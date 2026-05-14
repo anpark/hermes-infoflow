@@ -1760,12 +1760,24 @@ def _make_recall_handler():
                 "recall is only supported with an explicit message_id (use the "
                 "send_message tool's last-known id)."
             )}
-        result = await adapter.delete_message(
-            target,
-            message_id,
-            count=count,
-            current_inbound_message_id=current_inbound,
-        )
+        # ``adapter._http_session`` was created on the main gateway event loop,
+        # but this tool handler runs on ``worker_loop`` (a separate loop used
+        # by the tool dispatcher — see model_tools.py:_run_async).  Using a
+        # session across event loops makes aiohttp raise:
+        #   RuntimeError: Timeout context manager should be used inside a task
+        # Fix: temporarily null the session so delete_message's internal
+        # _ensure_session(None) creates a fresh session bound to worker_loop.
+        saved_session = getattr(adapter, "_http_session", None)
+        adapter._http_session = None
+        try:
+            result = await adapter.delete_message(
+                target,
+                message_id,
+                count=count,
+                current_inbound_message_id=current_inbound,
+            )
+        finally:
+            adapter._http_session = saved_session
         if not result.success:
             return {"error": result.error or "recall failed"}
         return {"success": True, "message_id": result.message_id}
