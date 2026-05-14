@@ -59,7 +59,6 @@ run_cmd() {
 }
 
 echo "==> Verifying runtime dependencies"
-PY="${PYTHON:-python3}"
 DEP_CHECK_SCRIPT=$(cat <<'PYEOF'
 import importlib, sys
 missing = []
@@ -74,17 +73,73 @@ if missing:
 print("OK")
 PYEOF
 )
+
+# Resolve the Python interpreter. Priority:
+#   1. $PYTHON (explicit override; respected as-is, no auto-detect).
+#   2. The interpreter behind the `hermes` CLI on PATH — for pipx / venv
+#      installs this is hermes-agent's own venv Python, which already has
+#      cryptography / aiohttp / pyyaml. Lets `bash scripts/deploy.sh` work
+#      without sourcing any venv.
+#   3. plain `python3` (works when hermes-agent is installed system-wide
+#      or with `pip install --user`).
+detect_hermes_python() {
+  local hermes_bin shebang interp
+  command -v hermes >/dev/null 2>&1 || return 1
+  hermes_bin="$(command -v hermes)"
+  if command -v realpath >/dev/null 2>&1; then
+    hermes_bin="$(realpath "$hermes_bin" 2>/dev/null || echo "$hermes_bin")"
+  fi
+  shebang="$(head -n 1 "$hermes_bin" 2>/dev/null || true)"
+  if [[ "$shebang" =~ ^#![[:space:]]*([^[:space:]]+) ]]; then
+    interp="${BASH_REMATCH[1]}"
+    # `/usr/bin/env python3` wrappers just defer to PATH, no info gained.
+    if [[ "$interp" != */env ]] && [[ -x "$interp" ]]; then
+      printf '%s\n' "$interp"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+CANDIDATE_PYTHONS=()
+if [[ -n "${PYTHON:-}" ]]; then
+  CANDIDATE_PYTHONS+=("$PYTHON")
+else
+  if hermes_py="$(detect_hermes_python)"; then
+    CANDIDATE_PYTHONS+=("$hermes_py")
+  fi
+  CANDIDATE_PYTHONS+=("python3")
+fi
+
+PY=""
 if [[ "$DRY_RUN" == "true" ]]; then
+  PY="${CANDIDATE_PYTHONS[0]}"
+  echo "  candidate interpreters: ${CANDIDATE_PYTHONS[*]}"
   echo "$ $PY -c <dep-check>"
 else
-  if ! "$PY" -c "$DEP_CHECK_SCRIPT"; then
+  for candidate in "${CANDIDATE_PYTHONS[@]}"; do
+    if "$candidate" -c "$DEP_CHECK_SCRIPT" >/dev/null 2>&1; then
+      PY="$candidate"
+      echo "  using interpreter: $PY"
+      break
+    fi
+  done
+  if [[ -z "$PY" ]]; then
+    PY="${CANDIDATE_PYTHONS[0]}"
+    # Re-run loudly so the user sees which modules are missing.
+    "$PY" -c "$DEP_CHECK_SCRIPT" || true
     echo
     echo "✗ One or more required Python packages are missing." >&2
     echo "  Required: cryptography, aiohttp, pyyaml" >&2
+    echo "  Tried interpreters: ${CANDIDATE_PYTHONS[*]}" >&2
     echo "  These are normally already installed by hermes-agent itself." >&2
-    echo "  If you installed hermes-agent in a venv, source it before re-running this script." >&2
-    echo "  As a manual fallback (per-user install):" >&2
-    echo "      $PY -m pip install --user cryptography aiohttp pyyaml" >&2
+    echo "  Fixes (any one):" >&2
+    echo "    1) install hermes-agent so its venv Python is auto-detected:" >&2
+    echo "         pipx install hermes-agent" >&2
+    echo "    2) explicitly point at a Python that has the deps:" >&2
+    echo "         PYTHON=/path/to/python bash scripts/deploy.sh" >&2
+    echo "    3) install per-user against the interpreter shown above:" >&2
+    echo "         $PY -m pip install --user cryptography aiohttp pyyaml" >&2
     exit 1
   fi
 fi
