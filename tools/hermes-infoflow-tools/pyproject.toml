@@ -7,16 +7,17 @@ name = "hermes-infoflow-tools"
 version = "0.1.0"
 description = "CLI tools for installing/updating the hermes-infoflow plugin into a Hermes Agent home directory."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = { text = "MIT" }
-authors = [{ name = "hermes-infoflow contributors" }]
+authors = [{ name = "chengbo05", email = "chengbo05@baidu.com" }]
 keywords = ["hermes", "hermes-agent", "infoflow", "cli", "installer"]
 classifiers = [
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Installation/Setup",
 ]
 # Stdlib + system tools (pip, tar, rsync, bash) only. We run this via

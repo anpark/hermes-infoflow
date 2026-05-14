@@ -25,3 +25,25 @@ build/
 # Local plan / scratch
 .plans/
 .cursor/
+
+# Coverage / test artifacts
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+
+# Other Python test runners
+.tox/
+.nox/
+
+# Editor swap / backup files
+*.swp
+*.swo
+*~
+*.bak
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini

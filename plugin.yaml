@@ -15,7 +15,7 @@ version: 0.1.0
 description: >
   Baidu Infoflow (如流) channel plugin for Hermes Agent.
   Receives messages via webhook (AES-ECB encrypted) and sends via REST API.
-author: hermes-infoflow contributors
+author: chengbo05 <chengbo05@baidu.com>
 
 # `entry_module` is honored by directory-style installs that import the plugin
 # directly (so `import hermes_infoflow` finds register()).

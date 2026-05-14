@@ -8,6 +8,14 @@ versioning (with prerelease suffixes such as `0.1.0b1` for betas).
 
 ## [Unreleased]
 
+### Changed
+
+- Minimum Python version bumped from 3.10 to 3.11, matching hermes-agent's
+  own ``requires-python = ">=3.11"``.
+- CI matrix and PyPI classifiers extended to cover Python 3.13 and 3.14.
+  hermes-infoflow already supported these in practice (the codebase runs
+  cleanly on 3.14 locally); this change locks in regression coverage.
+
 ## [0.1.0] - TBD
 
 ### Added
