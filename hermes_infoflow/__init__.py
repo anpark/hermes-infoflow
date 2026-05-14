@@ -37,8 +37,8 @@ name MUST be the string ``"infoflow"`` in three places:
 so the plugin manager deduplicates them to a single logical plugin.
 """
 
-from .adapter import register
+from .adapter import recall_inbound_message_id_hint_scope, register
 
-__all__ = ["register"]
+__all__ = ["recall_inbound_message_id_hint_scope", "register"]
 
 __version__ = "0.1.0"

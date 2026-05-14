@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextvars
 import json
 import logging
 import mimetypes
@@ -25,6 +26,7 @@ import re
 import socket as _socket
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -47,7 +49,7 @@ from .policy import (
     evaluate_inbound,
     normalize_reply_mode,
 )
-from .sent_store import SentMessageStore
+from .sent_store import SentMessage, SentMessageStore
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +102,33 @@ DEFAULT_WEBHOOK_PATH = "/webhook/infoflow"
 MAX_MESSAGE_LENGTH = 2048  # matches OpenClaw textChunkLimit
 DEFAULT_BODY_LIMIT_BYTES = 20 * 1024 * 1024
 GROUP_TARGET_RE = re.compile(r"^group:(\d+)$", re.IGNORECASE)
+
+# Optional hint for ``infoflow_recall_message`` when the agent runtime does not
+# pass ``current_inbound_message_id`` explicitly (OpenClaw supplies the
+# equivalent via ``toolContext.currentMessageId``).  Host code can wrap an
+# agent turn with ``recall_inbound_message_id_hint_scope(...)`` so recall
+# fallbacks in :meth:`InfoflowAdapter.delete_message` still see the inbound id.
+_recall_inbound_message_hint: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "hermes_infoflow_recall_inbound_hint",
+    default=None,
+)
+
+
+@contextmanager
+def recall_inbound_message_id_hint_scope(message_id: str | None):
+    """Set the recall inbound-id hint for this block (task-local via ``ContextVar``).
+
+    Hermes-agent (or any host) can wrap an agent turn while handling a message so
+    ``infoflow_recall_message`` calls that omit ``current_inbound_message_id`` still
+    resolve reply-to-bot / group ``msgseqid`` when the model passes a wrong
+    ``message_id``. Mirrors OpenClaw's ``toolContext.currentMessageId``.
+    """
+    tok = _recall_inbound_message_hint.set(message_id)
+    try:
+        yield
+    finally:
+        _recall_inbound_message_hint.reset(tok)
+
 
 # ---------------------------------------------------------------------------
 # Inbound-context registry — mirrors openclaw-infoflow/src/inbound-context.ts.
@@ -887,9 +916,11 @@ class InfoflowAdapter(BasePlatformAdapter):
         inbound: InboundMessage,
         decision: PolicyDecision | None = None,
     ) -> None:
+        hint = str(inbound.message_id) if inbound.message_id else None
         try:
-            event = await self._build_message_event(inbound, decision)
-            await self.handle_message(event)
+            with recall_inbound_message_id_hint_scope(hint):
+                event = await self._build_message_event(inbound, decision)
+                await self.handle_message(event)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -968,17 +999,16 @@ class InfoflowAdapter(BasePlatformAdapter):
             media_urls=local_media,
             media_types=media_types,
         )
-        # When the inbound is a quote-reply, pick the bot-message target first
-        # (so the agent can reason about its own prior message). Otherwise fall
-        # back to the first reply target.
+        # Quote-reply: only surface *bot* message ids on the event so the LLM
+        # does not treat a quoted user message id as a recall target (mirrors
+        # openclaw inbound-context / replyTargets handling).
         bot_target = next(
             (t for t in inbound.reply_targets if t.get("isBotMessage")),
             None,
         )
-        chosen = bot_target or (inbound.reply_targets[0] if inbound.reply_targets else None)
-        if chosen is not None:
-            event.reply_to_message_id = str(chosen.get("messageid") or "") or None
-            event.reply_to_text = str(chosen.get("preview") or "") or None
+        if bot_target is not None:
+            event.reply_to_message_id = str(bot_target.get("messageid") or "") or None
+            event.reply_to_text = str(bot_target.get("preview") or "") or None
         return event
 
     # ------------------------------------------------------------------
@@ -1255,30 +1285,44 @@ class InfoflowAdapter(BasePlatformAdapter):
         Without, recalls the ``count`` most recent messages tracked in
         the in-process ``SentMessageStore``.
 
-        ``current_inbound_message_id`` is an optional explicit hint from the
-        tool framework. **Even without it**, this method auto-corrects when
-        the supplied ``message_id`` happens to match an in-flight inbound
-        context record — the LLM rarely supplies the hint, so the implicit
-        lookup is the path that fires in practice. Mirrors
-        openclaw-infoflow/src/actions.ts::applyAggressiveGuardForInboundMessageId.
+        ``current_inbound_message_id`` is an optional hint (OpenClaw's
+        ``toolContext.currentMessageId``). When omitted, the same value may
+        still be supplied via :func:`recall_inbound_message_id_hint_scope`
+        (used automatically during webhook dispatch).
+
+        When a hint is present, aggressive guard matches openclaw: it runs
+        only if ``message_id`` equals that inbound id. When both the parameter
+        and the context hint are omitted, we still look up ``message_id`` as a
+        possible inbound id so rare LLM calls that pass only the inbound id can
+        be corrected (see tests).
+
+        When a specific ``message_id`` is unknown to the store but a hint
+        identifies the current inbound, we fall back to the bot message
+        quoted by that inbound (openclaw ``resolveInboundReplyToMessageId``).
         """
+        if current_inbound_message_id is None:
+            current_inbound_message_id = _recall_inbound_message_hint.get(None)
         kind, group_id, dm_user = self._parse_target(chat_id)
         store_key = self._normalize_chat_id(chat_id)
 
-        # Apply aggressive correction whenever ``message_id`` is itself a
-        # known inbound message id. The explicit ``current_inbound_message_id``
-        # hint is honored when supplied (and must match), but is no longer
-        # required for the correction path to fire.
+        # Aggressive guard (openclaw applyAggressiveGuardForInboundMessageId):
+        # when a hint is present, only treat ``message_id`` as the inbound id
+        # if it matches the hint — avoids false swaps when the LLM passed a
+        # legitimate bot id while the hint points at a different message.
         if message_id:
-            inbound_id_for_lookup = (
-                current_inbound_message_id
-                if current_inbound_message_id and current_inbound_message_id == message_id
-                else message_id
-            )
-            corrected = self._correct_inbound_confusion(
-                inbound_message_id=inbound_id_for_lookup,
-                store_key=store_key,
-            )
+            inbound_key_for_aggressive: str | None = None
+            if current_inbound_message_id:
+                if message_id == current_inbound_message_id:
+                    inbound_key_for_aggressive = current_inbound_message_id
+            else:
+                inbound_key_for_aggressive = message_id
+
+            corrected: dict[str, Any] | None = None
+            if inbound_key_for_aggressive:
+                corrected = self._correct_inbound_confusion(
+                    inbound_message_id=inbound_key_for_aggressive,
+                    store_key=store_key,
+                )
             if corrected is not None and corrected.get("kind") == "swap":
                 logger.info(
                     "[infoflow:delete] auto-swap inbound id=%s -> bot msg id=%s",
@@ -1287,7 +1331,7 @@ class InfoflowAdapter(BasePlatformAdapter):
                 message_id = str(corrected["message_id"])
             elif corrected is not None and corrected.get("kind") == "drop_to_count":
                 logger.info(
-                    "[infoflow:delete] auto-correct: drop to count=1 (recall-latest intent)"
+                    "[infoflow:delete] auto-correct: drop to count=1 (recall_latest intent)"
                 )
                 message_id = None
                 count = 1
@@ -1296,7 +1340,29 @@ class InfoflowAdapter(BasePlatformAdapter):
 
         if message_id:
             entry = self._sent_store.find(store_key, message_id)
-            msgseq = entry.msgseqid if entry else ""
+            if kind == "group":
+                need_reply_fallback = entry is None or not (entry.msgseqid or "").strip()
+            else:
+                need_reply_fallback = entry is None
+
+            if need_reply_fallback and current_inbound_message_id:
+                fb_entry = self._reply_to_bot_from_current_inbound(
+                    current_inbound_message_id=current_inbound_message_id,
+                    store_key=store_key,
+                )
+                if fb_entry is not None:
+                    ok_use = (kind != "group") or bool((fb_entry.msgseqid or "").strip())
+                    if ok_use:
+                        logger.info(
+                            "[infoflow:delete] fallback: message_id=%s -> bot id=%s "
+                            "(via current inbound reply context)",
+                            message_id,
+                            fb_entry.messageid,
+                        )
+                        message_id = fb_entry.messageid
+                        entry = fb_entry
+
+            msgseq = (entry.msgseqid if entry else "") or ""
             targets.append((message_id, msgseq))
         else:
             for entry in self._sent_store.recent(store_key, max(1, count)):
@@ -1346,6 +1412,10 @@ class InfoflowAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=first_error or "recall failed")  # type: ignore[call-arg]
         return SendResult(success=True, message_id=recalled_ids[-1])  # type: ignore[call-arg]
 
+    def _inbound_ctx_account_id(self) -> str:
+        """Same id used when registering inbound context in ``_handle_webhook``."""
+        return str(self._settings.get("app_key") or "default")
+
     def _correct_inbound_confusion(
         self,
         *,
@@ -1361,6 +1431,8 @@ class InfoflowAdapter(BasePlatformAdapter):
         ctx = _lookup_inbound_context(inbound_message_id)
         if ctx is None:
             return None
+        if ctx.account_id != self._inbound_ctx_account_id():
+            return None
         # Scope check: same chat target. ``ctx.target`` is always stored in
         # normalized form by ``_handle_webhook``.
         if ctx.target != store_key:
@@ -1374,6 +1446,28 @@ class InfoflowAdapter(BasePlatformAdapter):
         if _looks_like_recall_latest(ctx.inbound_body):
             return {"kind": "drop_to_count"}
         return None
+
+    def _reply_to_bot_from_current_inbound(
+        self,
+        *,
+        current_inbound_message_id: str,
+        store_key: str,
+    ) -> SentMessage | None:
+        """Resolve a stored bot-sent message from the current inbound's quote-reply.
+
+        Mirrors openclaw-infoflow ``resolveInboundReplyToMessageId`` + store lookup.
+        """
+        ctx = _lookup_inbound_context(current_inbound_message_id)
+        if ctx is None:
+            return None
+        if ctx.account_id != self._inbound_ctx_account_id():
+            return None
+        if ctx.target != store_key:
+            return None
+        bid = ctx.reply_to_bot_message_id
+        if not bid:
+            return None
+        return self._sent_store.find(store_key, bid)
 
     def _format_recall_candidates(self, store_key: str, limit: int = 5) -> str:
         """Format the last ``limit`` bot-sent messages for an error hint to the LLM."""

@@ -539,6 +539,146 @@ def test_delete_message_surface_candidates_when_unknown(
     assert "REAL-MID" in (result.error or "")
 
 
+def test_delete_message_group_falls_back_via_current_inbound_reply(
+    configured_env, monkeypatch
+) -> None:
+    """When message_id is wrong but current_inbound quotes a bot message, recall that bot id."""
+    from hermes_infoflow.adapter import _InboundContext, _register_inbound_context
+
+    adapter = InfoflowAdapter(_make_config())
+    adapter._sent_store.record(
+        "group:42", "BOT999", msgseqid="SEQ-99", digest="joke"
+    )
+    _register_inbound_context(
+        _InboundContext(
+            account_id=adapter._inbound_ctx_account_id(),
+            target="group:42",
+            inbound_message_id="USER123",
+            reply_to_bot_message_id="BOT999",
+            reply_targets=[
+                {"messageid": "BOT999", "preview": "joke", "isBotMessage": True}
+            ],
+            inbound_body="撤回那条",
+            registered_at=__import__("time").time(),
+        )
+    )
+
+    captured: dict[str, str] = {}
+
+    async def fake_recall_group(account, *, group_id, messageid, msgseqid, session=None):
+        captured["messageid"] = messageid
+        captured["msgseqid"] = msgseqid
+        captured["group_id"] = str(group_id)
+        return {"ok": True}
+
+    monkeypatch.setattr(_api, "recall_group_message", fake_recall_group)
+
+    async def _go():
+        return await adapter.delete_message(
+            "group:42",
+            message_id="HALLUCINATED",
+            current_inbound_message_id="USER123",
+        )
+
+    result = asyncio.run(_go())
+    assert result.success is True
+    assert captured["messageid"] == "BOT999"
+    assert captured["msgseqid"] == "SEQ-99"
+    assert captured["group_id"] == "42"
+
+
+def test_delete_message_group_no_fallback_when_target_mismatches_inbound_ctx(
+    configured_env, monkeypatch
+) -> None:
+    """Do not apply reply-to fallback from inbound ctx registered for another chat."""
+    from hermes_infoflow.adapter import _InboundContext, _register_inbound_context
+
+    adapter = InfoflowAdapter(_make_config())
+    adapter._sent_store.record(
+        "group:42", "BOT999", msgseqid="SEQ-99", digest="joke"
+    )
+    _register_inbound_context(
+        _InboundContext(
+            account_id=adapter._inbound_ctx_account_id(),
+            target="group:OTHER",
+            inbound_message_id="USER123",
+            reply_to_bot_message_id="BOT999",
+            reply_targets=[],
+            inbound_body="x",
+            registered_at=__import__("time").time(),
+        )
+    )
+    called: list[str] = []
+
+    async def fake_recall_group(account, **kwargs):
+        called.append("yes")
+        return {"ok": True}
+
+    monkeypatch.setattr(_api, "recall_group_message", fake_recall_group)
+
+    async def _go():
+        return await adapter.delete_message(
+            "group:42",
+            message_id="HALLUCINATED",
+            current_inbound_message_id="USER123",
+        )
+
+    result = asyncio.run(_go())
+    assert result.success is False
+    assert not called
+
+
+def test_delete_message_group_falls_back_via_context_hint(
+    configured_env, monkeypatch
+) -> None:
+    """ContextVar hint (webhook dispatch) supplies current inbound without tool arg."""
+    from hermes_infoflow.adapter import (
+        _InboundContext,
+        _register_inbound_context,
+        recall_inbound_message_id_hint_scope,
+    )
+
+    adapter = InfoflowAdapter(_make_config())
+    adapter._sent_store.record(
+        "group:42", "BOT999", msgseqid="SEQ-99", digest="joke"
+    )
+    _register_inbound_context(
+        _InboundContext(
+            account_id=adapter._inbound_ctx_account_id(),
+            target="group:42",
+            inbound_message_id="USER123",
+            reply_to_bot_message_id="BOT999",
+            reply_targets=[
+                {"messageid": "BOT999", "preview": "joke", "isBotMessage": True}
+            ],
+            inbound_body="撤回",
+            registered_at=__import__("time").time(),
+        )
+    )
+
+    captured: dict[str, str] = {}
+
+    async def fake_recall_group(account, *, group_id, messageid, msgseqid, session=None):
+        captured["messageid"] = messageid
+        captured["msgseqid"] = msgseqid
+        return {"ok": True}
+
+    monkeypatch.setattr(_api, "recall_group_message", fake_recall_group)
+
+    async def _go():
+        with recall_inbound_message_id_hint_scope("USER123"):
+            return await adapter.delete_message(
+                "group:42",
+                message_id="HALLUCINATED",
+                current_inbound_message_id=None,
+            )
+
+    result = asyncio.run(_go())
+    assert result.success is True
+    assert captured["messageid"] == "BOT999"
+    assert captured["msgseqid"] == "SEQ-99"
+
+
 # ---------------------------------------------------------------------------
 # Fix #15: non-webhook connection mode is rejected at connect time
 # ---------------------------------------------------------------------------
