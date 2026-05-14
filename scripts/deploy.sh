@@ -31,20 +31,44 @@ run_cmd() {
 
 echo "==> Syncing plugin files to $PLUGIN_DIR"
 run_cmd mkdir -p "$PLUGIN_DIR"
-RSYNC_OPTS=(
-  -av --delete
-  --exclude tests
-  --exclude tools
-  --exclude .git
-  --exclude .github
-  --exclude __pycache__
-  --exclude .venv
-  --exclude .pytest_cache
-  --exclude dist
-  --exclude build
-  --exclude "*.egg-info"
-)
-run_cmd rsync "${RSYNC_OPTS[@]}" "$PROJECT_DIR/" "$PLUGIN_DIR/"
+
+# hermes-agent's directory-plugin loader (hermes_cli/plugins.py::
+# _load_directory_module) requires ``__init__.py`` to live directly at
+# ``$PLUGIN_DIR``. Our repo keeps the source nested inside ``hermes_infoflow/``
+# so the same code also works as a pip-installed package via the
+# ``hermes_agent.plugins`` entry point. Bridge the two by flattening at
+# deploy time:
+#
+#   1. ``hermes_infoflow/*``  →  ``$PLUGIN_DIR/*``   (with --delete)
+#   2. ``plugin.yaml``        →  ``$PLUGIN_DIR/plugin.yaml``
+#   3. ``scripts/``           →  ``$PLUGIN_DIR/scripts/``  (kept so
+#                                 hermes-infoflow-tools --mode extract
+#                                 can find deploy-common.sh on re-runs)
+#
+# Internal imports inside the package are all relative (``from .adapter
+# import register``), and hermes-agent sets
+# ``submodule_search_locations=[plugin_dir]`` on the loaded module, so
+# the relative imports keep resolving against the flat layout.
+PACKAGE_DIR="$PROJECT_DIR/hermes_infoflow"
+if [[ ! -d "$PACKAGE_DIR" ]]; then
+  echo "✗ expected Python package directory not found: $PACKAGE_DIR" >&2
+  exit 1
+fi
+PLUGIN_MANIFEST="$PROJECT_DIR/plugin.yaml"
+if [[ ! -f "$PLUGIN_MANIFEST" ]]; then
+  echo "✗ expected plugin manifest not found: $PLUGIN_MANIFEST" >&2
+  exit 1
+fi
+
+run_cmd rsync -av --delete \
+  --exclude __pycache__ \
+  --exclude "*.pyc" \
+  "$PACKAGE_DIR/" "$PLUGIN_DIR/"
+run_cmd rsync -av "$PLUGIN_MANIFEST" "$PLUGIN_DIR/plugin.yaml"
+run_cmd rsync -av --delete \
+  --exclude __pycache__ \
+  --exclude "*.pyc" \
+  "$PROJECT_DIR/scripts/" "$PLUGIN_DIR/scripts/"
 
 COMMON_ARGS=(
   --plugin-dir "$PLUGIN_DIR"

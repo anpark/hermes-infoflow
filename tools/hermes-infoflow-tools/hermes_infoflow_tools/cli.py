@@ -199,26 +199,65 @@ def _do_extract(args, hermes_home: Path) -> int:
             with tarfile.open(tarball, "r:gz") as tar:
                 _safe_extract(tar, tmp_root)
 
-        # 3) rsync into the plugin dir
+        # 3) rsync into the plugin dir.
+        #
+        # hermes-agent's directory-plugin loader requires ``__init__.py``
+        # to live directly at ``plugin_dir`` (see
+        # hermes_cli/plugins.py::_load_directory_module). The sdist
+        # tarball keeps the source nested inside ``hermes_infoflow/`` for
+        # PyPI / entry-point installs, so we flatten the layout here:
+        #
+        #   1. ``<extracted>/hermes_infoflow/*``  →  ``plugin_dir/*``
+        #   2. ``<extracted>/plugin.yaml``        →  ``plugin_dir/plugin.yaml``
+        #   3. ``<extracted>/scripts/``           →  ``plugin_dir/scripts/``
+        #
+        # Internal imports inside the package are all relative
+        # (``from .adapter import register``) and hermes-agent points the
+        # loaded module's ``submodule_search_locations`` at ``plugin_dir``,
+        # so the relative imports keep resolving after flattening.
         if args.dry_run:
             extracted_label = str(tmp_root / f"<extracted {args.package_name}>")
         else:
             extracted_label = str(_extracted_dir(tmp_root, args.package_name))
 
         runner(["mkdir", "-p", str(plugin_dir)])
+        # Step 1: package contents → plugin_dir/ (flatten + clean stale files)
         runner(
             [
                 "rsync",
                 "-av",
                 "--delete",
-                f"{extracted_label}/",
+                "--exclude",
+                "__pycache__",
+                "--exclude",
+                "*.pyc",
+                f"{extracted_label}/hermes_infoflow/",
                 f"{plugin_dir}/",
+            ]
+        )
+        # Step 2: plugin.yaml on top (manifest lives at sdist root, not in the
+        # package dir).
+        runner(
+            [
+                "rsync",
+                "-av",
+                f"{extracted_label}/plugin.yaml",
+                f"{plugin_dir}/plugin.yaml",
+            ]
+        )
+        # Step 3: scripts/ on top so deploy-common.sh stays available for
+        # subsequent re-runs of `hermes-infoflow-tools update`.
+        runner(
+            [
+                "rsync",
+                "-av",
+                "--delete",
                 "--exclude",
-                "tests",
+                "__pycache__",
                 "--exclude",
-                "tools",
-                "--exclude",
-                ".git",
+                "*.pyc",
+                f"{extracted_label}/scripts/",
+                f"{plugin_dir}/scripts/",
             ]
         )
 
