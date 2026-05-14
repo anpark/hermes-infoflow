@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hermes-infoflow-tools"
+version = "0.1.0"
+description = "CLI tools for installing/updating the hermes-infoflow plugin into a Hermes Agent home directory."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "hermes-infoflow contributors" }]
+keywords = ["hermes", "hermes-agent", "infoflow", "cli", "installer"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Installation/Setup",
+]
+# Stdlib + system tools (pip, tar, rsync, bash) only. We run this via
+# `pipx run` or `uvx` so it doesn't need its own runtime dependencies.
+dependencies = []
+
+[project.scripts]
+hermes-infoflow-tools = "hermes_infoflow_tools.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/chbo297/hermes-infoflow"
+Issues   = "https://github.com/chbo297/hermes-infoflow/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["hermes_infoflow_tools"]

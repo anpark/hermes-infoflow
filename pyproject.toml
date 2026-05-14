@@ -1,0 +1,102 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hermes-infoflow"
+version = "0.1.0"
+description = "Baidu Infoflow (如流) channel plugin for Hermes Agent"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "hermes-infoflow contributors" }]
+keywords = [
+    "hermes",
+    "hermes-agent",
+    "hermes-plugin",
+    "infoflow",
+    "baidu",
+    "chatbot",
+    "ai-agent",
+    "enterprise-messaging",
+]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: POSIX",
+    "Operating System :: MacOS",
+    "Topic :: Communications :: Chat",
+]
+dependencies = [
+    # All three are already required by hermes-agent itself, so the wheel does
+    # not add new runtime dependencies for normal users. Pinned loosely.
+    "cryptography>=3.4",
+    "aiohttp>=3.8",
+    "PyYAML>=6.0",
+]
+
+# hermes-agent discovers plugins through this entry-point group.
+# See hermes_cli/plugins.py: ENTRY_POINTS_GROUP = "hermes_agent.plugins".
+# The key here MUST equal plugin.yaml's `name` and register(ctx)(name=...)
+# so directory-style and entry-point-style installs deduplicate to one plugin.
+[project.entry-points."hermes_agent.plugins"]
+infoflow = "hermes_infoflow"
+
+[project.urls]
+Homepage = "https://github.com/chbo297/hermes-infoflow"
+Issues   = "https://github.com/chbo297/hermes-infoflow/issues"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+    "pytest-asyncio>=0.21",
+    "ruff>=0.5",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["hermes_infoflow"]
+# Ship plugin.yaml inside the wheel so directory-style installs that unpack
+# the sdist (B-extract path) get a usable manifest at the package root.
+include = [
+    "plugin.yaml",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "hermes_infoflow",
+    "plugin.yaml",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "scripts",
+]
+exclude = [
+    "tests",
+    "tools",
+    ".github",
+    "**/__pycache__",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+ignore = [
+    "E501",   # line length handled by formatter
+    "B008",   # function-call-in-default-arg (we use sentinels intentionally)
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]

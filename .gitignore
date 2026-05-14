@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+dist/
+build/
+*.egg
+*.whl
+*.tar.gz
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Local env / secrets
+.env
+.env.*
+!.env.example
+
+# Local plan / scratch
+.plans/
+.cursor/
