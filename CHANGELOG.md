@@ -8,7 +8,72 @@ versioning (with prerelease suffixes such as `0.1.0b1` for betas).
 
 ## [Unreleased]
 
+### Added — OpenClaw parity pass
+
+- **Own-message guard.** Inbound events whose root ``fromid`` equals the
+  bot's persisted robotId are now dropped before policy evaluation. The
+  bot's robotId is auto-discovered from the first inbound @-mention and
+  cached in-process. Closes the "bot replies to its own
+  ALL_MESSAGE_FORWARD echo" feedback loop.
+- **Five-mode replyMode parity.** ``record`` (skip dispatch but log) and
+  ``proactive`` (always dispatch with a "use NO_REPLY when unsure" prompt)
+  are now first-class — no more silent fallback to ``mention-and-watch``.
+- **``watch_regex``.** Account-level (and per-group) regex patterns that
+  trigger group responses on content match. Configure via
+  ``INFOFLOW_WATCH_REGEX`` (newline or ``|||`` separated; single ``|`` is
+  preserved for regex alternation).
+- **Follow-up window.** When ``INFOFLOW_FOLLOW_UP=true``, the bot stays
+  engaged in a group for ``INFOFLOW_FOLLOW_UP_WINDOW`` seconds after its
+  last reply — adopting OpenClaw's behavior for natural multi-turn chat.
+- **Per-group config overrides.** Configure via ``INFOFLOW_GROUPS`` (JSON
+  keyed by group id) — each entry can override ``reply_mode`` /
+  ``watch_mentions`` / ``watch_regex`` / ``follow_up`` / ``follow_up_window``
+  / ``system_prompt``.
+- **Persistent sent-message store.** ``SentMessageStore`` now writes to a
+  local SQLite file (default: ``~/.hermes/state/infoflow/sent-messages.db``)
+  so cron sub-processes and adapter restarts can still recall messages.
+  Auto-cleanup after 7 days. Override the state dir with
+  ``HERMES_STATE_DIR``.
+- **Recall correction.** When the LLM accidentally passes the inbound
+  user-message id as the recall target, the delete path automatically:
+  (1) swaps in the bot-message id the user quote-replied to (when there
+  is one), or (2) drops to ``count=1`` if the inbound text is a clear
+  "撤回上一条 / recall the last one" request. Unknown ids return error
+  messages that include up to 5 recent bot-sent candidates so the LLM can
+  self-correct on the next call.
+- **Inbound-context registry** mirroring OpenClaw's ``inbound-context.ts``
+  (TTL + max-size bounded; underpins recall correction).
+- **body_for_agent format aligned** with OpenClaw — group @-mentions now
+  render as ``@<name> (robotid:<N>) `` (was ``[at:@<name>]``).
+- **InboundMessage** exposes ``discovered_robot_id``, ``fromid``, and
+  ``event_type`` so the adapter can implement the above guards.
+
 ### Changed
+
+- ``InfoflowAdapter.send()`` now reports failure if *any* chunk fails
+  (mirrors OpenClaw's ``firstError`` semantics). Last successful message
+  id is still surfaced for downstream recall.
+- ``INFOFLOW_CONNECTION_MODE!='webhook'`` is now a hard error at
+  ``connect()``-time instead of a silent fallback.
+- ``text/plain`` inbound with an empty body now returns HTTP 400 (was 500),
+  matching OpenClaw and Infoflow's retry-on-5xx policy.
+- Group recall failures with unknown messageid surface up to 5 recent
+  bot-sent candidates in the error text — gives the LLM something to
+  self-correct from.
+- ``SentMessageStore`` dedup set is now bounded by both TTL (5 min) and
+  size (1000 entries by default — same cap as OpenClaw's
+  ``DEDUP_MAX_SIZE``).
+- Reply-target selection in ``MessageEvent.reply_to_message_id`` now
+  prefers a bot-message target (when one is present in ``replyData``)
+  rather than the first generic target.
+
+### Removed
+
+- ``INFOFLOW_CONNECTION_MODE`` removed from the setup wizard prompts —
+  only ``webhook`` is supported and non-webhook values are now rejected
+  at connect-time rather than silently downgraded.
+
+### Changed (prior)
 
 - Minimum Python version bumped from 3.10 to 3.11, matching hermes-agent's
   own ``requires-python = ">=3.11"``.

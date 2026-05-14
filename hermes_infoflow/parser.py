@@ -107,6 +107,19 @@ class InboundMessage:
     reply_targets: list[dict[str, Any]] = field(default_factory=list)
     is_reply_to_bot: bool = False
     was_mentioned: bool = False
+    # Robot ID discovered from the @-mention AT item. The adapter uses this to
+    # persist the bot's actual robotid (Infoflow doesn't tell us upfront) so we
+    # can later ignore our own messages echoed back as ALL_MESSAGE_FORWARD
+    # events. Empty string when nothing was discovered. Mirrors OpenClaw
+    # bot.ts::getBotRobotidFromBody.
+    discovered_robot_id: str = ""
+    # The raw root-level ``fromid`` from the inbound payload (group events).
+    # Used by the adapter to compare against the persisted robotId for the
+    # "ignore own bot message" guard (OpenClaw bot.ts:766-775).
+    fromid: str = ""
+    # ``eventtype`` from the inbound payload — surfaced so the adapter / policy
+    # can branch on ``MESSAGE_RECEIVE`` vs ``ALL_MESSAGE_FORWARD`` etc.
+    event_type: str = ""
 
     def dedupe_key(self) -> str | None:
         """Compute the dedup key (priority: message_id > composite)."""
@@ -346,9 +359,13 @@ def _extract_reply_targets(
 def _build_body_for_agent(body_items: list[BodyItem]) -> tuple[str, str, list[str]]:
     """Reconstruct two strings + the image URL list from the body items.
 
-    * ``raw_text`` — text-only concatenation (no @-prefix markup).
-    * ``body_for_agent`` — text with each @-mention rendered as ``[at:@name]``
-      so the LLM can see who was mentioned. Plain TEXT/MD items pass through.
+    Mirrors openclaw-infoflow/src/bot.ts (handleGroupChatMessage body loop):
+
+    * ``raw_text`` — TEXT/MD content only, used for ``CommandBody`` (no @-prefix).
+    * ``body_for_agent`` — what the LLM sees: TEXT/MD plus each AT rendered as
+      ``@<name> (robotid:<N>) `` (or ``@<name> `` for human ATs). LINK items
+      contribute their ``label`` (matches OpenClaw's LINK handling for the
+      agent-visible text).
     """
     raw_parts: list[str] = []
     agent_parts: list[str] = []
@@ -359,17 +376,20 @@ def _build_body_for_agent(body_items: list[BodyItem]) -> tuple[str, str, list[st
             raw_parts.append(item.content)
             agent_parts.append(item.content)
         elif t == "AT":
-            tag = f"[at:@{item.name or item.userid or item.robotid or '?'}]"
-            agent_parts.append(tag)
+            name = item.name or item.userid or item.robotid or "?"
+            if item.robotid:
+                agent_parts.append(f"@{name} (robotid:{item.robotid}) ")
+            else:
+                agent_parts.append(f"@{name} ")
         elif t == "LINK":
-            href = item.content or ""
-            raw_parts.append(href)
-            agent_parts.append(href)
+            label = item.label or item.content or ""
+            if label:
+                raw_parts.append(f" {label} ")
+                agent_parts.append(f" {label} ")
         elif t == "IMAGE":
             if item.downloadurl:
                 image_urls.append(item.downloadurl)
-            agent_parts.append("[image]")
-    return ("".join(raw_parts).strip(), " ".join(agent_parts).strip(), image_urls)
+    return ("".join(raw_parts).strip(), "".join(agent_parts).strip(), image_urls)
 
 
 # ---------------------------------------------------------------------------
@@ -530,7 +550,7 @@ def build_group_inbound(
 
     raw_text, body_for_agent, image_urls = _build_body_for_agent(body_items)
 
-    was_mentioned_flag, _discovered = _check_bot_mentioned(
+    was_mentioned_flag, discovered_robot_id = _check_bot_mentioned(
         body_items,
         robot_name=account.robot_name,
         app_agent_id=account.app_agent_id,
@@ -543,6 +563,7 @@ def build_group_inbound(
         was_mentioned = True
     else:
         was_mentioned = was_mentioned_flag
+    fromid_str = _stringify(msg_data.get("fromid"))
 
     mention_user_ids, mention_agent_ids = _extract_mention_ids(
         body_items,
@@ -557,12 +578,32 @@ def build_group_inbound(
     if not raw_text and not image_urls and not reply_targets:
         return None
 
+    # Mirror OpenClaw bot.ts:838-844: when there's no text but media / reply
+    # context exists, fall back to a placeholder so the message isn't dropped.
+    if not raw_text and image_urls:
+        if len(image_urls) > 1:
+            text_out = f"<media:image> ({len(image_urls)} images)"
+        else:
+            text_out = "<media:image>"
+    elif not raw_text and reply_targets:
+        text_out = "(引用回复)"
+    else:
+        text_out = raw_text
+
+    # Sender display name: prefer header.username / nickname (OpenClaw bot.ts:849).
+    sender_display = _stringify(
+        (header or {}).get("username")
+        or (header or {}).get("nickname")
+        or msg_data.get("username")
+        or from_user
+    )
+
     return InboundMessage(
         chat_type="group",
         from_user=from_user,
-        text=raw_text or "<media:image>" if image_urls and not raw_text else raw_text,
-        body_for_agent=body_for_agent if body_for_agent else raw_text,
-        sender_name=from_user,
+        text=text_out,
+        body_for_agent=body_for_agent or text_out,
+        sender_name=sender_display,
         message_id=message_id,
         group_id=group_id_str,
         msgseqid=msgseqid,
@@ -575,6 +616,9 @@ def build_group_inbound(
         reply_targets=reply_targets,
         is_reply_to_bot=is_reply_to_bot,
         was_mentioned=was_mentioned,
+        discovered_robot_id=discovered_robot_id,
+        fromid=fromid_str,
+        event_type=event_type,
     )
 
 
@@ -661,6 +705,13 @@ def parse_webhook(
 
     # text/plain: group chat
     if ct.startswith("text/plain"):
+        # OpenClaw infoflow-req-parse.ts::tryDecryptAndDispatch returns 400
+        # "empty content" before attempting to decrypt — match that so Infoflow's
+        # retry-on-5xx behavior doesn't snowball on empty replays.
+        if not raw_body or not raw_body.strip():
+            return ParsedWebhook(
+                kind="http_error", status_code=400, body="empty content"
+            )
         decoded = _try_decrypt_and_parse(raw_body, account.encoding_aes_key)
         if not decoded:
             return ParsedWebhook(

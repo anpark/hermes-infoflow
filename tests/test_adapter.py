@@ -307,3 +307,358 @@ def test_fetch_url_bytes_rejects_internal_ip(configured_env) -> None:
     assert "refusing" in asyncio.run(_go("http://10.0.0.1/secret")).lower()
     # Non-http scheme
     assert "refusing" in asyncio.run(_go("ftp://example.com/x.png")).lower()
+
+
+# ---------------------------------------------------------------------------
+# Fix #2: send() must report failure when any chunk fails
+# ---------------------------------------------------------------------------
+
+
+def test_send_partial_failure_returns_error_with_last_messageid(
+    configured_env, monkeypatch
+) -> None:
+    """If ANY chunk fails, ``send()`` must surface a failure (with last good id).
+
+    Mirrors OpenClaw send.ts firstError semantics.
+    """
+    adapter = InfoflowAdapter(_make_config())
+    # Force tiny chunk size so a normal message splits into >1 chunk.
+    monkeypatch.setattr(adapter, "MAX_MESSAGE_LENGTH", 5)
+    call_count = {"n": 0}
+
+    async def fake_send_private(account, to_user, contents, *, session=None):
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            return {"ok": False, "error": "transient"}
+        return {"ok": True, "msgkey": f"MID-{call_count['n']}"}
+
+    monkeypatch.setattr(_api, "send_private_message", fake_send_private)
+
+    async def _go():
+        return await adapter.send("alice", "abcdefghijklmnop")
+
+    result = asyncio.run(_go())
+    assert result.success is False
+    assert "transient" in (result.error or "")
+    # The last successful messageid is still surfaced.
+    assert result.message_id is not None
+
+
+def test_send_records_bot_reply_for_follow_up(configured_env, monkeypatch) -> None:
+    adapter = InfoflowAdapter(_make_config())
+
+    async def fake_send_group(account, *, group_id, contents, reply_to=None, session=None):
+        return {"ok": True, "messageid": "M1", "msgseqid": "S1"}
+
+    monkeypatch.setattr(_api, "send_group_message", fake_send_group)
+
+    async def _go():
+        return await adapter.send("group:42", "hello")
+
+    result = asyncio.run(_go())
+    assert result.success is True
+    # The policy's follow-up bookkeeping is updated.
+    assert "42" in adapter._policy.last_reply_at
+
+
+# ---------------------------------------------------------------------------
+# Fix #1: fromid == robotId → ignore own bot message
+# ---------------------------------------------------------------------------
+
+
+def test_webhook_ignores_own_bot_message_by_fromid(configured_env, monkeypatch) -> None:
+    """An inbound whose root-level ``fromid`` equals our discovered robotId must be dropped."""
+    raw_key, _ = configured_env
+    adapter = InfoflowAdapter(_make_config())
+    adapter._robot_id = "8675309"  # simulate previously-discovered id
+
+    payload = {
+        "fromid": "8675309",
+        "eventtype": "ALL_MESSAGE_FORWARD",
+        "message": {
+            "header": {"fromuserid": "ourbot", "groupid": 1, "messageid": 9},
+            "body": [{"type": "TEXT", "content": "echo"}],
+        },
+    }
+    ct = aes_ecb_encrypt_b64url(json.dumps(payload), raw_key)
+    request = _make_request(content_type="text/plain", body=ct.encode("utf-8"))
+
+    dispatched = {"called": False}
+
+    async def trapping_handle_message(event):
+        dispatched["called"] = True
+
+    monkeypatch.setattr(adapter, "handle_message", trapping_handle_message)
+
+    async def _go():
+        return await adapter._handle_webhook(request)
+
+    response = asyncio.run(_go())
+    assert response.status == 200
+    # No background dispatch was scheduled.
+    assert dispatched["called"] is False
+
+
+def test_webhook_persists_discovered_robot_id(configured_env, monkeypatch) -> None:
+    raw_key, _ = configured_env
+    adapter = InfoflowAdapter(_make_config())
+    assert adapter._robot_id == ""
+
+    payload = {
+        "message": {
+            "header": {"fromuserid": "bob", "groupid": 1, "messageid": 11},
+            "body": [
+                {"type": "AT", "name": "hermes", "robotid": "777"},
+                {"type": "TEXT", "content": "hi"},
+            ],
+        }
+    }
+    ct = aes_ecb_encrypt_b64url(json.dumps(payload), raw_key)
+    request = _make_request(content_type="text/plain", body=ct.encode("utf-8"))
+
+    async def stub_handle_message(event):
+        return None
+
+    monkeypatch.setattr(adapter, "handle_message", stub_handle_message)
+
+    async def _go():
+        return await adapter._handle_webhook(request)
+
+    asyncio.run(_go())
+    assert adapter._robot_id == "777"
+
+
+# ---------------------------------------------------------------------------
+# Fix #4: delete_message LLM-confusion correction
+# ---------------------------------------------------------------------------
+
+
+def test_delete_message_corrects_inbound_id_via_reply_target(
+    configured_env, monkeypatch
+) -> None:
+    """When LLM passes the inbound message_id and inbound is a quote-reply to a
+    bot message, ``delete_message`` swaps in the bot message id automatically."""
+    from hermes_infoflow.adapter import _InboundContext, _register_inbound_context
+
+    adapter = InfoflowAdapter(_make_config())
+    adapter._sent_store.record("alice", "BOT-MSG", msgseqid="")
+
+    # Register inbound context: user quote-replied to BOT-MSG.
+    _register_inbound_context(
+        _InboundContext(
+            account_id=adapter._sent_store.account_id,
+            target="alice",
+            inbound_message_id="INBOUND-7",
+            reply_to_bot_message_id="BOT-MSG",
+            reply_targets=[
+                {"messageid": "BOT-MSG", "preview": "hi", "isBotMessage": True}
+            ],
+            inbound_body="please undo the previous",
+            registered_at=__import__("time").time(),
+        )
+    )
+
+    captured = {}
+
+    async def fake_recall_private(account, *, msgkey, session=None):
+        captured["msgkey"] = msgkey
+        return {"ok": True}
+
+    monkeypatch.setattr(_api, "recall_private_message", fake_recall_private)
+
+    async def _go():
+        return await adapter.delete_message(
+            "alice",
+            message_id="INBOUND-7",  # the LLM's mistake
+            current_inbound_message_id="INBOUND-7",
+        )
+
+    result = asyncio.run(_go())
+    assert result.success is True
+    # Auto-correction swapped in the bot's real message id.
+    assert captured["msgkey"] == "BOT-MSG"
+
+
+def test_delete_message_drops_to_count_one_on_recall_latest_intent(
+    configured_env, monkeypatch
+) -> None:
+    """When LLM passes inbound id and the user said '撤回上一条', drop to count=1."""
+    from hermes_infoflow.adapter import _InboundContext, _register_inbound_context
+
+    adapter = InfoflowAdapter(_make_config())
+    adapter._sent_store.record("alice", "LATEST-BOT-MSG")
+
+    _register_inbound_context(
+        _InboundContext(
+            account_id=adapter._sent_store.account_id,
+            target="alice",
+            inbound_message_id="INBOUND-X",
+            reply_to_bot_message_id=None,
+            reply_targets=[],
+            inbound_body="撤回上一条",
+            registered_at=__import__("time").time(),
+        )
+    )
+
+    captured = {}
+
+    async def fake_recall_private(account, *, msgkey, session=None):
+        captured["msgkey"] = msgkey
+        return {"ok": True}
+
+    monkeypatch.setattr(_api, "recall_private_message", fake_recall_private)
+
+    async def _go():
+        return await adapter.delete_message(
+            "alice",
+            message_id="INBOUND-X",
+            current_inbound_message_id="INBOUND-X",
+        )
+
+    result = asyncio.run(_go())
+    assert result.success is True
+    assert captured["msgkey"] == "LATEST-BOT-MSG"
+
+
+def test_delete_message_surface_candidates_when_unknown(
+    configured_env, monkeypatch
+) -> None:
+    """Group recall of an unknown messageid surfaces candidate hints (not just an opaque error)."""
+    adapter = InfoflowAdapter(_make_config())
+    adapter._sent_store.record("group:99", "REAL-MID", msgseqid="REAL-SEQ", digest="real msg")
+
+    async def _go():
+        return await adapter.delete_message(
+            "group:99",
+            message_id="UNKNOWN",
+            current_inbound_message_id=None,
+        )
+
+    result = asyncio.run(_go())
+    assert result.success is False
+    assert "REAL-MID" in (result.error or "")
+
+
+# ---------------------------------------------------------------------------
+# Fix #15: non-webhook connection mode is rejected at connect time
+# ---------------------------------------------------------------------------
+
+
+def test_connect_rejects_websocket_mode(configured_env, monkeypatch) -> None:
+    monkeypatch.setenv("INFOFLOW_CONNECTION_MODE", "websocket")
+    adapter = InfoflowAdapter(_make_config())
+
+    async def _go():
+        return await adapter.connect()
+
+    result = asyncio.run(_go())
+    assert result is False
+    # Adapter must surface a clear fatal error (not just a warning).
+    # The exact attribute name depends on hermes-agent's base class; we just
+    # confirm connect() returned False without spinning up the server.
+    assert adapter._site is None
+
+
+# ---------------------------------------------------------------------------
+# BUG HH regression — chat_id normalization across send / delete
+# ---------------------------------------------------------------------------
+
+
+def test_send_then_delete_with_infoflow_prefix(configured_env, monkeypatch) -> None:
+    """Sending via ``infoflow:alice`` and recalling via plain ``alice`` must hit
+    the same store entry. Without normalization the lookup misses.
+    """
+    adapter = InfoflowAdapter(_make_config())
+
+    async def fake_send_private(account, to_user, contents, *, session=None):
+        return {"ok": True, "msgkey": "MID-X"}
+
+    captured = {}
+
+    async def fake_recall_private(account, *, msgkey, session=None):
+        captured["msgkey"] = msgkey
+        return {"ok": True}
+
+    monkeypatch.setattr(_api, "send_private_message", fake_send_private)
+    monkeypatch.setattr(_api, "recall_private_message", fake_recall_private)
+
+    async def _go():
+        await adapter.send("infoflow:alice", "hello")
+        # Now recall using the canonical form.
+        return await adapter.delete_message("alice", count=1)
+
+    result = asyncio.run(_go())
+    assert result.success is True
+    assert captured["msgkey"] == "MID-X"
+
+
+def test_send_with_canonical_then_delete_with_prefix(configured_env, monkeypatch) -> None:
+    """And the symmetric direction: send canonical, recall via prefixed form."""
+    adapter = InfoflowAdapter(_make_config())
+
+    async def fake_send_private(account, to_user, contents, *, session=None):
+        return {"ok": True, "msgkey": "MID-Y"}
+
+    captured = {}
+
+    async def fake_recall_private(account, *, msgkey, session=None):
+        captured["msgkey"] = msgkey
+        return {"ok": True}
+
+    monkeypatch.setattr(_api, "send_private_message", fake_send_private)
+    monkeypatch.setattr(_api, "recall_private_message", fake_recall_private)
+
+    async def _go():
+        await adapter.send("alice", "hello")
+        return await adapter.delete_message("infoflow:alice", count=1)
+
+    result = asyncio.run(_go())
+    assert result.success is True
+    assert captured["msgkey"] == "MID-Y"
+
+
+# ---------------------------------------------------------------------------
+# BUG EE regression — implicit recall correction without explicit hint
+# ---------------------------------------------------------------------------
+
+
+def test_delete_message_corrects_without_explicit_current_inbound_id(
+    configured_env, monkeypatch
+) -> None:
+    """LLM rarely supplies ``current_inbound_message_id``. The correction must
+    fire as long as ``message_id`` itself is a known inbound context id.
+    """
+    from hermes_infoflow.adapter import _InboundContext, _register_inbound_context
+
+    adapter = InfoflowAdapter(_make_config())
+    adapter._sent_store.record("alice", "BOT-MSG-2", msgseqid="")
+
+    _register_inbound_context(
+        _InboundContext(
+            account_id=adapter._sent_store.account_id,
+            target="alice",
+            inbound_message_id="INBOUND-99",
+            reply_to_bot_message_id="BOT-MSG-2",
+            reply_targets=[
+                {"messageid": "BOT-MSG-2", "preview": "hi", "isBotMessage": True}
+            ],
+            inbound_body="please undo",
+            registered_at=__import__("time").time(),
+        )
+    )
+
+    captured = {}
+
+    async def fake_recall_private(account, *, msgkey, session=None):
+        captured["msgkey"] = msgkey
+        return {"ok": True}
+
+    monkeypatch.setattr(_api, "recall_private_message", fake_recall_private)
+
+    async def _go():
+        # LLM passes the inbound id but NOT current_inbound_message_id.
+        return await adapter.delete_message("alice", message_id="INBOUND-99")
+
+    result = asyncio.run(_go())
+    assert result.success is True
+    assert captured["msgkey"] == "BOT-MSG-2"

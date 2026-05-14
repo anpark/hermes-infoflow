@@ -82,7 +82,7 @@ optional_env:
     prompt: "Home channel display name"
     password: false
   - name: INFOFLOW_REPLY_MODE
-    description: "Group reply mode: ignore / mention-only / mention-and-watch (default)"
+    description: "Group reply mode: ignore / record / mention-only / mention-and-watch (default) / proactive"
     prompt: "Reply mode"
     password: false
   - name: INFOFLOW_REQUIRE_MENTION
@@ -93,6 +93,22 @@ optional_env:
     description: "Comma-separated names; @-mentioning any of them triggers the bot in mention-and-watch mode"
     prompt: "Watch mentions (comma-separated)"
     password: false
+  - name: INFOFLOW_WATCH_REGEX
+    description: "Regex patterns triggering the bot when matched in message text. Separate multiple patterns with newlines or '|||' (single '|' is preserved for regex alternation)."
+    prompt: "Watch regex patterns (newline / |||-separated)"
+    password: false
+  - name: INFOFLOW_FOLLOW_UP
+    description: "Enable follow-up replies after bot responds (default true). When true, the bot continues to engage messages in the same group within the follow-up window."
+    prompt: "Follow-up enabled? (true/false)"
+    password: false
+  - name: INFOFLOW_FOLLOW_UP_WINDOW
+    description: "Follow-up window in seconds after last bot reply (default 300)"
+    prompt: "Follow-up window seconds"
+    password: false
+  - name: INFOFLOW_GROUPS
+    description: "Per-group config overrides as JSON, keyed by group ID. Each entry can override reply_mode / watch_mentions / watch_regex / follow_up / follow_up_window / system_prompt."
+    prompt: "Per-group config (JSON)"
+    password: false
   - name: INFOFLOW_ALLOWED_USERS
     description: "Comma-separated uuapNames allowed to talk to the bot"
     prompt: "Allowed users (comma-separated)"
@@ -101,7 +117,7 @@ optional_env:
     description: "Allow all users to talk to the bot (dev only)"
     prompt: "Allow all users? (true/false)"
     password: false
-  - name: INFOFLOW_CONNECTION_MODE
-    description: "Reserved for future use; currently only 'webhook' is accepted"
-    prompt: "Connection mode (webhook only for now)"
+  - name: HERMES_STATE_DIR
+    description: "Override the directory holding hermes state (sent-messages.db etc.). Defaults to ~/.hermes/state."
+    prompt: "Hermes state directory"
     password: false

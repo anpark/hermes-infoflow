@@ -167,8 +167,12 @@ def test_group_message_extracts_mention_and_msgseqid(account):
     # large-integer IDs round-tripped to str
     assert inbound.message_id == "1859713223686736432"
     assert inbound.msgseqid == "1859713223686736433"
-    assert "[at:@hermes]" in inbound.body_for_agent
+    # OpenClaw render: "@<name> (robotid:<N>) " when the AT carries a robotid,
+    # plus the trailing TEXT content.
+    assert "@hermes" in inbound.body_for_agent
+    assert "(robotid:42)" in inbound.body_for_agent
     assert "ping" in inbound.body_for_agent
+    assert inbound.discovered_robot_id == "42"
     assert inbound.image_urls == ["https://media.infoflow/img.jpg"]
 
 
@@ -209,6 +213,56 @@ def test_unsupported_content_type(account):
     )
     assert res.kind == "http_error"
     assert res.status_code == 400
+
+
+def test_empty_text_plain_body_returns_400_not_500(account):
+    """Mirrors OpenClaw: empty content is 400, decryption failure is 500."""
+    acct, _ = account
+    res = parser.parse_webhook(content_type="text/plain", raw_body="   ", account=acct)
+    assert res.kind == "http_error"
+    assert res.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Fields used by the adapter's own-message guard + robotId persistence
+# ---------------------------------------------------------------------------
+
+
+def test_group_message_exposes_fromid_and_event_type(account):
+    acct, raw_key = account
+    payload = {
+        "fromid": "999",
+        "eventtype": "ALL_MESSAGE_FORWARD",
+        "message": {
+            "header": {"fromuserid": "bob", "groupid": 1, "messageid": 1},
+            "body": [{"type": "TEXT", "content": "hi"}],
+        },
+    }
+    ct = aes_ecb_encrypt_b64url(json.dumps(payload), raw_key)
+    res = parser.parse_webhook(content_type="text/plain", raw_body=ct, account=acct)
+    assert res.kind == "message"
+    assert res.inbound.fromid == "999"
+    assert res.inbound.event_type == "ALL_MESSAGE_FORWARD"
+
+
+def test_group_message_discovers_robot_id(account):
+    """When the bot is @-mentioned, the AT item's robotid is surfaced for persistence."""
+    acct, raw_key = account
+    payload = {
+        "message": {
+            "header": {"fromuserid": "bob", "groupid": 1, "messageid": 7},
+            "body": [
+                {"type": "AT", "name": "hermes", "robotid": "8675309"},
+                {"type": "TEXT", "content": "ping"},
+            ],
+        }
+    }
+    ct = aes_ecb_encrypt_b64url(json.dumps(payload), raw_key)
+    res = parser.parse_webhook(content_type="text/plain", raw_body=ct, account=acct)
+    assert res.kind == "message"
+    assert res.inbound.was_mentioned is True
+    # appAgentId=42 didn't match, but robot_name="hermes" did → discovered robotid.
+    assert res.inbound.discovered_robot_id == "8675309"
 
 
 # ---------------------------------------------------------------------------
