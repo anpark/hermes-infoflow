@@ -1053,12 +1053,29 @@ class InfoflowAdapter(BasePlatformAdapter):
         """
         metadata = metadata or {}
         items: list[_api.ContentItem] = []
+        # --- AT items (must precede text/markdown in the body array) ---
+        at_prefix_parts: list[str] = []  # text to prepend to content for bot @-mentions
+
         if metadata.get("at_all"):
             items.append(_api.ContentItem("at", "all"))
-        elif metadata.get("mention_user_ids"):
-            ids = str(metadata["mention_user_ids"])
-            items.append(_api.ContentItem("at", ids))
+        else:
+            # mention_user_ids → atuserids (human users, uuapName strings)
+            if metadata.get("mention_user_ids"):
+                ids = str(metadata["mention_user_ids"])
+                items.append(_api.ContentItem("at", ids))
+            # mention_agent_ids → atagentids (bots, numeric agentIds)
+            # Infoflow requires the literal "@<agentId>" in the message body for
+            # the bot @-mention to render correctly.
+            if metadata.get("mention_agent_ids"):
+                raw_ids = str(metadata["mention_agent_ids"])
+                items.append(_api.ContentItem("at-agent", raw_ids))
+                for aid in (s.strip() for s in raw_ids.split(",") if s.strip()):
+                    at_prefix_parts.append(f"@{aid}")
+
+        # --- Text / Markdown content ---
         if content:
+            if at_prefix_parts:
+                content = " ".join(at_prefix_parts) + " " + content
             markdown = metadata.get("markdown")
             if markdown is None:
                 markdown = self._looks_like_markdown(content)
@@ -1843,9 +1860,13 @@ def register(ctx: Any) -> None:
             "You are chatting via Baidu Infoflow (如流). Infoflow renders "
             "Markdown (bold/italic/code/lists/links). In group chats "
             "(chat_id=group:<id>) you can @-mention everyone via "
-            "metadata.at_all=true, or specific users via "
+            "metadata.at_all=true, specific users via "
             "metadata.mention_user_ids='user1,user2' (comma-separated "
-            "uuapNames). Use the infoflow_recall_message tool to recall "
+            "uuapNames), or specific bots via "
+            "metadata.mention_agent_ids='17212,33333' (comma-separated "
+            "numeric agentIds). The plugin auto-injects @<agentId> into "
+            "the message body so the mention renders correctly. "
+            "Use the infoflow_recall_message tool to recall "
             "your own previously-sent message; NEVER pass the inbound user "
             "message_id as the recall target — that is the USER's message, "
             "not a bot message, and the call will fail."
