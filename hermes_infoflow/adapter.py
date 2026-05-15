@@ -1070,6 +1070,8 @@ class InfoflowAdapter(BasePlatformAdapter):
                 raw_ids = str(metadata["mention_agent_ids"])
                 items.append(_api.ContentItem("at-agent", raw_ids))
                 for aid in (s.strip() for s in raw_ids.split(",") if s.strip()):
+                    if content and f"@{aid}" in content:
+                        continue  # avoid duplicate injection
                     at_prefix_parts.append(f"@{aid}")
 
         # --- Text / Markdown content ---
