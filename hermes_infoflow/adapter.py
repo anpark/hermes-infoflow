@@ -1102,6 +1102,26 @@ class InfoflowAdapter(BasePlatformAdapter):
         reply_to: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> "SendResult":  # type: ignore[name-defined]
+        # ``_http_session`` is created on the main gateway event loop, but this
+        # method may be called from ``worker_loop`` (tool dispatcher).  Using a
+        # session across event loops makes aiohttp raise:
+        #   RuntimeError: Timeout context manager should be used inside a task
+        # Fix: temporarily null the session so _api calls create a fresh one
+        # bound to the current loop, then restore it afterwards.
+        _saved_session = self._http_session
+        self._http_session = None
+        try:
+            return await self._send_impl(chat_id, content, reply_to, metadata)
+        finally:
+            self._http_session = _saved_session
+
+    async def _send_impl(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> "SendResult":  # type: ignore[name-defined]
         kind, group_id, dm_user = self._parse_target(chat_id)
         if kind == "group" and group_id is None:
             return SendResult(success=False, error="invalid group chat id")  # type: ignore[call-arg]
