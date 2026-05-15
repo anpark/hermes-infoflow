@@ -1719,15 +1719,25 @@ _RECALL_TOOL_SCHEMA = {
 }
 
 
+def _tool_result_json(payload: dict[str, Any]) -> str:
+    """Serialize a tool handler result for Chat Completions tool messages.
+
+    OpenAI-compatible APIs require tool message ``content`` to be a string,
+    not a JSON object. Hermes CLI may stringify for you; the gateway path
+    persists the handler return value as-is.
+    """
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def _make_recall_handler():
     """Build the ``infoflow_recall_message`` tool handler.
 
     Resolves the live adapter via the platform registry so we can reach
-    its in-memory ``SentMessageStore``. Returns ``{"error": ...}`` /
-    ``{"success": True, ...}``.
+    its in-memory ``SentMessageStore``. Returns a JSON string with
+    ``{"error": ...}`` or ``{"success": true, "message_id": ...}``.
     """
 
-    async def _handler(args: dict, **_kwargs) -> dict[str, Any]:
+    async def _handler(args: dict, **_kwargs) -> str:
         target = args.get("target")
         message_id = args.get("message_id") or None
         current_inbound = args.get("current_inbound_message_id") or None
@@ -1736,7 +1746,7 @@ def _make_recall_handler():
         except (TypeError, ValueError):
             count = 1
         if not target:
-            return {"error": "target is required"}
+            return _tool_result_json({"error": "target is required"})
 
         try:
             from gateway.run import _gateway_runner_ref  # type: ignore[import-not-found]
@@ -1755,11 +1765,11 @@ def _make_recall_handler():
             adapter = None
 
         if adapter is None:
-            return {"error": (
+            return _tool_result_json({"error": (
                 "Infoflow adapter not running in this process — cross-process "
                 "recall is only supported with an explicit message_id (use the "
                 "send_message tool's last-known id)."
-            )}
+            )})
         # ``adapter._http_session`` was created on the main gateway event loop,
         # but this tool handler runs on ``worker_loop`` (a separate loop used
         # by the tool dispatcher — see model_tools.py:_run_async).  Using a
@@ -1779,8 +1789,12 @@ def _make_recall_handler():
         finally:
             adapter._http_session = saved_session
         if not result.success:
-            return {"error": result.error or "recall failed"}
-        return {"success": True, "message_id": result.message_id}
+            return _tool_result_json({"error": result.error or "recall failed"})
+        mid = result.message_id
+        return _tool_result_json({
+            "success": True,
+            "message_id": str(mid) if mid is not None else None,
+        })
 
     return _handler
 

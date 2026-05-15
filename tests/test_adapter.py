@@ -245,11 +245,11 @@ def test_recall_tool_handler_takes_args_dict(configured_env, monkeypatch) -> Non
     async def _go():
         return await handler({"target": "alice", "count": 1})
 
-    import asyncio
     result = asyncio.run(_go())
-    assert isinstance(result, dict)
+    assert isinstance(result, str)
+    parsed = json.loads(result)
     # No live runner in tests, so we expect the cross-process error path.
-    assert "error" in result
+    assert "error" in parsed
 
 
 def test_send_image_private_sends_native_image(configured_env, monkeypatch, tmp_path) -> None:
