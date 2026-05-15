@@ -1068,11 +1068,18 @@ class InfoflowAdapter(BasePlatformAdapter):
             # the bot @-mention to render correctly.
             if metadata.get("mention_agent_ids"):
                 raw_ids = str(metadata["mention_agent_ids"])
-                items.append(_api.ContentItem("at-agent", raw_ids))
+                # Dedup: if content already contains @<agentId>, don't inject
+                # at-agent content item either — the service will still render
+                # the in-body @mention, and adding at-agent would cause a
+                # duplicate "@botName" append by the server.
+                agent_ids_for_api: list[str] = []
                 for aid in (s.strip() for s in raw_ids.split(",") if s.strip()):
                     if content and f"@{aid}" in content:
-                        continue  # avoid duplicate injection
+                        continue  # body already has it, skip entirely
                     at_prefix_parts.append(f"@{aid}")
+                    agent_ids_for_api.append(aid)
+                if agent_ids_for_api:
+                    items.append(_api.ContentItem("at-agent", ",".join(agent_ids_for_api)))
 
         # --- Text / Markdown content ---
         if content:
