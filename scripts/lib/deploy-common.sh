@@ -74,17 +74,59 @@ print("OK")
 PYEOF
 )
 
-# Resolve the Python interpreter. Priority:
-#   1. $PYTHON (explicit override; respected as-is, no auto-detect).
-#   2. The interpreter behind the `hermes` CLI on PATH — for pipx / venv
-#      installs this is hermes-agent's own venv Python, which already has
-#      cryptography / aiohttp / pyyaml. Lets `bash scripts/deploy.sh` work
-#      without sourcing any venv.
-#   3. plain `python3` (works when hermes-agent is installed system-wide
-#      or with `pip install --user`).
+# Pip package names (``yaml`` imports from the ``pyyaml`` distribution).
+PLUGIN_PIP_PACKAGES=(cryptography aiohttp pyyaml)
+
+# Set HERMES_DEPLOY_AUTO_PIP=0 to refuse automatic ``pip install`` / ``pipx inject``.
+HERMES_DEPLOY_AUTO_PIP="${HERMES_DEPLOY_AUTO_PIP:-1}"
+
+CANDIDATE_PYTHONS=()
+HERMES_LINKED_PYTHONS=()
+
+_add_candidate() {
+  local py="$1"
+  local hermes_linked="${2:-0}"
+  [[ -z "$py" ]] && return 0
+  if [[ "$py" != /* ]] && ! command -v "$py" >/dev/null 2>&1; then
+    return 0
+  fi
+  if [[ "$py" != /* ]]; then
+    py="$(command -v "$py")"
+  fi
+  [[ -x "$py" ]] || return 0
+  local existing
+  if [[ ${#CANDIDATE_PYTHONS[@]} -gt 0 ]]; then
+    for existing in "${CANDIDATE_PYTHONS[@]}"; do
+      if [[ "$existing" == "$py" ]]; then
+        return 0
+      fi
+    done
+  fi
+  CANDIDATE_PYTHONS+=("$py")
+  if [[ "$hermes_linked" == "1" ]]; then
+    HERMES_LINKED_PYTHONS+=("$py")
+  fi
+}
+
+# pipx-installed hermes-agent exposes its venv Python here.
+detect_pipx_hermes_python() {
+  local py
+  command -v pipx >/dev/null 2>&1 || return 1
+  py="$(pipx environment hermes-agent -P python 2>/dev/null)" || return 1
+  [[ -n "$py" && -x "$py" ]] || return 1
+  printf '%s\n' "$py"
+}
+
+# Resolve the Python interpreter behind ``hermes`` on PATH (shebang or pipx).
 detect_hermes_python() {
-  local hermes_bin shebang interp
+  local hermes_bin shebang interp pipx_py
   command -v hermes >/dev/null 2>&1 || return 1
+
+  if pipx_py="$(detect_pipx_hermes_python)"; then
+    printf '%s\n' "$pipx_py"
+    return 0
+  fi
+
   hermes_bin="$(command -v hermes)"
   if command -v realpath >/dev/null 2>&1; then
     hermes_bin="$(realpath "$hermes_bin" 2>/dev/null || echo "$hermes_bin")"
@@ -92,55 +134,230 @@ detect_hermes_python() {
   shebang="$(head -n 1 "$hermes_bin" 2>/dev/null || true)"
   if [[ "$shebang" =~ ^#![[:space:]]*([^[:space:]]+) ]]; then
     interp="${BASH_REMATCH[1]}"
-    # `/usr/bin/env python3` wrappers just defer to PATH, no info gained.
     if [[ "$interp" != */env ]] && [[ -x "$interp" ]]; then
       printf '%s\n' "$interp"
       return 0
     fi
   fi
+
+  # Common pipx / manual venv layouts when the CLI wrapper uses ``#!/usr/bin/env``.
+  local guess
+  for guess in \
+    "${HOME}/.local/pipx/venvs/hermes-agent/bin/python" \
+    "${HOME}/.local/share/pipx/venvs/hermes-agent/bin/python" \
+    "${HOME}/.hermes/venv/bin/python" \
+    "${HOME}/.hermes/.venv/bin/python"
+  do
+    if [[ -x "$guess" ]]; then
+      printf '%s\n' "$guess"
+      return 0
+    fi
+  done
   return 1
 }
 
-CANDIDATE_PYTHONS=()
-if [[ -n "${PYTHON:-}" ]]; then
-  CANDIDATE_PYTHONS+=("$PYTHON")
-else
-  if hermes_py="$(detect_hermes_python)"; then
-    CANDIDATE_PYTHONS+=("$hermes_py")
+collect_candidate_pythons() {
+  CANDIDATE_PYTHONS=()
+  HERMES_LINKED_PYTHONS=()
+
+  if [[ -n "${PYTHON:-}" ]]; then
+    _add_candidate "$PYTHON" 1
+    return 0
   fi
-  CANDIDATE_PYTHONS+=("python3")
-fi
+
+  local hermes_py
+  if hermes_py="$(detect_hermes_python)"; then
+    _add_candidate "$hermes_py" 1
+  fi
+  if hermes_py="$(detect_pipx_hermes_python)"; then
+    _add_candidate "$hermes_py" 1
+  fi
+
+  if [[ -n "${VIRTUAL_ENV:-}" ]]; then
+    _add_candidate "${VIRTUAL_ENV}/bin/python" 0
+  fi
+
+  local ver
+  for ver in python3 python3.14 python3.13 python3.12 python3.11; do
+    _add_candidate "$ver" 0
+  done
+}
+
+python_deps_ok() {
+  local py="$1"
+  "$py" -c "$DEP_CHECK_SCRIPT" >/dev/null 2>&1
+}
+
+python_has_pip() {
+  local py="$1"
+  "$py" -m pip --version >/dev/null 2>&1
+}
+
+pipx_has_hermes_agent() {
+  # Prefer a concrete venv path over parsing ``pipx list`` output.
+  detect_pipx_hermes_python >/dev/null 2>&1
+}
+
+warn_if_deploy_python_differs_from_hermes() {
+  local py="$1"
+  local ref="" ref_label=""
+  if ref="$(detect_pipx_hermes_python 2>/dev/null)"; then
+    ref_label="pipx hermes-agent"
+  elif ref="$(detect_hermes_python 2>/dev/null)"; then
+    ref_label="hermes CLI"
+  else
+    return 0
+  fi
+  local py_real="$py" ref_real="$ref"
+  if command -v realpath >/dev/null 2>&1; then
+    py_real="$(realpath "$py" 2>/dev/null || echo "$py")"
+    ref_real="$(realpath "$ref" 2>/dev/null || echo "$ref")"
+  fi
+  if [[ "$py_real" == "$ref_real" ]]; then
+    return 0
+  fi
+  echo "  ⚠ warning: deploy verified deps on: $py" >&2
+  echo "    but $ref_label Python is: $ref" >&2
+  echo "    Gateway loads plugins with the hermes-agent interpreter — if the plugin" >&2
+  echo "    fails at runtime, re-run with:" >&2
+  echo "      PYTHON=\$(pipx environment hermes-agent -P python) bash scripts/deploy.sh" >&2
+}
+
+auto_install_plugin_deps() {
+  local target="$1"
+  local pip_args=()
+
+  if [[ "$HERMES_DEPLOY_AUTO_PIP" == "0" ]]; then
+    return 1
+  fi
+
+  echo "==> Auto-installing plugin dependencies (cryptography, aiohttp, pyyaml)"
+
+  # Best case: deps belong in hermes-agent's pipx venv (same runtime as gateway).
+  if pipx_has_hermes_agent; then
+    echo "$ pipx inject hermes-agent ${PLUGIN_PIP_PACKAGES[*]}"
+    if [[ "$DRY_RUN" == "true" ]]; then
+      return 0
+    fi
+    if pipx inject hermes-agent "${PLUGIN_PIP_PACKAGES[@]}"; then
+      local pipx_py
+      if pipx_py="$(detect_pipx_hermes_python)"; then
+        python_deps_ok "$pipx_py" && return 0
+      fi
+    else
+      echo "  - pipx inject hermes-agent failed" >&2
+    fi
+  fi
+
+  if ! python_has_pip "$target"; then
+    echo "  - $target has no working pip; cannot auto-install." >&2
+    return 1
+  fi
+
+  # Only use --user for a plain system interpreter (not a venv / pipx path).
+  if [[ -z "${VIRTUAL_ENV:-}" ]] \
+    && [[ "$target" != *"/pipx/"* ]] \
+    && [[ "$target" != *"/venv/"* ]] \
+    && [[ "$target" != *"/.venv/"* ]]; then
+    pip_args+=(--user)
+  fi
+
+  echo "$ $target -m pip install ${pip_args[*]:-} ${PLUGIN_PIP_PACKAGES[*]}"
+  if [[ "$DRY_RUN" == "true" ]]; then
+    return 0
+  fi
+  if ! "$target" -m pip install "${pip_args[@]}" "${PLUGIN_PIP_PACKAGES[@]}"; then
+    echo "  - pip install failed for $target" >&2
+    return 1
+  fi
+  return 0
+}
+
+pick_install_target() {
+  local py
+  if [[ ${#HERMES_LINKED_PYTHONS[@]} -gt 0 ]]; then
+    printf '%s\n' "${HERMES_LINKED_PYTHONS[0]}"
+    return 0
+  fi
+  if [[ ${#CANDIDATE_PYTHONS[@]} -gt 0 ]]; then
+    for py in "${CANDIDATE_PYTHONS[@]}"; do
+      if python_has_pip "$py"; then
+        printf '%s\n' "$py"
+        return 0
+      fi
+    done
+    printf '%s\n' "${CANDIDATE_PYTHONS[0]}"
+  fi
+}
+
+collect_candidate_pythons
 
 PY=""
 if [[ "$DRY_RUN" == "true" ]]; then
-  PY="${CANDIDATE_PYTHONS[0]}"
-  echo "  candidate interpreters: ${CANDIDATE_PYTHONS[*]}"
+  PY="${CANDIDATE_PYTHONS[0]:-python3}"
+  echo "  candidate interpreters: ${CANDIDATE_PYTHONS[*]:-<none>}"
+  echo "  hermes-linked interpreters: ${HERMES_LINKED_PYTHONS[*]:-<none>}"
   echo "$ $PY -c <dep-check>"
 else
-  for candidate in "${CANDIDATE_PYTHONS[@]}"; do
-    if "$candidate" -c "$DEP_CHECK_SCRIPT" >/dev/null 2>&1; then
-      PY="$candidate"
-      echo "  using interpreter: $PY"
-      break
-    fi
-  done
+  if [[ ${#CANDIDATE_PYTHONS[@]} -gt 0 ]]; then
+    for candidate in "${CANDIDATE_PYTHONS[@]}"; do
+      if python_deps_ok "$candidate"; then
+        PY="$candidate"
+        echo "  using interpreter: $PY"
+        break
+      fi
+    done
+  fi
+
   if [[ -z "$PY" ]]; then
-    PY="${CANDIDATE_PYTHONS[0]}"
-    # Re-run loudly so the user sees which modules are missing.
-    "$PY" -c "$DEP_CHECK_SCRIPT" || true
+    install_target="$(pick_install_target)"
+    if [[ -n "$install_target" ]] && auto_install_plugin_deps "$install_target"; then
+      collect_candidate_pythons
+      if [[ ${#CANDIDATE_PYTHONS[@]} -gt 0 ]]; then
+        for candidate in "${CANDIDATE_PYTHONS[@]}"; do
+          if python_deps_ok "$candidate"; then
+            PY="$candidate"
+            echo "  using interpreter after auto-install: $PY"
+            break
+          fi
+        done
+      fi
+    fi
+  fi
+
+  if [[ -z "$PY" ]]; then
+    install_target="${install_target:-$(pick_install_target)}"
+    if [[ -n "${install_target:-}" ]]; then
+      "$install_target" -c "$DEP_CHECK_SCRIPT" || true
+    elif [[ ${#CANDIDATE_PYTHONS[@]} -gt 0 ]]; then
+      "${CANDIDATE_PYTHONS[0]}" -c "$DEP_CHECK_SCRIPT" || true
+    fi
     echo
     echo "✗ One or more required Python packages are missing." >&2
     echo "  Required: cryptography, aiohttp, pyyaml" >&2
-    echo "  Tried interpreters: ${CANDIDATE_PYTHONS[*]}" >&2
-    echo "  These are normally already installed by hermes-agent itself." >&2
+    echo "  Tried interpreters: ${CANDIDATE_PYTHONS[*]:-<none>}" >&2
+    echo "  Hermes-linked interpreters: ${HERMES_LINKED_PYTHONS[*]:-<none>}" >&2
+    if [[ "$HERMES_DEPLOY_AUTO_PIP" == "0" ]]; then
+      echo "  Auto-install was disabled (HERMES_DEPLOY_AUTO_PIP=0)." >&2
+    else
+      echo "  Auto-install was attempted but did not succeed." >&2
+    fi
     echo "  Fixes (any one):" >&2
-    echo "    1) install hermes-agent so its venv Python is auto-detected:" >&2
+    echo "    1) install hermes-agent (recommended — gateway uses its venv):" >&2
     echo "         pipx install hermes-agent" >&2
-    echo "    2) explicitly point at a Python that has the deps:" >&2
-    echo "         PYTHON=/path/to/python bash scripts/deploy.sh" >&2
-    echo "    3) install per-user against the interpreter shown above:" >&2
-    echo "         $PY -m pip install --user cryptography aiohttp pyyaml" >&2
+    echo "    2) point deploy at that Python explicitly:" >&2
+    echo "         PYTHON=\$(pipx environment hermes-agent -P python) bash scripts/deploy.sh" >&2
+    echo "    3) install manually:" >&2
+    if [[ -n "${install_target:-}" ]]; then
+      echo "         ${install_target} -m pip install cryptography aiohttp pyyaml" >&2
+    else
+      echo "         python3 -m pip install --user cryptography aiohttp pyyaml" >&2
+    fi
     exit 1
+  fi
+
+  if [[ -n "$PY" ]]; then
+    warn_if_deploy_python_differs_from_hermes "$PY"
   fi
 fi
 

@@ -86,6 +86,8 @@ bash scripts/deploy.sh             # 同步到 ~/.hermes/plugins/infoflow/、重
 bash scripts/deploy.sh --dry-run   # 仅打印操作
 ```
 
+`deploy.sh` 会同步插件并自动选择 Python：优先 `hermes` / `pipx` 的 `hermes-agent` venv，再尝试 `python3`。若缺少 `cryptography` / `aiohttp` / `pyyaml`，默认会尝试 `pipx inject hermes-agent …` 或对当前解释器 `pip install`（可用 `HERMES_DEPLOY_AUTO_PIP=0` 关闭）。若检测到的解释器与 gateway 实际用的 pipx venv 不一致，脚本会打印 warning。
+
 镜像 [`openclaw-infoflow/scripts/deploy.sh`](https://github.com/chbo297/openclaw-infoflow/blob/main/scripts/deploy.sh)。
 
 ---
