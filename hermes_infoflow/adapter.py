@@ -1884,6 +1884,42 @@ def _make_recall_handler():
     return _handler
 
 
+# ---------------------------------------------------------------------------
+# Target parsing for send_message tool integration
+# ---------------------------------------------------------------------------
+
+
+def _parse_infoflow_target(
+    target_ref: str,
+) -> tuple[str, str | None] | None:
+    """Parse an infoflow target reference into ``(chat_id, thread_id)``.
+
+    This is registered as ``PlatformEntry.target_parse_fn`` so that
+    ``tools/send_message_tool._parse_target_ref`` can recognise infoflow
+    targets on the first pass (without consulting channel_directory).
+
+    Recognised formats::
+
+        group:<id>        → ("group:<id>", None)
+        <id> (numeric)    → ("group:<id>", None)
+        <uuapName>        → ("<uuapName>", None)
+
+    Returns ``None`` for empty/whitespace-only strings to decline parsing.
+    Infoflow does not use threads (unlike Telegram topics).
+    """
+    target_ref = target_ref.strip()
+    if not target_ref:
+        return None
+    # Already in canonical form: group:4507088
+    if target_ref.startswith("group:"):
+        return (target_ref, None)
+    # Pure numeric → treat as group ID (matches _normalize_chat_id logic)
+    if target_ref.isdigit():
+        return (f"group:{target_ref}", None)
+    # Anything else → uuapName (DM)
+    return (target_ref, None)
+
+
 def register(ctx: Any) -> None:
     """Plugin entry point. Called by hermes-agent's plugin manager.
 
@@ -1924,10 +1960,15 @@ def register(ctx: Any) -> None:
         emoji="📣",
         pii_safe=False,
         allow_update_command=True,
+        target_parse_fn=_parse_infoflow_target,
         platform_hint=(
             "You are chatting via Baidu Infoflow (如流). Infoflow renders "
-            "Markdown (bold/italic/code/lists/links). In group chats "
-            "(chat_id=group:<id>) you can @-mention everyone via "
+            "Markdown (bold/italic/code/lists/links). "
+            "send_message targets use the format ``infoflow:<target>`` where "
+            "<target> is either a uuapName (for DMs, e.g. ``infoflow:chengbo05``) "
+            "or ``group:<id>`` (for groups, e.g. ``infoflow:group:4507088``). "
+            "Omitting the target sends to the home channel. "
+            "In group chats (chat_id=group:<id>) you can @-mention everyone via "
             "metadata.at_all=true, specific users via "
             "metadata.mention_user_ids='user1,user2' (comma-separated "
             "uuapNames), or specific bots via "

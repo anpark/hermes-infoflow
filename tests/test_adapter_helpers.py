@@ -187,3 +187,50 @@ def test_read_settings_picks_robot_id_seed(monkeypatch) -> None:
     monkeypatch.setenv("INFOFLOW_ROBOT_ID", "12345")
     s = _read_account_settings(_cfg())
     assert s["robot_id"] == "12345"
+
+
+# ---------------------------------------------------------------------------
+# Target parsing (_parse_infoflow_target)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_infoflow_target_group_prefix() -> None:
+    result = ad._parse_infoflow_target("group:4507088")
+    assert result == ("group:4507088", None)
+
+
+def test_parse_infoflow_target_numeric_as_group() -> None:
+    result = ad._parse_infoflow_target("4507088")
+    assert result == ("group:4507088", None)
+
+
+def test_parse_infoflow_target_uuapname_dm() -> None:
+    result = ad._parse_infoflow_target("chengbo05")
+    assert result == ("chengbo05", None)
+
+
+def test_parse_infoflow_target_empty_string() -> None:
+    assert ad._parse_infoflow_target("") is None
+
+
+def test_parse_infoflow_target_whitespace_only() -> None:
+    assert ad._parse_infoflow_target("   ") is None
+
+
+def test_parse_infoflow_target_strips_whitespace() -> None:
+    result = ad._parse_infoflow_target("  group:4507088  ")
+    assert result == ("group:4507088", None)
+
+
+def test_parse_infoflow_target_thread_always_none() -> None:
+    """Infoflow does not use threads (unlike Telegram topics)."""
+    for ref in ("group:4507088", "chengbo05", "12345"):
+        result = ad._parse_infoflow_target(ref)
+        assert result is not None
+        assert result[1] is None
+
+
+def test_parse_infoflow_target_account_id_dm() -> None:
+    """accountId-style strings (non-numeric uuapNames) treated as DM."""
+    result = ad._parse_infoflow_target("chengbo297")
+    assert result == ("chengbo297", None)
