@@ -101,7 +101,7 @@ DEFAULT_HOST = "0.0.0.0"
 DEFAULT_WEBHOOK_PATH = "/webhook/infoflow"
 MAX_MESSAGE_LENGTH = 2048  # matches OpenClaw textChunkLimit
 DEFAULT_BODY_LIMIT_BYTES = 20 * 1024 * 1024
-GROUP_TARGET_RE = re.compile(r"^group:(\d+)$", re.IGNORECASE)
+GROUP_TARGET_RE = re.compile(r"^(?:group:)?(\d+)$", re.IGNORECASE)
 
 # Optional hint for ``infoflow_recall_message`` when the agent runtime does not
 # pass ``current_inbound_message_id`` explicitly (OpenClaw supplies the
@@ -1037,12 +1037,19 @@ class InfoflowAdapter(BasePlatformAdapter):
         Strips an optional ``infoflow:`` prefix so callers passing
         ``infoflow:group:42`` and ``group:42`` see the same sent-store
         bucket and the same inbound-context scope.
+
+        Pure-numeric chat_ids are assumed to be group IDs and normalised
+        to ``group:<id>`` for consistency with the ``group:`` prefix used
+        by the inbound webhook handler.
         """
         if chat_id and chat_id.lower().startswith("infoflow:"):
-            return chat_id[len("infoflow:"):]
+            chat_id = chat_id[len("infoflow:"):]
+        if chat_id and chat_id.isdigit():
+            return f"group:{chat_id}"
         return chat_id
 
-    def _build_contents(self, content: str, metadata: dict[str, Any] | None) -> list[_api.ContentItem]:
+    @staticmethod
+    def _build_contents(content: str, metadata: dict[str, Any] | None) -> list[_api.ContentItem]:
         """Translate a plain-text/markdown body + metadata into ``ContentItem``s.
 
         ``metadata`` supports::
@@ -1087,7 +1094,7 @@ class InfoflowAdapter(BasePlatformAdapter):
                 content = " ".join(at_prefix_parts) + " " + content
             markdown = metadata.get("markdown")
             if markdown is None:
-                markdown = self._looks_like_markdown(content)
+                markdown = InfoflowAdapter._looks_like_markdown(content)
             items.append(_api.ContentItem("markdown" if markdown else "text", content))
         return items
 
@@ -1164,9 +1171,23 @@ class InfoflowAdapter(BasePlatformAdapter):
                     contents=contents,
                     session=self._http_session,
                 )
+                # Enrich opaque API errors with actionable hints.
+                if not res.get("ok") and dm_user:
+                    err = res.get("error", "")
+                    if "可见范围" in err or "关注" in err:
+                        res["error"] = (
+                            f"{err} "
+                            f"(to_user={dm_user!r} — Infoflow private send requires the "
+                            f"recipient to have an existing conversation with the bot, "
+                            f"or the chat_id must be a uuapName rather than an accountId)"
+                        )
 
             if res.get("ok"):
                 succeeded_count += 1
+                # For group messages ``messageid`` is the Infoflow message id.
+                # For private messages the API returns ``msgkey`` instead; we
+                # store it in the ``messageid`` column so ``find()`` and
+                # ``recall_private_message(msgkey=...)`` work uniformly.
                 mid = res.get("messageid") or res.get("msgkey")
                 msgseq = res.get("msgseqid") or ""
                 if mid:
@@ -1439,6 +1460,8 @@ class InfoflowAdapter(BasePlatformAdapter):
                     session=self._http_session,
                 )
             else:
+                # Private recall: ``mid`` here is actually the ``msgkey``
+                # stored in the ``messageid`` column (see _send_impl comment).
                 res = await _api.recall_private_message(
                     self._api_account,
                     msgkey=mid,
@@ -1552,6 +1575,7 @@ async def _standalone_send(
     message: str,
     *,
     thread_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
     media_files: list[str] | None = None,
     force_document: bool = False,
 ) -> dict[str, Any]:
@@ -1573,8 +1597,15 @@ async def _standalone_send(
         return {"error": "Infoflow standalone send: INFOFLOW_API_HOST/APP_KEY/APP_SECRET are required"}
 
     kind, group_id, dm_user = InfoflowAdapter._parse_target(chat_id)
-    is_markdown = InfoflowAdapter._looks_like_markdown(message)
-    contents = [_api.ContentItem("markdown" if is_markdown else "text", message)]
+    # Build content items from message + metadata (supports @-mentions).
+    if kind == "group" and metadata:
+        # Reuse the adapter's _build_contents for metadata handling (@-mentions).
+        # We instantiate a minimal dummy so the staticmethod can be reached
+        # without a full adapter instance.
+        contents = InfoflowAdapter._build_contents(message, metadata)
+    else:
+        is_markdown = InfoflowAdapter._looks_like_markdown(message)
+        contents = [_api.ContentItem("markdown" if is_markdown else "text", message)]
 
     try:
         if kind == "group":
@@ -1592,7 +1623,7 @@ async def _standalone_send(
 
     if not res.get("ok"):
         return {"error": res.get("error") or "send failed"}
-    mid = res.get("messageid") or res.get("msgkey")
+    mid = res.get("messageid") if res.get("messageid") else res.get("msgkey")
     msgseq = res.get("msgseqid") or ""
 
     # Persist for cross-process recall — same DB the adapter would use.
@@ -1782,6 +1813,11 @@ def _make_recall_handler():
     its in-memory ``SentMessageStore``. Returns a JSON string with
     ``{"error": ...}`` or ``{"success": true, "message_id": ...}``.
     """
+    # Guard against concurrent recall calls nulling/restoring the adapter
+    # session in an interleaved fashion (each call temporarily sets
+    # ``_http_session = None`` to work around a cross-event-loop aiohttp
+    # limitation).
+    _recall_lock = asyncio.Lock()
 
     async def _handler(args: dict, **_kwargs) -> str:
         target = args.get("target")
@@ -1823,17 +1859,20 @@ def _make_recall_handler():
         #   RuntimeError: Timeout context manager should be used inside a task
         # Fix: temporarily null the session so delete_message's internal
         # _ensure_session(None) creates a fresh session bound to worker_loop.
-        saved_session = getattr(adapter, "_http_session", None)
-        adapter._http_session = None
-        try:
-            result = await adapter.delete_message(
-                target,
-                message_id,
-                count=count,
-                current_inbound_message_id=current_inbound,
-            )
-        finally:
-            adapter._http_session = saved_session
+        # An asyncio.Lock prevents concurrent recall handlers from clobbering
+        # each other's saved/restored session reference.
+        async with _recall_lock:
+            saved_session = getattr(adapter, "_http_session", None)
+            adapter._http_session = None
+            try:
+                result = await adapter.delete_message(
+                    target,
+                    message_id,
+                    count=count,
+                    current_inbound_message_id=current_inbound,
+                )
+            finally:
+                adapter._http_session = saved_session
         if not result.success:
             return _tool_result_json({"error": result.error or "recall failed"})
         mid = result.message_id

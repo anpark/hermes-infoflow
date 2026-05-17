@@ -55,7 +55,7 @@ class SentMessage:
     """One outbound message record for by-count recall."""
 
     chat_id: str
-    messageid: str
+    messageid: str     # Infoflow message id for groups; *msgkey* for private chats
     msgseqid: str = ""
     digest: str = ""        # short text fingerprint for debug / future filters
     sent_at_ms: int = 0
