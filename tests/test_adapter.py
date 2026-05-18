@@ -19,6 +19,7 @@ gateway_base = pytest.importorskip("gateway.platforms.base")  # noqa: F401  (pre
 
 from hermes_infoflow import api as _api  # noqa: E402
 from hermes_infoflow import crypto as _crypto  # noqa: E402
+from hermes_infoflow.sent_store import SentMessageStore  # noqa: E402
 from hermes_infoflow.adapter import InfoflowAdapter  # noqa: E402
 from hermes_infoflow.parser import AccountConfig  # noqa: E402
 from tests._aes_helpers import aes_ecb_encrypt_b64url, aes_key_b64url  # noqa: E402
@@ -213,8 +214,11 @@ def test_delete_message_by_count_uses_sent_store(configured_env, monkeypatch) ->
     assert captured["msgkey"] == "MID-1"
 
 
-def test_delete_message_with_no_recent_returns_error(configured_env) -> None:
+def test_delete_message_with_no_recent_returns_error(configured_env, monkeypatch) -> None:
     adapter = InfoflowAdapter(_make_config())
+
+    # Ensure no stale data leaks from previous tests (SQLite may persist).
+    adapter._sent_store = SentMessageStore(dedup_set=set())
 
     async def _go():
         return await adapter.delete_message("alice")
@@ -228,9 +232,9 @@ def test_recall_tool_handler_takes_args_dict(configured_env, monkeypatch) -> Non
     """The recall handler must accept a single ``args`` dict + kwargs,
     matching tools/registry.py's calling convention (registry.dispatch
     calls ``entry.handler(args, **kwargs)``)."""
-    from hermes_infoflow.adapter import _make_recall_handler
+    from hermes_infoflow.tools import make_recall_handler
 
-    handler = _make_recall_handler()
+    handler = make_recall_handler()
     import inspect
     sig = inspect.signature(handler)
     # First param is named `args` and is positional.

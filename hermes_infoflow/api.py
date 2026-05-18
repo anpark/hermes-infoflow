@@ -31,6 +31,7 @@ import json
 import logging
 import time
 import uuid
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -84,11 +85,28 @@ class ContentItem:
 
 @dataclass
 class ReplyContext:
-    """Reply / quote context for group messages."""
+    """Reply / quote context for group messages.
+
+    Per the Infoflow API docs, reply sits at the same level as header
+    and body inside the ``message`` object.
+    """
 
     messageid: str
     preview: str = ""
     replytype: str = "1"  # "1" = reply (default), "2" = quote
+    imid: str = ""        # robot imid (required by the API)
+
+
+@dataclass
+class GroupMember:
+    """A member of an Infoflow group (user or bot)."""
+
+    uid: str              # userId (humans) or str(agentId) (bots)
+    name: str             # display name
+    role: str             # "owner" | "manager" | "member"
+    is_bot: bool          # True for agent-type members
+    agent_id: int | None  # agentId for bots, None for humans
+    imid: str = ""        # Infoflow numeric imId / robotId
 
 
 # ---------------------------------------------------------------------------
@@ -292,30 +310,27 @@ def _build_private_payload(to_user: str, contents: list[ContentItem]) -> dict[st
     return payload
 
 
-def _extract_id_from_raw_json(raw: str, key: str) -> str | None:
-    """Extract a large integer ``key`` value from raw JSON, preserving precision."""
-    import re
-
-    m = re.search(rf'"{re.escape(key)}"\s*:\s*(\d+)', raw)
-    if m:
-        return m.group(1)
-    m = re.search(rf'"{re.escape(key)}"\s*:\s*"([^"]+)"', raw)
-    if m:
-        return m.group(1)
-    return None
+# Pattern for extracting ID fields from raw JSON strings.
+# Infoflow uses 16+ digit integers that exceed JavaScript's Number.MAX_SAFE_INTEGER.
+# Using regex on raw JSON avoids precision loss from json.loads().
+_ID_EXTRACT_RE = re.compile(r'"(%s)"\s*:\s*"?(\d{10,})"?')
 
 
-def _extract_msgkey(data: dict[str, Any]) -> str | None:
-    if data.get("msgkey") is not None:
-        return str(data["msgkey"])
-    inner = data.get("data") if isinstance(data.get("data"), dict) else None
-    if inner:
-        for key in ("messageid", "msgid", "msgkey"):
-            if inner.get(key) is not None:
-                return str(inner[key])
-    for key in ("messageid", "msgid"):
-        if data.get(key) is not None:
-            return str(data[key])
+def _extract_id(raw_json: str, *fields: str) -> str | None:
+    """Extract an ID from a raw JSON string, preserving full integer precision.
+
+    Args:
+        raw_json: The raw JSON response string.
+        *fields: Field names to try, in priority order (e.g. "messageid", "msgid").
+
+    Returns:
+        The ID as a string, or None if not found.
+    """
+    for field in fields:
+        pattern = _ID_EXTRACT_RE.pattern % re.escape(field)
+        m = re.search(pattern, raw_json)
+        if m:
+            return m.group(2)
     return None
 
 
@@ -385,18 +400,11 @@ def _parse_send_response(response_text: str, *, kind: str) -> dict[str, Any]:
             }
 
     if kind == "private":
-        msgkey = (
-            _extract_id_from_raw_json(response_text, "msgkey")
-            or _extract_id_from_raw_json(response_text, "messageid")
-            or _extract_msgkey(inner or {})
-        )
+        msgkey = _extract_id(response_text, "msgkey", "messageid", "msgid")
         return {"ok": True, "msgkey": msgkey, "invaliduser": (inner or {}).get("invaliduser")}
     if kind == "group":
-        messageid = (
-            _extract_id_from_raw_json(response_text, "messageid")
-            or _extract_id_from_raw_json(response_text, "msgid")
-        )
-        msgseqid = _extract_id_from_raw_json(response_text, "msgseqid")
+        messageid = _extract_id(response_text, "messageid", "msgid")
+        msgseqid = _extract_id(response_text, "msgseqid")
         return {"ok": True, "messageid": messageid, "msgseqid": msgseqid}
     return {"ok": True}
 
@@ -495,11 +503,23 @@ async def send_group_message(
         }
         msg_seq += 1
         if reply is not None:
-            payload["message"]["reply"] = {
+            # Per Infoflow docs: reply sits at the same level as header
+            # and body inside the message object.
+            reply_block: dict[str, Any] = {
                 "messageid": reply.messageid,
                 "preview": reply.preview,
                 "replytype": reply.replytype,
             }
+            if reply.imid:
+                reply_block["imid"] = reply.imid
+            payload["message"]["reply"] = reply_block
+        _log = logging.getLogger("hermes_plugins.infoflow.api")
+        _log.debug(
+            "[infoflow] reply payload: messageid=%s preview=%r replytype=%s",
+            reply.messageid if reply else None,
+            reply.preview[:80] if reply else None,
+            reply.replytype if reply else None,
+        )
         body_str = json.dumps(payload, ensure_ascii=False)
         async with _ensure_session(session) as sess:
             async with sess.post(
@@ -556,6 +576,80 @@ async def send_group_message(
             "msgseqid": last_msgseqid,
         }
     return {"ok": True, "messageid": last_messageid, "msgseqid": last_msgseqid}
+
+
+# ---------------------------------------------------------------------------
+# Group members
+# ---------------------------------------------------------------------------
+
+
+async def get_group_members(
+    account: InfoflowAccountAPI,
+    *,
+    group_id: int | str,
+    session: aiohttp.ClientSession | None = None,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+) -> list[GroupMember]:
+    """Fetch the member list of a group.
+
+    Returns a list of :class:`GroupMember` objects (both humans and bots).
+    """
+    _log = logging.getLogger("hermes_plugins.infoflow.api")
+    api_host = ensure_https(account.api_host)
+    token = await get_app_access_token(account, session=session)
+    url = f"{api_host}/api/v1/robot/group/memberList"
+    headers = _auth_headers(token, content_type="application/json")
+    body = json.dumps({"groupId": int(group_id), "recallType": 0})
+
+    async with _ensure_session(session) as sess:
+        async with sess.post(
+            url,
+            data=body.encode("utf-8"),
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=timeout),
+        ) as resp:
+            text = await resp.text()
+
+    try:
+        data = json.loads(text)
+    except Exception:
+        _log.warning("[infoflow] get_group_members: non-JSON response: %s", text[:200])
+        return []
+
+    inner = data.get("data", data)
+    # Handle nested {"data":{"data":{...}}} structure
+    if isinstance(inner, dict) and "data" in inner and isinstance(inner["data"], dict):
+        inner = inner["data"]
+    members: list[GroupMember] = []
+
+    for u in inner.get("userInfoList") or []:
+        members.append(GroupMember(
+            uid=u.get("userId", ""),
+            name=u.get("name", u.get("userId", "")),
+            role=u.get("role", "member"),
+            is_bot=False,
+            agent_id=None,
+            imid="",  # humans don't have imId in this API
+        ))
+
+    for a in inner.get("agentInfoList") or []:
+        aid = a.get("agentId")
+        members.append(GroupMember(
+            uid=str(aid) if aid is not None else "",
+            name=a.get("name", f"机器人{aid}"),
+            role=a.get("role", "member"),
+            is_bot=True,
+            agent_id=int(aid) if aid is not None else None,
+            imid=str(a.get("imId", "")),  # robot imId = webhook fromid
+        ))
+
+    _log.debug(
+        "[infoflow] get_group_members(%s): %d members (%d humans, %d bots)",
+        group_id, len(members),
+        sum(1 for m in members if not m.is_bot),
+        sum(1 for m in members if m.is_bot),
+    )
+    return members
 
 
 # ---------------------------------------------------------------------------
@@ -671,11 +765,13 @@ def _parse_recall_response(response_text: str, *, kind: str) -> dict[str, Any]:
 __all__ = [
     "ContentItem",
     "InfoflowAPIError",
+    "GroupMember",
     "InfoflowAccountAPI",
     "ReplyContext",
     "clear_token_cache",
     "ensure_https",
     "get_app_access_token",
+    "get_group_members",
     "recall_group_message",
     "recall_private_message",
     "send_group_message",

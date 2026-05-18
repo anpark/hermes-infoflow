@@ -11,11 +11,12 @@ import sys
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
-from hermes_infoflow.adapter import InfoflowAdapter, _make_recall_handler, _tool_result_json
+from hermes_infoflow.adapter import InfoflowAdapter
+from hermes_infoflow.tools import make_recall_handler, tool_result_json
 
 
 def test_tool_result_json_returns_string() -> None:
-    raw = _tool_result_json({"success": True, "message_id": "1865187797205374754"})
+    raw = tool_result_json({"success": True, "message_id": "1865187797205374754"})
     assert isinstance(raw, str)
     assert json.loads(raw) == {
         "success": True,
@@ -62,7 +63,7 @@ def test_recall_handler_success_returns_json_string() -> None:
     gw_config = ModuleType("gateway.config")
     gw_config.Platform = _Platform
 
-    handler = _make_recall_handler()
+    handler = make_recall_handler()
     with (
         patch.dict(sys.modules, {"gateway.run": gw_run, "gateway.config": gw_config}),
     ):
@@ -76,7 +77,7 @@ def test_recall_handler_success_returns_json_string() -> None:
 
 
 def test_recall_handler_error_returns_json_string() -> None:
-    handler = _make_recall_handler()
+    handler = make_recall_handler()
     result = asyncio.run(handler({"count": 1}))
     assert isinstance(result, str)
     parsed = json.loads(result)

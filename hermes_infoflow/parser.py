@@ -40,11 +40,11 @@ from .crypto import InfoflowCryptoError, decrypt_message, verify_echostr_signatu
 
 # Regex matches IDs with 16 or more digits — anything shorter is safe to
 # leave as a Python int. The capture groups are (field_name, digits).
-_ID_FIELD_RE = re.compile(r'"(messageid|msgid|MsgId|msgkey|msgseqid)"\s*:\s*(\d{16,})')
+_ID_FIELD_RE = re.compile(r'"(messageid|msgid|MsgId|msgkey|msgseqid|fromid)"\s*:\s*(\d{16,})')
 
 # Field names we patch through ``patch_precise_ids``. Listed here for
 # documentation; the regex is the authoritative source.
-ID_FIELDS = ("messageid", "msgid", "MsgId", "msgkey", "msgseqid")
+ID_FIELDS = ("messageid", "msgid", "MsgId", "msgkey", "msgseqid", "fromid")
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +120,10 @@ class InboundMessage:
     # ``eventtype`` from the inbound payload — surfaced so the adapter / policy
     # can branch on ``MESSAGE_RECEIVE`` vs ``ALL_MESSAGE_FORWARD`` etc.
     event_type: str = ""
+    # Whether the sender is a bot (agent).  Detected by matching ``fromid``
+    # against body-item ``robotid`` values, or by checking if ``fromid`` is a
+    # pure numeric string (robotId is always numeric; human uuapName is not).
+    is_bot_sender: bool = False
 
     def dedupe_key(self) -> str | None:
         """Compute the dedup key (priority: message_id > composite)."""
@@ -598,6 +602,25 @@ def build_group_inbound(
         or from_user
     )
 
+    # Detect if the sender is a bot (agent).
+    # Strategy 1 (reliable): header.fromuserid is absent for bot senders
+    #   and present for human senders.  When fromuserid is missing, from_user
+    #   falls back to msg_data.fromid (a numeric robotId).
+    # Strategy 2 (supplementary): fromid matches a body-item robotid.
+    _header_fromuserid = (header or {}).get("fromuserid") or ""
+    _bot_sender = False
+    if not _header_fromuserid:
+        # No fromuserid → bot sender (human messages always have it)
+        _bot_sender = True
+    elif fromid_str:
+        for bi in body_items:
+            if bi.type == "replyData" and bi.robotid:
+                continue
+            rid = bi.robotid
+            if rid and str(rid) == fromid_str:
+                _bot_sender = True
+                break
+
     return InboundMessage(
         chat_type="group",
         from_user=from_user,
@@ -619,6 +642,7 @@ def build_group_inbound(
         discovered_robot_id=discovered_robot_id,
         fromid=fromid_str,
         event_type=event_type,
+        is_bot_sender=_bot_sender,
     )
 
 

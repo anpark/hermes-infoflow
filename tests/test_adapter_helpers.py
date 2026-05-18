@@ -23,8 +23,11 @@ from hermes_infoflow.adapter import (
     _looks_like_recall_intent,
     _looks_like_recall_latest,
     _lookup_inbound_context,
-    _read_account_settings,
     _register_inbound_context,
+)
+from hermes_infoflow.settings import (
+    _parse_infoflow_target,
+    _read_account_settings,
 )
 
 
@@ -195,42 +198,42 @@ def test_read_settings_picks_robot_id_seed(monkeypatch) -> None:
 
 
 def test_parse_infoflow_target_group_prefix() -> None:
-    result = ad._parse_infoflow_target("group:4507088")
+    result = _parse_infoflow_target("group:4507088")
     assert result == ("group:4507088", None)
 
 
 def test_parse_infoflow_target_numeric_as_group() -> None:
-    result = ad._parse_infoflow_target("4507088")
+    result = _parse_infoflow_target("4507088")
     assert result == ("group:4507088", None)
 
 
 def test_parse_infoflow_target_uuapname_dm() -> None:
-    result = ad._parse_infoflow_target("chengbo05")
+    result = _parse_infoflow_target("chengbo05")
     assert result == ("chengbo05", None)
 
 
 def test_parse_infoflow_target_empty_string() -> None:
-    assert ad._parse_infoflow_target("") is None
+    assert _parse_infoflow_target("") is None
 
 
 def test_parse_infoflow_target_whitespace_only() -> None:
-    assert ad._parse_infoflow_target("   ") is None
+    assert _parse_infoflow_target("   ") is None
 
 
 def test_parse_infoflow_target_strips_whitespace() -> None:
-    result = ad._parse_infoflow_target("  group:4507088  ")
+    result = _parse_infoflow_target("  group:4507088  ")
     assert result == ("group:4507088", None)
 
 
 def test_parse_infoflow_target_thread_always_none() -> None:
     """Infoflow does not use threads (unlike Telegram topics)."""
     for ref in ("group:4507088", "chengbo05", "12345"):
-        result = ad._parse_infoflow_target(ref)
+        result = _parse_infoflow_target(ref)
         assert result is not None
         assert result[1] is None
 
 
 def test_parse_infoflow_target_account_id_dm() -> None:
     """accountId-style strings (non-numeric uuapNames) treated as DM."""
-    result = ad._parse_infoflow_target("chengbo297")
+    result = _parse_infoflow_target("chengbo297")
     assert result == ("chengbo297", None)
