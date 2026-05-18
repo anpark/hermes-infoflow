@@ -623,7 +623,13 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             raw_message["policy_reason"] = decision.reason
             raw_message["trigger_reason"] = decision.trigger_reason
 
-            # Follow-up: enrich with sender context
+            # Follow-up: enrich with sender context.
+            # CRITICAL: inject follow-up instructions as a PREFIX of the user
+            # message text (NOT into channel_prompt / system prompt).
+            # Rationale: GLM-5-Turbo ignores follow-up directives when they're
+            # buried in ~18K tokens of system prompt.  Prepending to the user
+            # message guarantees the LLM sees the instruction in the most
+            # recent turn, dramatically improving compliance.
             if getattr(decision, "needs_sender_context", False) and msg.group_id:
                 try:
                     from .policy import build_follow_up_prompt
@@ -654,14 +660,15 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                         "[iflow:dispatch] mid=%s template=%s sender_engaged=%s is_reply_to_bot=%s",
                         msg.msgid or "-", _template, _sender_engaged, msg.is_reply_to_bot,
                     )
-                    eff_prompt = prompt
-                    if decision.group_system_prompt:
-                        eff_prompt = decision.group_system_prompt + "\n\n---\n\n" + prompt
-                    raw_message["group_system_prompt"] = eff_prompt
                     gw_log().info(
                         "[iflow:dispatch] mid=%s prompt_len=%d",
-                        msg.msgid or "-", len(eff_prompt),
+                        msg.msgid or "-", len(prompt),
                     )
+                    # Inject follow-up context as prefix of the user message text.
+                    # This goes into event.text → gateway sends it as user message,
+                    # giving it much higher priority than system prompt content.
+                    _followup_prefix = f"[Follow-up context]\n{prompt}\n---\n[User message]\n"
+                    text_for_agent = _followup_prefix + (text_for_agent or "")
                 except Exception as exc:
                     gw_log().warning(
                         "[infoflow] failed to build follow-up context for %s: %s",
@@ -669,6 +676,19 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     )
             elif decision.group_system_prompt:
                 raw_message["group_system_prompt"] = decision.group_system_prompt
+
+            # Per-message judgement prompt (watch, proactive, etc.) → user message prefix.
+            # Same rationale as follow-up: per-message instructions in the system prompt
+            # are ignored by GLM-5-Turbo when buried under ~18K tokens.  Injecting as a
+            # user-message prefix guarantees the LLM evaluates the instruction.
+            _per_msg = getattr(decision, "per_message_prompt", "")
+            if _per_msg:
+                _dispatch_prefix = f"[Dispatch context]\n{_per_msg}\n---\n[User message]\n"
+                text_for_agent = _dispatch_prefix + (text_for_agent or "")
+                gw_log().info(
+                    "[iflow:dispatch] mid=%s per_message_prompt_len=%d",
+                    msg.msgid or "-", len(_per_msg),
+                )
 
         event = MessageEvent(
             text=text_for_agent,
@@ -708,6 +728,8 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             _full_prompt = _sender_guide + "\n\n" + _privacy_rule + "\n\n" + _full_prompt
         if _full_prompt:
             event.channel_prompt = _full_prompt
+            gw_log().info("[iflow:debug] channel_prompt len=%d preview=%s", len(_full_prompt), repr(_full_prompt[:300]))
+            gw_log().info("[iflow:debug] channel_prompt FULL=\n%s", _full_prompt)
         # Quote-reply: only surface bot message ids
         if msg.reply_info:
             event.reply_to_message_id = msg.reply_info.messageid or None

@@ -184,7 +184,12 @@ class PolicyDecision:
     reason: str = ""
     action: Action = Action.DISPATCH
     trigger_reason: str = ""
+    # Persistent group-level identity / role prompt → channel_prompt → system prompt.
     group_system_prompt: str = ""
+    # Per-message judgement instructions (watch, proactive, etc.) → injected as
+    # a PREFIX of the user message text so the LLM sees them in the latest turn
+    # rather than buried deep in the system prompt.
+    per_message_prompt: str = ""
     # When True, the adapter should asynchronously enrich group_system_prompt
     # with sender context + group member info before dispatching to the LLM.
     needs_sender_context: bool = False
@@ -336,6 +341,10 @@ _WATCH_REGEX_PROMPT = (
     "The message matched a configured watch pattern ({pattern}). Reply only "
     "when you can add genuine value; otherwise output exactly NO_REPLY."
 )
+_MENTION_PROMPT = (
+    "This message directly @mentioned you. You MUST reply — the user is "
+    "addressing you specifically. Do NOT output NO_REPLY."
+)
 _PROACTIVE_PROMPT = (
     "You observed this message in the group. Decide whether you can add genuine "
     "value. If yes, reply concisely; otherwise output exactly NO_REPLY."
@@ -476,13 +485,14 @@ def evaluate_inbound(
     if reply_mode == "proactive":
         # Always dispatch, but tell the agent to NO_REPLY if nothing useful.
         trigger = "bot-mentioned" if direct_signal else "proactive"
-        prompt = "" if direct_signal else _PROACTIVE_PROMPT
+        per_msg = _MENTION_PROMPT if direct_signal else _PROACTIVE_PROMPT
         return PolicyDecision(
             should_dispatch=True,
             reason="proactive",
             action=Action.DISPATCH,
             trigger_reason=trigger,
-            group_system_prompt=_join_prompt(prompt, eff["system_prompt"]),
+            group_system_prompt=eff["system_prompt"],
+            per_message_prompt=per_msg,
         )
 
     if reply_mode == "mention-only":
@@ -492,7 +502,8 @@ def evaluate_inbound(
                 reason="mention-only: bot mentioned",
                 action=Action.DISPATCH,
                 trigger_reason="bot-mentioned",
-                group_system_prompt=_join_prompt(eff["system_prompt"]),
+                group_system_prompt=eff["system_prompt"],
+                per_message_prompt=_MENTION_PROMPT,
             )
         if (
             eff["follow_up"]
@@ -513,7 +524,7 @@ def evaluate_inbound(
                 reason="mention-only: require_mention=false",
                 action=Action.DISPATCH,
                 trigger_reason="require_mention=false",
-                group_system_prompt=_join_prompt(eff["system_prompt"]),
+                group_system_prompt=eff["system_prompt"],
             )
         # Otherwise record (matches OpenClaw's "pending" behavior — accumulate
         # context for future @-mentions).
@@ -530,7 +541,8 @@ def evaluate_inbound(
             reason="mention-and-watch: bot mentioned",
             action=Action.DISPATCH,
             trigger_reason="bot-mentioned",
-            group_system_prompt=_join_prompt(eff["system_prompt"]),
+            group_system_prompt=eff["system_prompt"],
+            per_message_prompt=_MENTION_PROMPT,
         )
     watch_hit = _watch_mentioned(inbound, eff["watch_mentions"])
     if watch_hit:
@@ -539,10 +551,8 @@ def evaluate_inbound(
             reason=f"mention-and-watch: watch list hit ({watch_hit})",
             action=Action.DISPATCH,
             trigger_reason=f"watchMentions:{watch_hit}",
-            group_system_prompt=_join_prompt(
-                _WATCH_MENTION_PROMPT.format(who=watch_hit),
-                eff["system_prompt"],
-            ),
+            group_system_prompt=eff["system_prompt"],
+            per_message_prompt=_WATCH_MENTION_PROMPT.format(who=watch_hit),
         )
     regex_hit = _watch_regex_match(inbound.text, eff["watch_regex"])
     if regex_hit:
@@ -552,10 +562,8 @@ def evaluate_inbound(
             reason=f"mention-and-watch: regex hit ({pattern})",
             action=Action.DISPATCH,
             trigger_reason=f"watchRegex#{idx}({pattern})",
-            group_system_prompt=_join_prompt(
-                _WATCH_REGEX_PROMPT.format(pattern=pattern),
-                eff["system_prompt"],
-            ),
+            group_system_prompt=eff["system_prompt"],
+            per_message_prompt=_WATCH_REGEX_PROMPT.format(pattern=pattern),
         )
     if (
         eff["follow_up"]
@@ -576,7 +584,7 @@ def evaluate_inbound(
             reason="mention-and-watch: require_mention=false",
             action=Action.DISPATCH,
             trigger_reason="require_mention=false",
-            group_system_prompt=_join_prompt(eff["system_prompt"]),
+            group_system_prompt=eff["system_prompt"],
         )
     return PolicyDecision(
         should_dispatch=False,
