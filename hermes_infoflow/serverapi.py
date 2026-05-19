@@ -43,7 +43,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _MAX_PREVIEW_LENGTH = 200
-_DEFAULT_MARKDOWN_TOKENS = ("**", "__", "`", "* ", "- ", "# ", "](", "```")
 
 # Group member cache: {group_id: (members_list, timestamp)}
 _MEMBERS_CACHE: dict[str, tuple[list[GroupMember], float]] = {}
@@ -228,17 +227,12 @@ class ServerAPI:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _looks_like_markdown(content: str) -> bool:
-        return any(tok in content for tok in _DEFAULT_MARKDOWN_TOKENS)
-
-    @staticmethod
     def _build_contents(
         text: str, options: SendOptions | None
     ) -> list[_api.ContentItem]:
         """Translate bot-layer send params → Infoflow ``ContentItem[]``.
 
-        Handles AT items (must precede text in the body array) and
-        markdown auto-detection.
+        Always emits markdown ContentItems; AT items are prepended as needed.
         """
         options = options or SendOptions()
         items: list[_api.ContentItem] = []
@@ -247,11 +241,14 @@ class ServerAPI:
         # --- AT items ---
         if options.at_all:
             items.append(_api.ContentItem("at", "all"))
+            # Ensure text has @all placeholder for MD rendering
+            text_lower = text.lower()
+            if text and "@all" not in text_lower and "@所有人" not in text:
+                at_prefix_parts.append("@all")
         else:
             user_ids_for_api: list[str] = []
             if options.mention_user_ids:
                 for uid in (s.strip() for s in options.mention_user_ids.split(",") if s.strip()):
-                    # Always generate AT item; only prepend @uid if text lacks it
                     user_ids_for_api.append(uid)
                     if not (text and f"@{uid}" in text):
                         at_prefix_parts.append(f"@{uid}")
@@ -260,21 +257,17 @@ class ServerAPI:
             if options.mention_agent_ids:
                 agent_ids_for_api: list[str] = []
                 for aid in (s.strip() for s in options.mention_agent_ids.split(",") if s.strip()):
-                    # Always generate AT item; only prepend @aid if text lacks it
                     agent_ids_for_api.append(aid)
                     if not (text and f"@{aid}" in text):
                         at_prefix_parts.append(f"@{aid}")
                 if agent_ids_for_api:
                     items.append(_api.ContentItem("at-agent", ",".join(agent_ids_for_api)))
 
-        # --- Text / Markdown ---
+        # --- Markdown (always MD) ---
         if text:
             if at_prefix_parts:
                 text = " ".join(at_prefix_parts) + " " + text
-            markdown = options.markdown
-            if markdown is None:
-                markdown = ServerAPI._looks_like_markdown(text)
-            items.append(_api.ContentItem("markdown" if markdown else "text", text))
+            items.append(_api.ContentItem("markdown", text))
         return items
 
     async def send_to_group(
@@ -382,8 +375,7 @@ class ServerAPI:
         b64 = base64.b64encode(image_bytes).decode("ascii")
         contents: list[_api.ContentItem] = [_api.ContentItem("image", b64)]
         if caption:
-            md = self._looks_like_markdown(caption)
-            contents.insert(0, _api.ContentItem("markdown" if md else "text", caption))
+            contents.insert(0, _api.ContentItem("markdown", caption))
 
         reply_ctx = None
         if reply_info:
@@ -433,8 +425,7 @@ class ServerAPI:
         caption_items: list[_api.ContentItem] = []
         image_items: list[_api.ContentItem] = [_api.ContentItem("image", b64)]
         if caption:
-            md = self._looks_like_markdown(caption)
-            caption_items = [_api.ContentItem("markdown" if md else "text", caption)]
+            caption_items = [_api.ContentItem("markdown", caption)]
 
         async with self._ensure_session(session) as sess:
             try:

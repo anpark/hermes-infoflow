@@ -51,8 +51,7 @@ async def standalone_send(
         # without a full adapter instance.
         contents = InfoflowAdapter._build_contents(message, metadata)
     else:
-        is_markdown = InfoflowAdapter._looks_like_markdown(message)
-        contents = [_api.ContentItem("markdown" if is_markdown else "text", message)]
+        contents = [_api.ContentItem("markdown", message)]
 
     try:
         if kind == "group":

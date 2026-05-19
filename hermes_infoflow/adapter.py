@@ -67,20 +67,20 @@ def _extract_mentions(
 
     Returns (user_ids, agent_ids, at_all, unmatched).
     - user_ids: list of uuapName strings (humans)
-    - agent_ids: list of agentId ints (bots)
+    - agent_ids: list of agentId ints (bots) — for Infoflow API atagentids
     - at_all: True if @所有人 or @all found
     - unmatched: mentions that didn't match any member
     """
     user_ids: list[str] = []
-    agent_ids: list[int] = []
+    agent_ids: list[int] = []  # agentId (int), not imid
     at_all = False
     unmatched: list[str] = []
-    seen_users: set[str] = set()
-    seen_agents: set[int] = set()
 
     # Pre-build lookup sets for O(1) member resolution
     _human_uids: set[str] | None = None
     _bot_aids: set[int] | None = None
+    seen_users: set[str] = set()
+    seen_agents: set[int] = set()
     if members:
         _human_uids = {mb.uid for mb in members if not mb.is_bot}
         _bot_aids = {mb.agent_id for mb in members if mb.is_bot}
@@ -787,8 +787,10 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             "## Mentioning Users in Messages\n"
             "- To @ a human user, use @<their uuapName>, e.g. @chengbo05\n"
             "- To @ a bot, use @<their agentId> (a number), e.g. @6471\n"
-            "- To @ everyone, use @所有人 or @all\n"
+            "- To @ everyone, use @all\n"
             "- The @ must have a space before it (e.g. \"你好 @chengbo05\" not \"你好@chengbo05\").\n"
+            "Note: you do NOT need to use send_message metadata (at_all/mention_user_ids) — "
+            "just include @mentions in the message text and the platform handles the rest."
         )
         _full_prompt = ""
         if _bot_identity:
@@ -919,7 +921,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     for m in list(unmatched):
                         if m.isdigit():
                             aid = int(m)
-                            if any(mb.agent_id == aid for mb in members if mb.is_bot):
+                            if any(mb.is_bot and mb.agent_id == aid for mb in members):
                                 if aid not in aids:
                                     aids.append(aid)
                                 unmatched.remove(m)
@@ -948,15 +950,14 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                             if options.mention_user_ids else uid
                         )
                 existing_agents = set(
-                    s.strip() for s in options.mention_agent_ids.split(",") if s.strip()
+                    int(s.strip()) for s in options.mention_agent_ids.split(",") if s.strip()
                 )
                 for aid in aids:
-                    aid_str = str(aid)
-                    if aid_str not in existing_agents:
-                        existing_agents.add(aid_str)
+                    if aid not in existing_agents:
+                        existing_agents.add(aid)
                         options.mention_agent_ids = (
-                            options.mention_agent_ids + "," + aid_str
-                            if options.mention_agent_ids else aid_str
+                            options.mention_agent_ids + "," + str(aid)
+                            if options.mention_agent_ids else str(aid)
                         )
             except Exception as exc:
                 gw_log().warning("[iflow:send] @ mention extraction failed: %s", exc)
