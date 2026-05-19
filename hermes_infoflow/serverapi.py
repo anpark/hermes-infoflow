@@ -18,6 +18,7 @@ Responsibilities
 from __future__ import annotations
 
 import base64
+import asyncio
 import contextlib
 import logging
 import time
@@ -153,8 +154,14 @@ class ServerAPI:
             yield session
             return
         if self._http_session is not None:
-            yield self._http_session
-            return
+            try:
+                sess_loop = self._http_session._loop  # noqa: SLF001
+                current_loop = asyncio.get_running_loop()
+                if sess_loop is current_loop:
+                    yield self._http_session
+                    return
+            except RuntimeError:
+                pass
         # Last resort: ad-hoc session — close it when the caller is done.
         async with aiohttp.ClientSession() as sess:
             yield sess
