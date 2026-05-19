@@ -729,16 +729,24 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
     def _is_session_valid(session: "aiohttp.ClientSession | None") -> bool:
         """Check whether *session* is usable on the current event loop.
 
-        aioctl doesn't expose a public API for this, so we probe the
-        private ``_loop`` attribute (stable across aiohttp ≥ 3.x).
+        ``aiohttp`` sessions are bound to the loop that created them.
+        Using a session from a *different* loop triggers
+        ``RuntimeError: Timeout context manager should be used inside a task``
+        because ``TimerContext.__enter__`` queries ``current_task`` on the
+        session's original loop — which has no active task from the
+        caller's perspective.  Compare loop identity to catch this.
         """
         if session is None:
             return False
         try:
-            session._loop  # noqa: SLF001 — aiohttp has no public API for this
+            session_loop = session._loop  # noqa: SLF001
         except RuntimeError:
             return False
-        return True
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        return session_loop is current_loop
 
     @staticmethod
     def _effective_session(session: "aiohttp.ClientSession | None") -> "aiohttp.ClientSession | None":

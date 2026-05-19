@@ -18,6 +18,7 @@ Responsibilities
 from __future__ import annotations
 
 import base64
+import contextlib
 import logging
 import time
 from dataclasses import dataclass
@@ -137,21 +138,26 @@ class ServerAPI:
     # Session helpers
     # ------------------------------------------------------------------
 
-    def _ensure_session(
+    @contextlib.asynccontextmanager
+    async def _ensure_session(
         self, session: aiohttp.ClientSession | None
-    ) -> aiohttp.ClientSession:
-        """Return *session* if provided; fall back to the main session.
+    ):
+        """Yield a usable session, cleaning up ad-hoc ones on exit.
 
-        If neither is available, create a temporary one.  Callers that
-        pass ``None`` from a *different* event loop should close the
-        returned session when done (or use :meth:`_call_with_session`).
+        Prefers the caller-supplied *session*, then the persistent
+        ``self._http_session``.  If neither is available (e.g. when
+        invoked from a different event loop), a temporary session is
+        created and **automatically closed** when the context exits.
         """
         if session is not None:
-            return session
+            yield session
+            return
         if self._http_session is not None:
-            return self._http_session
-        # Last resort: ad-hoc session (caller must close it).
-        return aiohttp.ClientSession()
+            yield self._http_session
+            return
+        # Last resort: ad-hoc session — close it when the caller is done.
+        async with aiohttp.ClientSession() as sess:
+            yield sess
 
     # ------------------------------------------------------------------
     # Incoming message conversion
@@ -276,7 +282,6 @@ class ServerAPI:
         session: aiohttp.ClientSession | None = None,
     ) -> SentResult:
         """Send a text/markdown message to a group."""
-        sess = self._ensure_session(session)
         contents = self._build_contents(text, options)
 
         reply_ctx = None
@@ -288,25 +293,26 @@ class ServerAPI:
                 imid=reply_info.sender_imid or self._robot_id,
             )
 
-        try:
-            res = await _api.send_group_message(
-                self._api_account,
-                group_id=int(group_id),
-                contents=contents,
-                reply_to=reply_ctx,
-                session=sess,
-            )
-        except Exception as exc:
-            return SentResult(success=False, error=str(exc))
+        async with self._ensure_session(session) as sess:
+            try:
+                res = await _api.send_group_message(
+                    self._api_account,
+                    group_id=int(group_id),
+                    contents=contents,
+                    reply_to=reply_ctx,
+                    session=sess,
+                )
+            except Exception as exc:
+                return SentResult(success=False, error=str(exc))
 
-        if res.get("ok"):
-            return SentResult(
-                success=True,
-                msgid=str(res.get("messageid") or ""),
-                msgseqid=str(res.get("msgseqid") or ""),
-                raw_response=res,
-            )
-        return SentResult(success=False, error=res.get("error") or "send failed", raw_response=res)
+            if res.get("ok"):
+                return SentResult(
+                    success=True,
+                    msgid=str(res.get("messageid") or ""),
+                    msgseqid=str(res.get("msgseqid") or ""),
+                    raw_response=res,
+                )
+            return SentResult(success=False, error=res.get("error") or "send failed", raw_response=res)
 
     # ------------------------------------------------------------------
     # Send — DM
@@ -321,38 +327,38 @@ class ServerAPI:
         session: aiohttp.ClientSession | None = None,
     ) -> SentResult:
         """Send a text/markdown message to a user (DM)."""
-        sess = self._ensure_session(session)
         contents = self._build_contents(text, options)
 
-        try:
-            res = await _api.send_private_message(
-                self._api_account,
-                to_user=user_id,
-                contents=contents,
-                session=sess,
-            )
-        except Exception as exc:
-            return SentResult(success=False, error=str(exc))
-
-        # Enrich opaque API errors with actionable hints.
-        if not res.get("ok") and user_id:
-            err = res.get("error", "")
-            if "可见范围" in err or "关注" in err:
-                res["error"] = (
-                    f"{err} "
-                    f"(to_user={user_id!r} — Infoflow private send requires the "
-                    f"recipient to have an existing conversation with the bot, "
-                    f"or the chat_id must be a uuapName rather than an accountId)"
+        async with self._ensure_session(session) as sess:
+            try:
+                res = await _api.send_private_message(
+                    self._api_account,
+                    to_user=user_id,
+                    contents=contents,
+                    session=sess,
                 )
+            except Exception as exc:
+                return SentResult(success=False, error=str(exc))
 
-        if res.get("ok"):
-            return SentResult(
-                success=True,
-                msgid=str(res.get("messageid") or res.get("msgkey") or ""),
-                msgseqid=str(res.get("msgseqid") or ""),
-                raw_response=res,
-            )
-        return SentResult(success=False, error=res.get("error") or "send failed", raw_response=res)
+            # Enrich opaque API errors with actionable hints.
+            if not res.get("ok") and user_id:
+                err = res.get("error", "")
+                if "可见范围" in err or "关注" in err:
+                    res["error"] = (
+                        f"{err} "
+                        f"(to_user={user_id!r} — Infoflow private send requires the "
+                        f"recipient to have an existing conversation with the bot, "
+                        f"or the chat_id must be a uuapName rather than an accountId)"
+                    )
+
+            if res.get("ok"):
+                return SentResult(
+                    success=True,
+                    msgid=str(res.get("messageid") or res.get("msgkey") or ""),
+                    msgseqid=str(res.get("msgseqid") or ""),
+                    raw_response=res,
+                )
+            return SentResult(success=False, error=res.get("error") or "send failed", raw_response=res)
 
     # ------------------------------------------------------------------
     # Send image — group
@@ -368,7 +374,6 @@ class ServerAPI:
         session: aiohttp.ClientSession | None = None,
     ) -> SentResult:
         """Send an image (optionally with caption) to a group."""
-        sess = self._ensure_session(session)
         b64 = base64.b64encode(image_bytes).decode("ascii")
         contents: list[_api.ContentItem] = [_api.ContentItem("image", b64)]
         if caption:
@@ -384,25 +389,26 @@ class ServerAPI:
                 imid=reply_info.sender_imid or self._robot_id,
             )
 
-        try:
-            res = await _api.send_group_message(
-                self._api_account,
-                group_id=int(group_id),
-                contents=contents,
-                reply_to=reply_ctx,
-                session=sess,
-            )
-        except Exception as exc:
-            return SentResult(success=False, error=str(exc))
+        async with self._ensure_session(session) as sess:
+            try:
+                res = await _api.send_group_message(
+                    self._api_account,
+                    group_id=int(group_id),
+                    contents=contents,
+                    reply_to=reply_ctx,
+                    session=sess,
+                )
+            except Exception as exc:
+                return SentResult(success=False, error=str(exc))
 
-        if res.get("ok"):
-            return SentResult(
-                success=True,
-                msgid=str(res.get("messageid") or ""),
-                msgseqid=str(res.get("msgseqid") or ""),
-                raw_response=res,
-            )
-        return SentResult(success=False, error=res.get("error") or "image send failed", raw_response=res)
+            if res.get("ok"):
+                return SentResult(
+                    success=True,
+                    msgid=str(res.get("messageid") or ""),
+                    msgseqid=str(res.get("msgseqid") or ""),
+                    raw_response=res,
+                )
+            return SentResult(success=False, error=res.get("error") or "image send failed", raw_response=res)
 
     # ------------------------------------------------------------------
     # Send image — DM
@@ -417,7 +423,6 @@ class ServerAPI:
         session: aiohttp.ClientSession | None = None,
     ) -> SentResult:
         """Send an image to a user (DM). Caption and image sent separately."""
-        sess = self._ensure_session(session)
         b64 = base64.b64encode(image_bytes).decode("ascii")
 
         caption_items: list[_api.ContentItem] = []
@@ -426,30 +431,31 @@ class ServerAPI:
             md = self._looks_like_markdown(caption)
             caption_items = [_api.ContentItem("markdown" if md else "text", caption)]
 
-        try:
-            # Send caption first (text), then image.
-            res_caption: dict[str, Any] = {"ok": True}
-            if caption_items:
-                res_caption = await _api.send_private_message(
-                    self._api_account, to_user=user_id, contents=caption_items, session=sess,
+        async with self._ensure_session(session) as sess:
+            try:
+                # Send caption first (text), then image.
+                res_caption: dict[str, Any] = {"ok": True}
+                if caption_items:
+                    res_caption = await _api.send_private_message(
+                        self._api_account, to_user=user_id, contents=caption_items, session=sess,
+                    )
+                res = await _api.send_private_message(
+                    self._api_account, to_user=user_id, contents=image_items, session=sess,
                 )
-            res = await _api.send_private_message(
-                self._api_account, to_user=user_id, contents=image_items, session=sess,
-            )
-            # Surface caption error if image succeeded.
-            if not res_caption.get("ok") and res.get("ok"):
-                res = {"ok": False, "error": res_caption.get("error"), **{k: v for k, v in res.items() if k != "ok"}}
-        except Exception as exc:
-            return SentResult(success=False, error=str(exc))
+                # Surface caption error if image succeeded.
+                if not res_caption.get("ok") and res.get("ok"):
+                    res = {"ok": False, "error": res_caption.get("error"), **{k: v for k, v in res.items() if k != "ok"}}
+            except Exception as exc:
+                return SentResult(success=False, error=str(exc))
 
-        if res.get("ok"):
-            return SentResult(
-                success=True,
-                msgid=str(res.get("messageid") or res.get("msgkey") or ""),
-                msgseqid=str(res.get("msgseqid") or ""),
-                raw_response=res,
-            )
-        return SentResult(success=False, error=res.get("error") or "image send failed", raw_response=res)
+            if res.get("ok"):
+                return SentResult(
+                    success=True,
+                    msgid=str(res.get("messageid") or res.get("msgkey") or ""),
+                    msgseqid=str(res.get("msgseqid") or ""),
+                    raw_response=res,
+                )
+            return SentResult(success=False, error=res.get("error") or "image send failed", raw_response=res)
 
     # ------------------------------------------------------------------
     # Recall — group
@@ -464,21 +470,21 @@ class ServerAPI:
         session: aiohttp.ClientSession | None = None,
     ) -> RecallResult:
         """Recall (withdraw) a bot-sent group message."""
-        sess = self._ensure_session(session)
-        try:
-            res = await _api.recall_group_message(
-                self._api_account,
-                group_id=int(group_id),
-                messageid=msgid,
-                msgseqid=msgseqid,
-                session=sess,
-            )
-        except Exception as exc:
-            return RecallResult(success=False, error=str(exc))
+        async with self._ensure_session(session) as sess:
+            try:
+                res = await _api.recall_group_message(
+                    self._api_account,
+                    group_id=int(group_id),
+                    messageid=msgid,
+                    msgseqid=msgseqid,
+                    session=sess,
+                )
+            except Exception as exc:
+                return RecallResult(success=False, error=str(exc))
 
-        if res.get("ok"):
-            return RecallResult(success=True, raw_response=res)
-        return RecallResult(success=False, error=res.get("error") or "recall failed", raw_response=res)
+            if res.get("ok"):
+                return RecallResult(success=True, raw_response=res)
+            return RecallResult(success=False, error=res.get("error") or "recall failed", raw_response=res)
 
     # ------------------------------------------------------------------
     # Recall — DM
@@ -491,19 +497,19 @@ class ServerAPI:
         session: aiohttp.ClientSession | None = None,
     ) -> RecallResult:
         """Recall (withdraw) a bot-sent private message by its ``msgkey``."""
-        sess = self._ensure_session(session)
-        try:
-            res = await _api.recall_private_message(
-                self._api_account,
-                msgkey=msgkey,
-                session=sess,
-            )
-        except Exception as exc:
-            return RecallResult(success=False, error=str(exc))
+        async with self._ensure_session(session) as sess:
+            try:
+                res = await _api.recall_private_message(
+                    self._api_account,
+                    msgkey=msgkey,
+                    session=sess,
+                )
+            except Exception as exc:
+                return RecallResult(success=False, error=str(exc))
 
-        if res.get("ok"):
-            return RecallResult(success=True, raw_response=res)
-        return RecallResult(success=False, error=res.get("error") or "recall failed", raw_response=res)
+            if res.get("ok"):
+                return RecallResult(success=True, raw_response=res)
+            return RecallResult(success=False, error=res.get("error") or "recall failed", raw_response=res)
 
     # ------------------------------------------------------------------
     # Group members (common capability)
@@ -529,37 +535,37 @@ class ServerAPI:
                 logger.debug("[serverapi] get_group_members(%s) cache hit", gid)
                 return cached[0]
 
-        sess = self._ensure_session(session)
-        try:
-            api_members = await _api.get_group_members(
-                self._api_account, group_id=group_id, session=sess,
-                timeout=6.0,
-            )
-            members = [
-                GroupMember(
-                    uid=str(m.uid or ""),
-                    name=m.name or "",
-                    agent_id=int(m.agent_id or 0),
-                    is_bot=m.is_bot,
-                    imid=getattr(m, "imid", "") or "",
+        async with self._ensure_session(session) as sess:
+            try:
+                api_members = await _api.get_group_members(
+                    self._api_account, group_id=group_id, session=sess,
+                    timeout=6.0,
                 )
-                for m in api_members
-            ]
-            # Update cache
-            _MEMBERS_CACHE[gid] = (members, time.time())
-            logger.debug(
-                "[serverapi] get_group_members(%s): %d members cached",
-                gid, len(members),
-            )
-            return members
-        except Exception as exc:
-            logger.warning("[serverapi] get_group_members(%s) failed: %s", group_id, exc)
-            # Return stale cache if available
-            cached = _MEMBERS_CACHE.get(gid)
-            if cached:
-                logger.info("[serverapi] get_group_members(%s) returning stale cache", gid)
-                return cached[0]
-            return []
+                members = [
+                    GroupMember(
+                        uid=str(m.uid or ""),
+                        name=m.name or "",
+                        agent_id=int(m.agent_id or 0),
+                        is_bot=m.is_bot,
+                        imid=getattr(m, "imid", "") or "",
+                    )
+                    for m in api_members
+                ]
+                # Update cache
+                _MEMBERS_CACHE[gid] = (members, time.time())
+                logger.debug(
+                    "[serverapi] get_group_members(%s): %d members cached",
+                    gid, len(members),
+                )
+                return members
+            except Exception as exc:
+                logger.warning("[serverapi] get_group_members(%s) failed: %s", group_id, exc)
+                # Return stale cache if available
+                cached = _MEMBERS_CACHE.get(gid)
+                if cached:
+                    logger.info("[serverapi] get_group_members(%s) returning stale cache", gid)
+                    return cached[0]
+                return []
 
     # ------------------------------------------------------------------
     # Image download
@@ -576,29 +582,25 @@ class ServerAPI:
 
         Returns raw bytes or ``None`` on failure.
         """
-        sess = self._ensure_session(session)
-        own_session = (session is None and self._http_session is None)
-        try:
-            token = await self.get_access_token(session=sess)
-            async with sess.get(
-                url,
-                headers={"Authorization": f"Bearer-{token}"},
-                timeout=aiohttp.ClientTimeout(total=30.0),
-            ) as resp:
-                if resp.status >= 400:
-                    return None
-                buf = bytearray()
-                async for chunk in resp.content.iter_chunked(64 * 1024):
-                    buf.extend(chunk)
-                    if len(buf) > max_bytes:
+        async with self._ensure_session(session) as sess:
+            try:
+                token = await self.get_access_token(session=sess)
+                async with sess.get(
+                    url,
+                    headers={"Authorization": f"Bearer-{token}"},
+                    timeout=aiohttp.ClientTimeout(total=30.0),
+                ) as resp:
+                    if resp.status >= 400:
                         return None
-                return bytes(buf)
-        except Exception as exc:
-            logger.warning("[serverapi] download_image(%s) failed: %s", url[:80], exc)
-            return None
-        finally:
-            if own_session:
-                await sess.close()
+                    buf = bytearray()
+                    async for chunk in resp.content.iter_chunked(64 * 1024):
+                        buf.extend(chunk)
+                        if len(buf) > max_bytes:
+                            return None
+                    return bytes(buf)
+            except Exception as exc:
+                logger.warning("[serverapi] download_image(%s) failed: %s", url[:80], exc)
+                return None
 
     # ------------------------------------------------------------------
     # Access token
@@ -610,10 +612,5 @@ class ServerAPI:
         session: aiohttp.ClientSession | None = None,
     ) -> str:
         """Return a valid app access token (cached / refreshed)."""
-        sess = self._ensure_session(session)
-        own_session = (session is None and self._http_session is None)
-        try:
+        async with self._ensure_session(session) as sess:
             return await _api.get_app_access_token(self._api_account, session=sess)
-        finally:
-            if own_session:
-                await sess.close()
