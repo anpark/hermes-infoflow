@@ -454,9 +454,9 @@ def build_follow_up_prompt(
     Template C is used for direct reply-to-bot regardless of engaged state.
     """
     if is_bot:
-        sender_label = f"{sender_name} (bot agentId={agent_id})"
+        sender_label = f"{sender_name} (agentId: {agent_id}, bot)"
     else:
-        sender_label = f"{sender_name} ({fromid}, human)"
+        sender_label = f"{sender_name} (userId: {fromid}, human)"
     if is_reply_to_bot:
         tmpl = _FOLLOW_UP_REPLY_TO_BOT_CONTEXT_TEMPLATE
     elif sender_engaged:

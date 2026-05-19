@@ -415,42 +415,121 @@ def _parse_send_response(response_text: str, *, kind: str) -> dict[str, Any]:
 
 
 def _build_group_body_items(contents: list[ContentItem]) -> tuple[list[dict[str, Any]], bool]:
-    """Translate generic ``ContentItem`` into Infoflow's group body item shape."""
+    """Translate generic ``ContentItem`` into Infoflow's group body item shape.
+
+    TEXT items: @ mentions are split into separate AT body items, with the
+    surrounding text becoming TEXT fragments.  The @mention text itself is
+    consumed (not present in any TEXT content).
+
+    MD items: AT items are prepended; the MD content retains @mention text
+    as placeholder for rendering.
+    """
     body: list[dict[str, Any]] = []
     has_markdown = False
+
+    # ── Pass 1: collect AT items into a set keyed by mention string ──
+    at_all = False
+    # { "@chengbo05": {"type": "AT", "atuserids": ["chengbo05"]} }
+    at_items: dict[str, dict[str, Any]] = {}
+    _at_re = re.compile(r"(?<=[\s]|^)@([^\s@\n]{1,30})(?=[\s]|$)")
+
     for item in contents:
         t = item.type.lower()
-        if t == "text":
-            body.append({"type": "TEXT", "content": item.content})
-        elif t in ("md", "markdown"):
-            body.append({"type": "MD", "content": item.content})
-            has_markdown = True
-        elif t == "at":
+        if t == "at":
             if item.content == "all":
-                body.append({"type": "AT", "atall": True, "atuserids": []})
+                at_all = True
             else:
                 ids = [s.strip() for s in item.content.split(",") if s.strip()]
                 if ids:
-                    body.append({"type": "AT", "atuserids": ids})
+                    for uid in ids:
+                        at_items[f"@{uid}"] = {"type": "AT", "atuserids": [uid]}
         elif t == "at-agent":
-            ids: list[int] = []
+            ids_int: list[int] = []
             for raw in item.content.split(","):
                 s = raw.strip()
                 if not s:
                     continue
                 try:
-                    ids.append(int(s))
+                    ids_int.append(int(s))
                 except ValueError:
                     continue
-            if ids:
-                body.append({"type": "AT", "atuserids": [], "atagentids": ids})
+            if ids_int:
+                # Map each agentId to the same combined AT item
+                combined = {"type": "AT", "atuserids": [], "atagentids": ids_int}
+                for aid in ids_int:
+                    at_items[f"@{aid}"] = combined
+
+    # ── Pass 2: build body items ──
+    for item in contents:
+        t = item.type.lower()
+
+        if t == "text":
+            # Split TEXT at @mentions, interleaving TEXT fragments and AT items
+            text_content = item.content or ""
+            if (at_items or at_all) and _at_re.search(text_content):
+                # Insert @all AT item at the beginning
+                if at_all:
+                    body.append({"type": "AT", "atall": True, "atuserids": []})
+                last_end = 0
+                for m in _at_re.finditer(text_content):
+                    full_match = m.group(0)  # e.g. "@chengbo05"
+                    mention_text = m.group(1)
+                    # Skip @所有人/@all — already handled by at_all
+                    if mention_text.lower() in ("所有人", "all"):
+                        # Consume the text but don't emit AT item (at_all already emitted)
+                        last_end = m.end()
+                        continue
+                    # Text before this @mention
+                    if m.start() > last_end:
+                        frag = text_content[last_end:m.start()]
+                        if frag:
+                            body.append({"type": "TEXT", "content": frag})
+                    # Insert AT item if we have a matching one
+                    if full_match in at_items:
+                        body.append(at_items[full_match])
+                    last_end = m.end()
+                # Remaining text after last @mention
+                if last_end < len(text_content):
+                    frag = text_content[last_end:]
+                    if frag:
+                        body.append({"type": "TEXT", "content": frag})
+            else:
+                body.append({"type": "TEXT", "content": text_content})
+
+        elif t in ("md", "markdown"):
+            body.append({"type": "MD", "content": item.content})
+            has_markdown = True
+
+        elif t in ("at", "at-agent"):
+            # Already collected in pass 1; skip to avoid duplicates.
+            # For MD messages AT items are handled below (prepended).
+            pass
+
         elif t == "link":
             if item.content:
                 href, _ = _parse_link_content(item.content)
                 body.append({"type": "LINK", "href": href})
+
         elif t == "image":
             if item.content:
                 body.append({"type": "IMAGE", "content": item.content})
+
+    # For MD messages, prepend AT items (already done via TEXT split for TEXT).
+    # Only prepend if body starts with an MD item (no TEXT split happened).
+    if has_markdown and (at_items or at_all):
+        at_prefix: list[dict[str, Any]] = []
+        if at_all:
+            at_prefix.append({"type": "AT", "atall": True, "atuserids": []})
+        # Deduplicate: multiple keys may map to the same AT item (e.g. at-agent)
+        seen_items: set[int] = set()
+        for item_dict in at_items.values():
+            item_id = id(item_dict)
+            if item_id not in seen_items:
+                seen_items.add(item_id)
+                at_prefix.append(item_dict)
+        if at_prefix:
+            body = at_prefix + body
+
     return body, has_markdown
 
 

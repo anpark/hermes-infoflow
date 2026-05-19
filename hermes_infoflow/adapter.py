@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import logging
+import re
 import socket as _socket
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
@@ -37,6 +38,74 @@ import aiohttp
 
 # ── Context var: propagate inbound mid → send() for tracing ────
 _inbound_mid: contextvars.ContextVar[str] = contextvars.ContextVar("inbound_mid", default="")
+
+# ── @ mention extraction ─────────────────────────────────────────
+# Match @xxx where xxx is 1-30 chars excluding @, space, newline,
+# followed by whitespace or end-of-string.
+# Context check (preceded by whitespace or start-of-string) done in code.
+_AT_RE = re.compile(r"@([^\s@\n]{1,30})(?=[\s]|$)")
+
+
+def _at_iter(text: str) -> list[tuple[str, int, int]]:
+    """Yield (full_match, start, end) for each @mention in text.
+
+    Only matches @ that are preceded by whitespace or start-of-string.
+    """
+    results: list[tuple[str, int, int]] = []
+    for m in _AT_RE.finditer(text):
+        if m.start() > 0 and text[m.start() - 1] not in " \t\r\n":
+            continue
+        results.append((m.group(0), m.start(), m.end()))
+    return results
+
+
+def _extract_mentions(
+    text: str,
+    members: list[Any] | None,
+) -> tuple[list[str], list[int], bool, list[str]]:
+    """Extract @ mentions from text and resolve against group members.
+
+    Returns (user_ids, agent_ids, at_all, unmatched).
+    - user_ids: list of uuapName strings (humans)
+    - agent_ids: list of agentId ints (bots)
+    - at_all: True if @所有人 or @all found
+    - unmatched: mentions that didn't match any member
+    """
+    user_ids: list[str] = []
+    agent_ids: list[int] = []
+    at_all = False
+    unmatched: list[str] = []
+    seen_users: set[str] = set()
+    seen_agents: set[int] = set()
+
+    mentions = _at_iter(text)
+    for m, _start, _end in mentions:
+        ml = m[1:].lower()  # strip leading @
+        if ml in ("所有人", "all"):
+            at_all = True
+            continue
+        name_part = m[1:]  # strip leading @, e.g. "chengbo05"
+        if name_part.isdigit():
+            aid = int(name_part)
+            if aid in seen_agents:
+                continue
+            # Match against bot agent_ids in group members
+            if members and any(mb.agent_id == aid for mb in members if mb.is_bot):
+                agent_ids.append(aid)
+                seen_agents.add(aid)
+            else:
+                unmatched.append(name_part)
+        else:
+            if name_part in seen_users:
+                continue
+            # Match against human uids in group members
+            if members and any(mb.uid == name_part for mb in members if not mb.is_bot):
+                user_ids.append(name_part)
+                seen_users.add(name_part)
+            else:
+                unmatched.append(name_part)
+
+    return user_ids, agent_ids, at_all, unmatched
 
 # ── Hermes symbols (soft-import for testability) ──────────────────────
 
@@ -675,6 +744,12 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     msg.msgid or "-", len(_per_msg),
                 )
 
+        # Log the complete user message sent to the LLM (gateway truncates to 80 chars)
+        gw_log().info(
+            "[iflow:user_message] mid=%s len=%d text=\n%s",
+            msg.msgid or "-", len(text_for_agent or ""), text_for_agent or "",
+        )
+
         event = MessageEvent(
             text=text_for_agent,
             message_type=message_type,
@@ -700,9 +775,15 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         group_prompt = raw_message.pop("group_system_prompt", None)
         _sender_guide = (
             "## Message Sender Identity\n"
-            "- Human messages are prefixed with [uid] — uid is the human's unique identifier (a string, format varies).\n"
+            "- Human messages are prefixed with [uid] — uid is the human's unique identifier (uuapName, e.g. chengbo05).\n"
             "- Bot messages are prefixed with [botname 🤖:agentId] — agentId (e.g. 6471) is the bot's unique "
             "identifier; the bot also has a name which may change but rarely does.\n"
+            "\n"
+            "## Mentioning Users in Messages\n"
+            "- To @ a human user, use @<their uuapName>, e.g. @chengbo05\n"
+            "- To @ a bot, use @<their agentId> (a number), e.g. @6471\n"
+            "- To @ everyone, use @所有人 or @all\n"
+            "- The @ must have a space before it (e.g. \"你好 @chengbo05\" not \"你好@chengbo05\").\n"
         )
         _full_prompt = ""
         if _bot_identity:
@@ -814,6 +895,66 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 options.mention_agent_ids = ",".join(str(x) for x in raw_val if x)
             else:
                 options.mention_agent_ids = str(raw_val or "")
+
+        # Extract @ mentions from text (group messages only)
+        if group_id is not None and content:
+            try:
+                # Try cached group members first
+                members = await self._serverapi.get_group_members(
+                    str(group_id), session=session,
+                )
+                uids, aids, at_all, unmatched = _extract_mentions(content, members)
+
+                # Unmatched → force-refresh group members and retry once
+                if unmatched:
+                    members = await self._serverapi.get_group_members(
+                        str(group_id), force_refresh=True, session=session,
+                    )
+                    # Retry each unmatched mention individually
+                    for m in list(unmatched):
+                        if m.isdigit():
+                            aid = int(m)
+                            if any(mb.agent_id == aid for mb in members if mb.is_bot):
+                                if aid not in aids:
+                                    aids.append(aid)
+                                unmatched.remove(m)
+                        else:
+                            if any(mb.uid == m for mb in members if not mb.is_bot):
+                                if m not in uids:
+                                    uids.append(m)
+                                unmatched.remove(m)
+                    if unmatched:
+                        gw_log().info(
+                            "[iflow:send] @ mentions discarded (no member match): %s",
+                            unmatched,
+                        )
+
+                # Merge into SendOptions (metadata-explicit values take priority)
+                if at_all:
+                    options.at_all = True
+                existing_users = set(
+                    s.strip() for s in options.mention_user_ids.split(",") if s.strip()
+                )
+                for uid in uids:
+                    if uid not in existing_users:
+                        existing_users.add(uid)
+                        options.mention_user_ids = (
+                            options.mention_user_ids + "," + uid
+                            if options.mention_user_ids else uid
+                        )
+                existing_agents = set(
+                    s.strip() for s in options.mention_agent_ids.split(",") if s.strip()
+                )
+                for aid in aids:
+                    aid_str = str(aid)
+                    if aid_str not in existing_agents:
+                        existing_agents.add(aid_str)
+                        options.mention_agent_ids = (
+                            options.mention_agent_ids + "," + aid_str
+                            if options.mention_agent_ids else aid_str
+                        )
+            except Exception as exc:
+                gw_log().warning("[iflow:send] @ mention extraction failed: %s", exc)
 
         # Delegate to bot
         bot_result = await self._bot.send_message(

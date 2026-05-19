@@ -8,6 +8,30 @@ Each layer converts to/from its external format:
   - **adapter**: Hermes ``MessageEvent`` / ``SendResult`` ←→ bot types
   - **serverapi**: bot types ←→ Infoflow API payloads
   - **bot**: all business logic operates on bot types exclusively
+
+User identity reference
+-----------------------
+Infoflow has two kinds of users with distinct identifiers:
+
+**Human users:**
+  - **uuapName** (= **userid**): Baidu login username, e.g. ``"chengbo05"``.
+    This is the primary human identifier used everywhere — inbound AT body
+    items carry it in the ``atuserids`` array (and historically a single
+    ``userid`` field), outbound AT items also use it, and DM targets are
+    addressed by uuapName.  In this codebase the two terms are interchangeable.
+
+**Bot users:**
+  - **name**: Display name, e.g. ``"chengbo5.2"``.  Used in the header
+    ``fromuser`` field and for inbound name-based mention matching.
+  - **agentId** (or **agent_id**): Numeric app-level ID, e.g. ``6533``.
+    Used in outbound AT body items as ``atagentids`` and in Hermes
+    plugin metadata for routing.
+
+**All users (human & bot):**
+  - **imid**: Numeric Infoflow internal ID (stored as a **string** to
+    preserve precision).  Assigned by the Infoflow platform.  Rarely needed
+    — only required in a few API calls (e.g. reply/quote payloads).
+    Not suitable as a general-purpose identifier.
 """
 
 from __future__ import annotations
@@ -138,12 +162,16 @@ class RecallResult:
 
 @dataclass
 class GroupMember:
-    """A member of an Infoflow group."""
+    """A member of an Infoflow group.
 
-    uid: str  # User ID (uuapName for humans, agent ID for bots)
-    name: str = ""  # Display name
-    imid: str = ""  # Infoflow numeric imid
-    agent_id: int = 0  # Agent ID (non-zero for bots)
+    See module-level docstring ("User identity reference") for the
+    distinction between uuapName/userid, agentId, and imid.
+    """
+
+    uid: str           # Human: uuapName (= userid).  Bot: not used as primary ID (see agent_id below).
+    name: str = ""     # Display name (used for bots; often empty for humans in this field).
+    imid: str = ""     # Numeric Infoflow internal ID (string).  See module docstring — rarely needed.
+    agent_id: int = 0  # Agent ID (non-zero for bots only).  Primary bot identifier.
     is_bot: bool = False
 
 
