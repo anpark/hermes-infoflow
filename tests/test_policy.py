@@ -5,29 +5,41 @@ from __future__ import annotations
 import pytest
 
 from hermes_infoflow import policy
-from hermes_infoflow.parser import BodyItem, InboundMessage
+from hermes_infoflow.itypes import IncomingMessage
+from hermes_infoflow.parser import BodyItem
 
 
-def _group(**kwargs) -> InboundMessage:
-    base = {
-        "chat_type": "group",
-        "from_user": "bob",
+# Back-compat alias: old fixture used parser.InboundMessage's
+# ``was_mentioned`` field; the unified IncomingMessage renamed it to
+# ``bot_was_mentioned``.  Map it transparently to keep test bodies short.
+def _coerce_kwargs(kwargs: dict) -> dict:
+    if "was_mentioned" in kwargs:
+        kwargs.setdefault("bot_was_mentioned", kwargs.pop("was_mentioned"))
+    return kwargs
+
+
+def _group(**kwargs) -> IncomingMessage:
+    kwargs = _coerce_kwargs(kwargs)
+    base: dict = {
+        "msgid": "msg-group-test",
+        "group_id": "g1",
+        "sender_id": "bob",
         "text": "hello",
-        "body_for_agent": "hello",
     }
     base.update(kwargs)
-    return InboundMessage(**base)
+    return IncomingMessage(**base)
 
 
-def _dm(**kwargs) -> InboundMessage:
-    base = {
-        "chat_type": "dm",
-        "from_user": "alice",
+def _dm(**kwargs) -> IncomingMessage:
+    kwargs = _coerce_kwargs(kwargs)
+    base: dict = {
+        "msgid": "msg-dm-test",
+        "dm_user_id": "alice",
+        "sender_id": "alice",
         "text": "hi",
-        "body_for_agent": "hi",
     }
     base.update(kwargs)
-    return InboundMessage(**base)
+    return IncomingMessage(**base)
 
 
 def test_normalize_reply_mode_passthrough() -> None:
@@ -97,7 +109,7 @@ def test_watch_list_with_empty_entries_aligns_indices() -> None:
     d = policy.evaluate_inbound(msg, p)
     assert d.should_dispatch is True
     assert "Alice" in d.trigger_reason
-    assert d.trigger_reason == "watchMentions(Alice)"
+    assert d.trigger_reason == "watchMentions:Alice"
 
 
 def test_watch_list_numeric_robotid_match() -> None:
@@ -113,7 +125,7 @@ def test_watch_list_numeric_robotid_match() -> None:
     )
     d = policy.evaluate_inbound(msg, p)
     assert d.should_dispatch is True
-    assert d.trigger_reason == "watchMentions(12345)"
+    assert d.trigger_reason == "watchMentions:12345"
 
 
 def test_group_policy_is_hashable() -> None:
@@ -163,9 +175,11 @@ def test_proactive_mode_always_dispatches() -> None:
     d = policy.evaluate_inbound(_group(was_mentioned=False, body_items=[]), p)
     assert d.should_dispatch is True
     assert d.trigger_reason == "proactive"
-    # Proactive mode emits a system prompt telling the agent to NO_REPLY when
-    # nothing useful to add.
-    assert "NO_REPLY" in d.group_system_prompt
+    # Proactive mode emits a per-message prompt telling the agent to NO_REPLY
+    # when nothing useful to add.  (Adapter injects per_message_prompt into
+    # the user message prefix; group_system_prompt stays reserved for user
+    # config / channel-level overrides only.)
+    assert "NO_REPLY" in d.per_message_prompt
 
 
 def test_proactive_skips_prompt_when_bot_mentioned() -> None:
@@ -189,7 +203,9 @@ def test_mention_and_watch_regex_hit() -> None:
     d = policy.evaluate_inbound(msg, p)
     assert d.should_dispatch is True
     assert "watchRegex" in d.trigger_reason
-    assert "NO_REPLY" in d.group_system_prompt
+    # NO_REPLY directive now lives in per_message_prompt (injected as user
+    # message prefix), not in the channel-level group_system_prompt.
+    assert "NO_REPLY" in d.per_message_prompt
 
 
 def test_mention_and_watch_regex_no_hit_records() -> None:

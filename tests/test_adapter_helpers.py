@@ -17,8 +17,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from hermes_infoflow import adapter as ad
-from hermes_infoflow.adapter import (
+from hermes_infoflow import recall as ad
+from hermes_infoflow.recall import (
     _InboundContext,
     _looks_like_recall_intent,
     _looks_like_recall_latest,
