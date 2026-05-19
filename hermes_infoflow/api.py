@@ -39,6 +39,12 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
+# Match @xxx where xxx is 1-30 chars excluding @, space, newline,
+# followed by whitespace or end-of-string.  Context check (preceded by
+# whitespace or start-of-string) is done in code, not in the regex,
+# because Python ``re`` requires fixed-width lookbehinds.
+_AT_RE = re.compile(r"@([^\s@\n]{1,30})(?=[\s]|$)")
+
 DEFAULT_TIMEOUT_SECONDS = 30.0
 TOKEN_TTL_BUFFER_SECONDS = 300
 TOKEN_DEFAULT_LIFETIME_SECONDS = 7200
@@ -431,7 +437,9 @@ def _build_group_body_items(contents: list[ContentItem]) -> tuple[list[dict[str,
     at_all = False
     # { "@chengbo05": {"type": "AT", "atuserids": ["chengbo05"]} }
     at_items: dict[str, dict[str, Any]] = {}
-    _at_re = re.compile(r"(?<=[\s]|^)@([^\s@\n]{1,30})(?=[\s]|$)")
+    # Track which AT item dicts have been emitted (avoid duplicates from
+    # at-agent shared combined dicts when multiple @agentId appear in text)
+    _emitted: set[int] = set()
 
     for item in contents:
         t = item.type.lower()
@@ -464,14 +472,19 @@ def _build_group_body_items(contents: list[ContentItem]) -> tuple[list[dict[str,
         t = item.type.lower()
 
         if t == "text":
-            # Split TEXT at @mentions, interleaving TEXT fragments and AT items
+            # Split TEXT at @mentions, interleaving TEXT fragments and AT items.
+            # Reuse adapter._AT_RE — matches @xxx followed by whitespace/EOS.
+            # Context check (preceded by whitespace or start-of-string) done below.
             text_content = item.content or ""
-            if (at_items or at_all) and _at_re.search(text_content):
+            if (at_items or at_all) and _AT_RE.search(text_content):
                 # Insert @all AT item at the beginning
                 if at_all:
                     body.append({"type": "AT", "atall": True, "atuserids": []})
                 last_end = 0
-                for m in _at_re.finditer(text_content):
+                for m in _AT_RE.finditer(text_content):
+                    # Context check: @ must be preceded by whitespace or start-of-string
+                    if m.start() > 0 and text_content[m.start() - 1] not in " \t\r\n":
+                        continue
                     full_match = m.group(0)  # e.g. "@chengbo05"
                     mention_text = m.group(1)
                     # Skip @所有人/@all — already handled by at_all
@@ -486,9 +499,17 @@ def _build_group_body_items(contents: list[ContentItem]) -> tuple[list[dict[str,
                             body.append({"type": "TEXT", "content": frag})
                     # Insert AT item if we have a matching one
                     if full_match in at_items:
-                        body.append(at_items[full_match])
-                    last_end = m.end()
-                # Remaining text after last @mention
+                        item_dict = at_items[full_match]
+                        item_id = id(item_dict)
+                        if item_id not in _emitted:
+                            _emitted.add(item_id)
+                            body.append(item_dict)
+                        last_end = m.end()
+                    else:
+                        # No matching AT item — leave @mention as plain text
+                        # (don't consume it, it will be part of next TEXT fragment)
+                        pass
+                # Remaining text after last consumed @mention
                 if last_end < len(text_content):
                     frag = text_content[last_end:]
                     if frag:

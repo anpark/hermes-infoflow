@@ -47,7 +47,7 @@ _AT_RE = re.compile(r"@([^\s@\n]{1,30})(?=[\s]|$)")
 
 
 def _at_iter(text: str) -> list[tuple[str, int, int]]:
-    """Yield (full_match, start, end) for each @mention in text.
+    """Return list of (full_match, start, end) for each @mention in text.
 
     Only matches @ that are preceded by whitespace or start-of-string.
     """
@@ -78,6 +78,13 @@ def _extract_mentions(
     seen_users: set[str] = set()
     seen_agents: set[int] = set()
 
+    # Pre-build lookup sets for O(1) member resolution
+    _human_uids: set[str] | None = None
+    _bot_aids: set[int] | None = None
+    if members:
+        _human_uids = {mb.uid for mb in members if not mb.is_bot}
+        _bot_aids = {mb.agent_id for mb in members if mb.is_bot}
+
     mentions = _at_iter(text)
     for m, _start, _end in mentions:
         ml = m[1:].lower()  # strip leading @
@@ -89,8 +96,7 @@ def _extract_mentions(
             aid = int(name_part)
             if aid in seen_agents:
                 continue
-            # Match against bot agent_ids in group members
-            if members and any(mb.agent_id == aid for mb in members if mb.is_bot):
+            if _bot_aids is not None and aid in _bot_aids:
                 agent_ids.append(aid)
                 seen_agents.add(aid)
             else:
@@ -98,8 +104,7 @@ def _extract_mentions(
         else:
             if name_part in seen_users:
                 continue
-            # Match against human uids in group members
-            if members and any(mb.uid == name_part for mb in members if not mb.is_bot):
+            if _human_uids is not None and name_part in _human_uids:
                 user_ids.append(name_part)
                 seen_users.add(name_part)
             else:
