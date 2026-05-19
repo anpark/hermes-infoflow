@@ -332,81 +332,110 @@ def _resolve_for_group(policy: GroupPolicy, group_id: str | None) -> dict[str, A
 # ---------------------------------------------------------------------------
 
 
-_WATCH_MENTION_PROMPT = (
-    "Someone in the group @mentioned {who}. You are {who}'s assistant and you "
-    "see this message. Reply only when you can add genuine value; otherwise "
-    "output exactly NO_REPLY."
-)
-_WATCH_REGEX_PROMPT = (
-    "The message matched a configured watch pattern ({pattern}). Reply only "
-    "when you can add genuine value; otherwise output exactly NO_REPLY."
-)
-_MENTION_PROMPT = (
-    "This message directly @mentioned you. You MUST reply — the user is "
-    "addressing you specifically. Do NOT output NO_REPLY."
-)
-_PROACTIVE_PROMPT = (
-    "You observed this message in the group. Decide whether you can add genuine "
-    "value. If yes, reply concisely; otherwise output exactly NO_REPLY."
-)
+_WATCH_MENTION_PROMPT = """\
+[Dispatch] 群里有人 @ 了 {who}(你是 {who} 的助理,在旁听)。
+
+**快通道 — 简单事实即代答**:如果消息问的是无需调 tools 就能定论的常识(时间、日期、星期、基础算术、公开知识、英文翻译、单位换算等),即使消息明确 @ 的是 {who} 而不是你,你也以"{who} 的助理"身份**直接代答**,不要 NO_REPLY、不要 "我帮你看看 / 让我查一下"等开场白。{who} 不一定立刻在线,你代答能让群继续运转。
+
+否则,走下面三步:
+
+第一步 · 静默探索(**不输出任何消息**):
+- 允许并鼓励你**多轮**调用任何 tools / skills 去尝试解决该消息背后的问题:查资料、查日历、看历史记录、调内部接口、链式调用都可以。
+- 全过程**只在内部进行**——绝不要发"我帮你看看 / 让我查一下 / 稍等 / 先确认一下"等任何中间消息。
+- 不要因为"先确认一下"就提前回复半句话;要么静默继续探索,要么走第二步定结论。
+
+第二步 · 价值判定(拿到最终结论后才做):
+- 你已得到**有信息量的结果**(具体事实 / 完整答案 / 可执行建议)→ 进入第三步。
+- 结论是拒绝声明("我没法 / 我无法 / 作为AI")、客套、与原消息脱节的发散、或仍只是"我去查一下"这类过程话 → 输出单独一行 `NO_REPLY`,**不输出其它任何字**。
+
+第三步 · 直接给答(仅价值通过时):
+- 作为 {who} 的助理,把最终结论直接发出去;不加开场白、不复述问题、不汇报过程("经过查询..."、"根据我的搜索..." 一律不要)。
+
+**Output:要么是已查得的最终答案正文,要么单独一行 NO_REPLY。**"""
+
+_WATCH_REGEX_PROMPT = """\
+[Dispatch] 消息命中关注的正则 ({pattern})。
+
+第一步 · 静默探索:允许并鼓励**多轮**调用 tools / skills;全过程不发任何中间消息(不要"我帮你看看 / 稍等")。
+第二步 · 价值判定(拿到结论后):
+- 有信息量的事实 / 答案 / 可执行建议 → 直接发出去,不带开场白。
+- 拒绝声明("我没法 / 我无法 / 作为AI")、客套、脱题发散、或仍是过程话 → 单独一行 NO_REPLY。
+
+**Output:要么回复正文,要么单独一行 NO_REPLY。**"""
+
+_MENTION_PROMPT = """\
+[Dispatch] 用户在群里直接 @ 了你,必须回复。
+
+允许并鼓励多轮静默调用 tools / skills 去解决问题;过程中不发"我帮你看看 / 让我查一下 / 稍等"等任何中间消息。
+拿到结论后直接给最终答案;即使确实做不到,也用自然语气如实说(如"这个我暂时帮不上"),**不要**输出 NO_REPLY。
+不要输出 JSON、不要解释自己在做什么。"""
+
+_PROACTIVE_PROMPT = """\
+[Dispatch] 你在被动观察群消息,没人 @ 你。默认 NO_REPLY。
+
+仅在下列**全部** YES 时允许回复:
+1) 消息没点名另一个人(无"李四 …"、"@张三 …"、"老王:")
+2) 你能给出确定有用的答案(不是拒绝、客套、水货、发散)
+3) 主动插话不会显得打扰(消息明显是公开提问,如"有人知道X吗")
+
+可以静默调 tools / skills;不要发"我帮你看看 / 让我查一下"等任何中间消息。
+其余一律单行 NO_REPLY。"""
 
 # --- Follow-up prompt templates (injected into channel_prompt at dispatch time) ---
 
 # Template A: sender @mentioned bot earlier in the current follow-up window.
 # Default: RESPOND.  Only NO_REPLY for clear conversation-closing signals.
 _FOLLOW_UP_ENGAGED_TEMPLATE = """\
-**Follow-up window — this sender @mentioned you earlier.** Default: respond.
+**Follow-up — 对方在窗口内 @过你,默认回复。** Sender: {sender_label}
 
-**Sender:** {sender_label}
+仅在以下任一条件命中时输出 NO_REPLY:
+1. 收件人显然是别人:"李四 …"、"张三,…"、"@老王 …"、"老刘:"、"帮我问问王哥"
+2. 独立成句的结束 / 反应词:"没事了 / 不用回复了 / 谢谢 / 好的 / 收到 / 👍 / 哈哈 / 666 / ..."
+3. 你将要发出的内容是拒绝声明("我没法 / 我无法 / 作为AI")、空礼貌、与原消息脱钩的发散
 
-**Output NO_REPLY only when clearly not for you:**
-- Message addresses another specific person by name: "李四 xxx", "张三，帮我xxx"
-- Explicit conversation closing: "没事了", "不用回复了", "谢谢", "好的", "👍"
-- Pure reaction / short noise: "哈哈", "666", "..."
+其余一律静默调 tools / skills 直至拿到结论,再**简洁直接**地回答——今天周几、日期、计算、追问、对你上一句的延展都属于"该回"。调用过程不输出任何中间消息("我帮你看看 / 稍等 / 先确认一下" 一律不要)。
+拿不准时:能答就答;要发的像拒绝就 NO_REPLY。
 
-**Respond normally**, including:
-- Any question you can answer (time, date, general knowledge, calculations)
-- Messages containing your name or addressed to you
-- Follow-up questions, clarifications, new requests
-- Topic continuations from your earlier conversation
-
-When in doubt, respond."""
+**Output:要么回复正文,要么单独一行 NO_REPLY。**"""
 
 # Template B: sender has NOT @mentioned bot in the current follow-up window.
 # Default: DO NOT respond.  Only reply when clearly directed at bot.
 _FOLLOW_UP_PASSIVE_TEMPLATE = """\
-**⚠️ STRICT MODE — You were NOT @mentioned. Default action: NO_REPLY.**
+**⚠️ STRICT MODE — 对方在窗口内**没有** @过你,默认 NO_REPLY。** Sender: {sender_label}
 
-**Sender:** {sender_label}
+第一步 · 收件人门槛(不过则直接 NO_REPLY,**不进入下一步、不调任何 tools**):
+仅当下列**全部** YES 才能继续:
+1) 消息**显式**指向你(含你的名字 / @你 / 是回复你的消息 / 自然延续了你上一轮且没出现别的收件人);
+2) 消息里**没有任何其他人**作为收件人("另一个人名 + 内容" 一律视作不指向你)。
 
-**YOU MUST output NO_REPLY unless you can answer YES to ALL of these:**
-1. Is the message explicitly directed at you (your name, @you, or reply to your message)?
-2. Do you have genuinely useful information to provide?
-3. Is there NO other person being addressed in the message?
+任一 NO → 立刻输出 NO_REPLY,不要解释、不要调任何工具。
 
-If ANY answer is NO → output NO_REPLY immediately, do not reason further.
+**罕见可回的例外**:群里有人问 "有人知道X吗 / 谁会X" 这类公开提问,且看起来你可能答得了 → 视为通过第一步,可以进第二步。
 
-**Rare exceptions where you MAY respond:**
-- The message naturally continues YOUR previous topic with no other addressee
-- Someone asks "有人知道X吗" and you have a definitive answer
+第二步 · 静默探索(仅当第一步全过时):
+- 允许并鼓励**多轮**调用 tools / skills 去尝试解决该消息背后的问题。
+- 全过程**静默**——绝不发"我帮你看看 / 让我查一下 / 稍等 / 先确认一下"等任何中间消息。
 
-**Never respond to:**
-- Messages containing another person's name as addressee
-- Physical-world queries you can't answer (menus, locations, schedules)
-- Messages from other bots unless they explicitly ask for your help
+第三步 · 价值判定(拿到最终结论后才做):
+- 结论是**确定且有价值**的答案(具体事实 / 可执行结果)→ 简洁直接地发出去,不带开场白、不复述问题、不汇报过程。
+- 结论是 "我不知道 / 我无法 / 作为AI"、空礼貌、发散、属于"现实世界你查不到的事"(菜单、实时排期、当下位置)、或仍只是"我去查一下" → 改为单独一行 NO_REPLY。
 
-Output NO_REPLY."""
+**绝不要回复**:其它 bot 发的消息(除非它明确求助你)。
+
+**Output:要么回复正文,要么单独一行 NO_REPLY。**"""
 
 # Template C: message is a direct reply/quote to bot's previous message.
 # Always respond unless it's an explicit conversation closer.
 _FOLLOW_UP_REPLY_TO_BOT_CONTEXT_TEMPLATE = """\
-**Follow-up window — the message is a reply to YOUR previous message.** It is directed at you.
+**Follow-up — 这条消息直接回复/引用了你的上一条,目标就是你。** Sender: {sender_label}
 
-**Sender:** {sender_label}
+NO_REPLY 仅限两种:
+- 对方明确结束("不用回复了 / 没事了 / 谢谢 / 好的 / 收到 / 👍 / 哈哈 / 666" 独立成句)
+- 你本次回复会是 "我没法 / 我无法 / 我不知道 / 作为AI / 纯礼貌空话" 这类无价值内容
 
-You should respond — BUT if the sender explicitly ends the conversation (e.g. "不用回复了", "没事了", "谢谢"), output exactly `NO_REPLY`.
+其余 → 静默调 tools / skills(**不发**"我帮你看看 / 稍等"等中间消息)拿到结论后,直接给出有信息量的回复。
 
-Otherwise, respond normally with your helpful response."""
+**Output:要么回复正文,要么单独一行 NO_REPLY。**"""
 
 
 def build_follow_up_prompt(

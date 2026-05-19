@@ -13,10 +13,10 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
-import aiohttp
 import json
 import logging
 import os
+import re
 import time
 from typing import Any, TYPE_CHECKING
 from contextlib import contextmanager
@@ -130,18 +130,54 @@ def get_recall_inbound_message_id_hint() -> str | None:
 # Bot — stateful message processor
 # ---------------------------------------------------------------------------
 
-# Module-level ContextVars for follow-up dispatch state.  Must be module-level
-# (not instance-level) so that asyncio.create_task() context copies work
-# correctly across concurrent dispatch tasks.
-_dispatch_followup_cv: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    "dispatch_is_followup", default=False,
+# Module-level ContextVar carrying the current dispatch trigger reason
+# ("bot-mentioned" / "watchMentions:..." / "watchRegex#..." / "followUp"
+# / "proactive" / "direct-message" / ...).  Set in dispatch_inbound entry,
+# reset in finally.  Used in send_message to:
+#   (a) log which path produced the outbound;
+#   (b) gate the static refusal-regex filter to the followUp path only.
+_send_path_cv: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "send_path", default="",
 )
-_dispatch_followup_passive_cv: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    "dispatch_is_passive_followup", default=False,
+
+# Static refusal-regex filter — used in send_message as a zero-latency
+# fallback against GLM occasionally violating the NO_REPLY contract.
+# Matches refusal declarations at the start of a line; only applied on the
+# followUp path so that @bot/watch responses like "暂时帮不上" are not killed.
+_REFUSAL_RE = re.compile(
+    r"(?:^|\n)\s*("
+    r"作为(?:一个)?\s*AI[,，]?|"
+    r"我无法|我没法|我不能|"
+    r"(?:很)?抱歉[,，]?\s*(?:我)?\s*(?:目前|当前)?\s*(?:无法|不能|不太|没有|帮不上)"
+    r")",
+    re.IGNORECASE,
 )
-_dispatch_inbound_text_cv: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "dispatch_inbound_text", default="",
-)
+
+# Characters stripped when matching the NO_REPLY sentinel.  Includes CJK
+# punctuation/emoji-adjacent symbols + ASCII whitespace so that variants
+# like "NO_REPLY。" / "NO_REPLY ~" still suppress.
+_NO_REPLY_PUNCT = "。，,.！!？?~～ \t\n;；:："
+
+
+def no_reply_sentinel_hits(text: str | None) -> bool:
+    """True iff ``text`` should be suppressed by the NO_REPLY sentinel.
+
+    Acceptance rules (kept in sync with the merged-prompt contract):
+      1) full text (strip whitespace + ``_NO_REPLY_PUNCT``) == "NO_REPLY", or
+      2) first line (same strip) == "NO_REPLY".
+
+    Deliberately does NOT match "NO_REPLY" appearing only on a middle/last
+    line — we'd rather ship a real answer followed by an accidental
+    sentinel than swallow the entire message.
+    """
+    if not text:
+        return False
+    stripped = text.strip()
+    full_clean = stripped.strip(_NO_REPLY_PUNCT)
+    if full_clean == "NO_REPLY":
+        return True
+    first_line = stripped.split("\n", 1)[0].strip().strip(_NO_REPLY_PUNCT)
+    return first_line == "NO_REPLY"
 
 
 class Bot:
@@ -164,8 +200,6 @@ class Bot:
         sent_store: SentMessageStore,
         dedup_set: set[str],
         message_store: MessageStore,
-        llm_config: dict[str, str] | None = None,
-        http_session: aiohttp.ClientSession | None = None,
     ) -> None:
         self._settings = settings
         self._policy = policy
@@ -174,20 +208,7 @@ class Bot:
         self._dedup_set = dedup_set
         self._message_store = message_store
         self._robot_id: str = str(settings.get("robot_id") or "")
-        self._llm_config = llm_config or {}
-        self._http_session = http_session  # shared with adapter
-        gw_log().info(
-            "[infoflow] Bot init: llm_config=%s, has_session=%s, robot_id=%s",
-            bool(self._llm_config), self._http_session is not None, self._robot_id,
-        )
-
-    # -- helpers -------------------------------------------------------------
-
-    def _get_http_session(self) -> aiohttp.ClientSession:
-        """Return the shared aiohttp session (owned by adapter)."""
-        if self._http_session is None:
-            raise RuntimeError("Bot._http_session not set — adapter must pass its session")
-        return self._http_session
+        gw_log().info("[infoflow] Bot init: robot_id=%s", self._robot_id)
 
     # -- robot_id management ------------------------------------------------
 
@@ -303,39 +324,10 @@ class Bot:
             )
             return ProcessResult(decision=decision)
 
-        # Step 5b: LLM intent classification for follow-up messages
-        # Only triggered for follow-up window hits — @mention / watch hits skip this.
-        gw_log().info(
-            "[iflow:decision] mid=%s step5b trigger=%s llm_config=%s",
-            msg.msgid or "-", decision.trigger_reason, bool(self._llm_config),
-        )
-        if decision.trigger_reason == "followUp" and self._llm_config:
-            _intent = await self._classify_followup_intent(msg)
-            if _intent == "other":
-                gw_log().info(
-                    "[iflow:decision] mid=%s action=RECORD reason=followUp-intent:other sender=%s text=%r",
-                    msg.msgid or "-", msg.sender_name or msg.sender_id, _text_preview,
-                )
-                return ProcessResult(decision=PolicyDecision(action=Action.RECORD, reason="followUp-intent:other"))
-            if _intent == "bot":
-                gw_log().info(
-                    "[iflow:decision] mid=%s action=DISPATCH reason=followUp-intent:bot sender=%s text=%r",
-                    msg.msgid or "-", msg.sender_name or msg.sender_id, _text_preview,
-                )
-            elif _intent is None:
-                # LLM call failed → safe fallback: dispatch (with prompt guard)
-                gw_log().info(
-                    "[iflow:decision] mid=%s step=intent_classify result=FAILED action=dispatch_fallback",
-                    msg.msgid or "-",
-                )
-            # _intent == "none" → fall through to dispatch (Layer 2 + 3)
-            elif _intent == "none":
-                gw_log().info(
-                    "[iflow:decision] mid=%s step=intent_classify result=none action=dispatch_with_guard",
-                    msg.msgid or "-",
-                )
-
         # Step 6: Dispatch
+        # (Layer 1 intent classification was removed — the merged prompt
+        # templates in policy.py let the main agent self-classify and output
+        # NO_REPLY directly when the message isn't for it.)
         gw_log().info(
             "[iflow:decision] mid=%s action=DISPATCH trigger=%s reason=%s sender=%s text=%r",
             msg.msgid or "-", decision.trigger_reason, decision.reason,
@@ -401,40 +393,6 @@ class Bot:
                 raw_json=raw_json,
             )
 
-    # -- LLM judge helpers ---------------------------------------------------
-
-    async def _classify_followup_intent(self, msg: IncomingMessage) -> str | None:
-        """Layer 1: classify whether a follow-up message targets the bot."""
-        from .llm_judge import classify_followup_intent
-
-        try:
-            return await classify_followup_intent(
-                self._get_http_session(),
-                text=msg.text or "",
-                sender_name=msg.sender_name or msg.sender_id or "",
-                is_bot=msg.sender_is_bot,
-                bot_name=self._settings.get("robot_name") or "bot",
-                config=self._llm_config,
-            )
-        except Exception:
-            logger.debug("[llm_judge] intent classification error", exc_info=True)
-            return None
-
-    async def _evaluate_reply_value(self, reply_text: str) -> bool | None:
-        """Layer 3: evaluate whether a generated reply is worth sending."""
-        from .llm_judge import evaluate_reply_value
-
-        try:
-            return await evaluate_reply_value(
-                self._get_http_session(),
-                original_text=_dispatch_inbound_text_cv.get(""),
-                reply_text=reply_text,
-                config=self._llm_config,
-            )
-        except Exception:
-            logger.debug("[llm_judge] reply value evaluation error", exc_info=True)
-            return None  # safe fallback: send
-
     # -- dispatch orchestration ---------------------------------------------
 
     async def dispatch_inbound(
@@ -447,26 +405,18 @@ class Bot:
         # Propagate mid via contextvar so send() can trace it
         from .adapter import _inbound_mid
         _inbound_mid.set(msg.msgid or "")
-        # Mark follow-up dispatch context for Layer 3 (reply value check)
-        _dispatch_followup_cv.set(decision.trigger_reason == "followUp")
-        _dispatch_inbound_text_cv.set(msg.text or "")
+        _send_path_cv.set(decision.trigger_reason or "")
         hint = msg.msgid or None
         try:
             with recall_inbound_message_id_hint_scope(hint):
                 event = await adapter.build_message_event(msg, decision)
-                # Read passive flag set by adapter during build_message_event
-                _dispatch_followup_passive_cv.set(
-                    getattr(adapter, "_last_followup_is_passive", False)
-                )
                 await adapter.handle_message(event)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("[infoflow] inbound dispatch failed")
         finally:
-            _dispatch_followup_cv.set(False)
-            _dispatch_followup_passive_cv.set(False)
-            _dispatch_inbound_text_cv.set("")
+            _send_path_cv.set("")
 
     def spawn_dispatch(
         self,
@@ -500,50 +450,29 @@ class Bot:
         dedup, message store, and follow-up tracking.
         """
         from .adapter import _inbound_mid as _mid_var
+        _path = _send_path_cv.get("")
 
-        # NO_REPLY sentinel — suppress outbound message
-        stripped = (text or "").strip()
-        # Normalize: collapse whitespace, strip punctuation/emoji after NO_REPLY
-        _nr_first_line = stripped.split("\n")[0].strip()
-        _nr_clean = _nr_first_line.strip("。，,.！!？?~～ \t;；:：")
-        if _nr_clean == "NO_REPLY":
-            gw_log().info("[iflow:send] mid=%s NO_REPLY sentinel suppressed", _mid_var.get(""))
+        # NO_REPLY sentinel — see ``no_reply_sentinel_hits`` for acceptance rules.
+        if no_reply_sentinel_hits(text):
+            gw_log().info(
+                "[iflow:send] mid=%s path=%s NO_REPLY sentinel suppressed",
+                _mid_var.get(""), _path,
+            )
             return SentResult(success=True)
 
-        # Layer 3: Reply value evaluation (follow-up group messages only)
+        # Static refusal-regex filter (zero-latency Layer-3 fallback).
+        # Only applied on the followUp path so that @bot/watch responses
+        # like "暂时帮不上" are not killed.
         if (
-            _dispatch_followup_cv.get(False)
+            _path == "followUp"
             and group_id is not None
-            and self._llm_config
+            and _REFUSAL_RE.search((text or "")[:200])
         ):
-            _should_send = await self._evaluate_reply_value(stripped)
-            if _should_send is False:
-                gw_log().info(
-                    "[iflow:send] mid=%s target=group:%s chars=%d action=SUPPRESSED (Layer 3: low value)",
-                    _mid_var.get(""),
-                    group_id,
-                    len(stripped),
-                )
-                return SentResult(success=True)
-            elif _should_send is None:
-                # Layer 3 failed (timeout/error) → graded fallback
-                if _dispatch_followup_passive_cv.get(False):
-                    # Passive template: default to NOT sending on failure
-                    gw_log().info(
-                        "[iflow:send] mid=%s Layer3=None passive_followup → SUPPRESS",
-                        _mid_var.get(""),
-                    )
-                    return SentResult(success=True)
-                # Engaged / reply-to-bot: allow through
-                gw_log().info(
-                    "[iflow:send] mid=%s Layer3=None engaged → ALLOW",
-                    _mid_var.get(""),
-                )
-            else:
-                gw_log().info(
-                    "[iflow:send] mid=%s step=layer3_eval result=%s action=SEND",
-                    _mid_var.get(""), _should_send,
-                )
+            gw_log().info(
+                "[iflow:send] mid=%s path=%s refusal-regex SUPPRESS preview=%r",
+                _mid_var.get(""), _path, (text or "")[:60],
+            )
+            return SentResult(success=True)
 
         # Truncate into chunks (Hermes convention, 2KB per message ceiling)
         from gateway.platforms.base import BasePlatformAdapter  # type: ignore[import-not-found]

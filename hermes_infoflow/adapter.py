@@ -149,7 +149,6 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         super().__init__(config=config, platform=platform)
 
         self._settings = _read_account_settings(config)
-        self._last_followup_is_passive = False
 
         # ── ServerAPI (Infoflow service layer) ─────────────────────────
         self._serverapi = ServerAPI(settings=self._settings)
@@ -216,15 +215,6 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             account_id=str(self._settings.get("app_agent_id") or "default"),
         )
 
-        # ── LLM judge (lightweight classifier for follow-up messages) ────
-        from .llm_judge import _load_llm_config
-
-        self._llm_config = _load_llm_config()
-        gw_log().info("[infoflow] llm_judge config: model=%s base_url=%s has_key=%s",
-                       self._llm_config.get("model", "?"),
-                       self._llm_config.get("base_url", "?"),
-                       bool(self._llm_config.get("api_key", "")))
-
         # ── Bot (business logic) ──────────────────────────────────────
         self._bot = Bot(
             settings=self._settings,
@@ -233,7 +223,6 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             sent_store=self._sent_store,
             dedup_set=self._dedup_set,
             message_store=self._message_store,
-            llm_config=self._llm_config,
         )
 
         # Sync persisted robot_id to bot (so own-message echo filter works
@@ -321,7 +310,6 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
 
         self._http_session = aiohttp.ClientSession()
         self._serverapi.http_session = self._http_session
-        self._bot._http_session = self._http_session  # share session with bot
         try:
             from aiohttp import web
             app = web.Application(client_max_size=DEFAULT_BODY_LIMIT_BYTES)
@@ -366,7 +354,6 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             finally:
                 self._http_session = None
                 self._serverapi.http_session = None
-                self._bot._http_session = None
         self._mark_disconnected()
         gw_log().info("[infoflow] Disconnected")
 
@@ -654,8 +641,6 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     )
                     _template = ("reply_to_bot" if msg.is_reply_to_bot
                                  else "engaged" if _sender_engaged else "passive")
-                    # Store passive flag on adapter for bot.py to read
-                    self._last_followup_is_passive = not _sender_engaged and not msg.is_reply_to_bot
                     gw_log().info(
                         "[iflow:dispatch] mid=%s template=%s sender_engaged=%s is_reply_to_bot=%s",
                         msg.msgid or "-", _template, _sender_engaged, msg.is_reply_to_bot,
