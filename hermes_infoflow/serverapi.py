@@ -235,8 +235,16 @@ class ServerAPI:
         if options.at_all:
             items.append(_api.ContentItem("at", "all"))
         else:
+            user_ids_for_api: list[str] = []
             if options.mention_user_ids:
-                items.append(_api.ContentItem("at", options.mention_user_ids))
+                for uid in (s.strip() for s in options.mention_user_ids.split(",") if s.strip()):
+                    # Dedup: if body already has @<uid>, skip API item
+                    if text and f"@{uid}" in text:
+                        continue
+                    at_prefix_parts.append(f"@{uid}")
+                    user_ids_for_api.append(uid)
+            if user_ids_for_api:
+                items.append(_api.ContentItem("at", ",".join(user_ids_for_api)))
             if options.mention_agent_ids:
                 agent_ids_for_api: list[str] = []
                 for aid in (s.strip() for s in options.mention_agent_ids.split(",") if s.strip()):

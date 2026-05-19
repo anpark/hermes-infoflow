@@ -796,8 +796,16 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         options = SendOptions()
         if metadata:
             options.at_all = bool(metadata.get("at_all"))
-            options.mention_user_ids = str(metadata.get("mention_user_ids") or "")
-            options.mention_agent_ids = str(metadata.get("mention_agent_ids") or "")
+            raw_val = metadata.get("mention_user_ids")
+            if isinstance(raw_val, list):
+                options.mention_user_ids = ",".join(str(x) for x in raw_val if x)
+            else:
+                options.mention_user_ids = str(raw_val or "")
+            raw_val = metadata.get("mention_agent_ids")
+            if isinstance(raw_val, list):
+                options.mention_agent_ids = ",".join(str(x) for x in raw_val if x)
+            else:
+                options.mention_agent_ids = str(raw_val or "")
 
         # Delegate to bot
         bot_result = await self._bot.send_message(
