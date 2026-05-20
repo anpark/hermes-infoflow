@@ -555,7 +555,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             _raw = wh_result.raw_inbound.raw_msgdata if hasattr(wh_result.raw_inbound, "raw_msgdata") else {}
             gw_log().info(
                 "[iflow:raw] mid=%s payload=%s",
-                msg.msgid, _json.dumps(_raw, ensure_ascii=False, default=str)[:2000],
+                msg.message_id, _json.dumps(_raw, ensure_ascii=False, default=str)[:2000],
             )
         except Exception:
             pass
@@ -572,7 +572,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 "[iflow:event] mid=%s sender_id=%s sender_name=%s sender_imid=%s "
                 "sender_agent_id=%s is_bot=%s mentioned=%s "
                 "mention_users=%s mention_agents=%s reply_to_bot=%s body=%s",
-                msg.msgid, msg.sender_id, msg.sender_name, msg.sender_imid,
+                msg.message_id, msg.sender_id, msg.sender_name, msg.sender_imid,
                 getattr(msg, "sender_agent_id", ""), msg.sender_is_bot,
                 msg.bot_was_mentioned,
                 msg.mention_user_ids, msg.mention_agent_ids,
@@ -660,7 +660,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
 
         gw_log().info(
             "[infoflow-enrich] mid=%s sender=%s(%s) name=%s agent_id=%s is_bot=%s degraded=%s",
-            msg.msgid, msg.sender_id, msg.sender_imid, msg.sender_name,
+            msg.message_id, msg.sender_id, msg.sender_imid, msg.sender_name,
             getattr(msg, "sender_agent_id", ""), msg.sender_is_bot, _degraded,
         )
 
@@ -713,7 +713,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             chat_type=chat_type,
             user_id=msg.sender_id,
             user_name=_user_display,
-            message_id=msg.msgid,
+            message_id=msg.message_id,
         )
 
         message_type = MessageType.PHOTO if local_media else MessageType.TEXT
@@ -804,11 +804,11 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                                  else "engaged" if _sender_engaged else "passive")
                     gw_log().info(
                         "[iflow:dispatch] mid=%s template=%s sender_engaged=%s is_reply_to_bot=%s",
-                        msg.msgid or "-", _template, _sender_engaged, msg.is_reply_to_bot,
+                        msg.message_id or "-", _template, _sender_engaged, msg.is_reply_to_bot,
                     )
                     gw_log().info(
                         "[iflow:dispatch] mid=%s prompt_len=%d",
-                        msg.msgid or "-", len(prompt),
+                        msg.message_id or "-", len(prompt),
                     )
                     # Inject follow-up context as prefix of the user message text.
                     # This goes into event.text → gateway sends it as user message,
@@ -831,7 +831,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 text_for_agent = f"{_per_msg}\n\n{_sender_tag}\n[Message]\n{text_for_agent or ''}"
                 gw_log().info(
                     "[iflow:dispatch] mid=%s per_message_prompt_len=%d",
-                    msg.msgid or "-", len(_per_msg),
+                    msg.message_id or "-", len(_per_msg),
                 )
 
         # AT-only message: append explicit guidance so LLM doesn't output NO_REPLY
@@ -842,7 +842,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         # Log the complete user message sent to the LLM (gateway truncates to 80 chars)
         gw_log().info(
             "[iflow:user_message] mid=%s len=%d text=\n%s",
-            msg.msgid or "-", len(text_for_agent or ""), text_for_agent or "",
+            msg.message_id or "-", len(text_for_agent or ""), text_for_agent or "",
         )
 
         # DM: inject Sender tag + [Message] separator (matches group format).
@@ -857,7 +857,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             message_type=message_type,
             source=source,
             raw_message=raw_message,
-            message_id=msg.msgid,
+            message_id=msg.message_id,
             media_urls=local_media,
             media_types=media_types,
         )
@@ -1106,7 +1106,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             )
 
         if bot_result.success:
-            return SendResult(success=True, message_id=bot_result.msgid)
+            return SendResult(success=True, message_id=bot_result.message_id)
         return SendResult(
             success=False,
             error=bot_result.error,
@@ -1165,7 +1165,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             )
 
         if bot_result.success:
-            return SendResult(success=True, message_id=bot_result.msgid)
+            return SendResult(success=True, message_id=bot_result.message_id)
         return SendResult(success=False, error=bot_result.error, retryable=False)
 
     # ------------------------------------------------------------------
@@ -1185,7 +1185,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         result = await self._bot.recall_message(
             group_id=str(group_id) if group_id is not None else None,
             dm_user_id=dm_user or None,
-            msgid=message_id,
+            message_id=message_id,
             msgseqid="",
             count=count,
             session=session,

@@ -44,7 +44,7 @@ class IncomingMessage:
     """
 
     # Identity
-    msgid: str  # Infoflow message ID
+    message_id: str  # Infoflow message ID (unified from messageid/msgkey)
     text: str  # Plain text of the message
 
     # Target (exactly one is set)
@@ -124,7 +124,7 @@ class SentResult:
     """Result from serverapi after sending a message."""
 
     success: bool
-    msgid: str = ""  # Message ID assigned by Infoflow (``messageid`` or ``msgkey``)
+    message_id: str = ""  # Message ID assigned by Infoflow (unified from messageid/msgkey)
     msgseqid: str = ""  # Message sequence ID
     raw_response: dict[str, Any] = field(default_factory=dict)
     error: str = ""

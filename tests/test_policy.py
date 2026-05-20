@@ -21,7 +21,7 @@ def _coerce_kwargs(kwargs: dict) -> dict:
 def _group(**kwargs) -> IncomingMessage:
     kwargs = _coerce_kwargs(kwargs)
     base: dict = {
-        "msgid": "msg-group-test",
+        "message_id": "msg-group-test",
         "group_id": "g1",
         "sender_id": "bob",
         "text": "hello",
@@ -33,7 +33,7 @@ def _group(**kwargs) -> IncomingMessage:
 def _dm(**kwargs) -> IncomingMessage:
     kwargs = _coerce_kwargs(kwargs)
     base: dict = {
-        "msgid": "msg-dm-test",
+        "message_id": "msg-dm-test",
         "dm_user_id": "alice",
         "sender_id": "alice",
         "text": "hi",

@@ -395,7 +395,7 @@ def _build_body_for_agent(body_items: list[BodyItem]) -> tuple[str, str, list[st
                 agent_parts.append(f" {label} ")
         elif t in ("REPLYDATA", "REPLY"):
             if item.messageid:
-                agent_parts.append(f"<引用 messageid:{item.messageid}>{item.content}</引用>")
+                agent_parts.append(f"<引用 message_id:{item.messageid}>{item.content}</引用>")
         elif t == "IMAGE":
             if item.downloadurl:
                 image_urls.append(item.downloadurl)

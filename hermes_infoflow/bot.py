@@ -257,7 +257,7 @@ class Bot:
         gw_log().info(
             "[infoflow] inbound decoded: from=%s chat=%s group=%s mentioned=%s mid=%s text=%r",
             msg.sender_id, _chat, msg.is_group, msg.bot_was_mentioned,
-            msg.msgid or "-", _text_preview,
+            msg.message_id or "-", _text_preview,
         )
 
         # Step 1: Discover robot_id from @-mention body items
@@ -275,7 +275,7 @@ class Bot:
         if dedupe_key and self._sent_store.is_duplicate(dedupe_key):
             gw_log().info(
                 "[iflow:decision] mid=%s action=DROP reason=own-echo:plugin-sent text=%r",
-                msg.msgid or "-", _text_preview,
+                msg.message_id or "-", _text_preview,
             )
             return ProcessResult()
         if dedupe_key:
@@ -292,7 +292,7 @@ class Bot:
         ):
             gw_log().info(
                 "[iflow:decision] mid=%s action=RECORD reason=own-echo:external text=%r",
-                msg.msgid or "-", _text_preview,
+                msg.message_id or "-", _text_preview,
             )
             self._register_context(msg)
             return ProcessResult(decision=PolicyDecision(action=Action.RECORD, reason="own-echo:external"))
@@ -314,7 +314,7 @@ class Bot:
                 self._policy.record_sender_mention(msg.group_id, _mention_key)
                 gw_log().info(
                     "[iflow:decision] mid=%s step=record_mention sender=%s group=%s",
-                    msg.msgid or "-", _mention_key, msg.group_id,
+                    msg.message_id or "-", _mention_key, msg.group_id,
                 )
 
         # Step 5: Policy evaluation
@@ -322,7 +322,7 @@ class Bot:
         if not decision.should_dispatch:
             gw_log().info(
                 "[iflow:decision] mid=%s action=%s reason=%s sender=%s text=%r",
-                msg.msgid or "-", decision.action.value, decision.reason,
+                msg.message_id or "-", decision.action.value, decision.reason,
                 msg.sender_name or msg.sender_id, _text_preview,
             )
             return ProcessResult(decision=decision)
@@ -333,7 +333,7 @@ class Bot:
         # NO_REPLY directly when the message isn't for it.)
         gw_log().info(
             "[iflow:decision] mid=%s action=DISPATCH trigger=%s reason=%s sender=%s text=%r",
-            msg.msgid or "-", decision.trigger_reason, decision.reason,
+            msg.message_id or "-", decision.trigger_reason, decision.reason,
             msg.sender_name or msg.sender_id, _text_preview,
         )
         return ProcessResult(should_dispatch=True, decision=decision)
@@ -342,7 +342,7 @@ class Bot:
 
     def _register_context(self, msg: IncomingMessage) -> None:
         """Register inbound context for recall + persist to message store."""
-        if not msg.msgid:
+        if not msg.message_id:
             return
         target = (
             f"group:{msg.group_id}" if msg.is_group else (msg.dm_user_id or "")
@@ -358,7 +358,7 @@ class Bot:
             _InboundContext(
                 account_id=self._settings.get("app_key") or "default",
                 target=target,
-                inbound_message_id=msg.msgid,
+                inbound_message_id=msg.message_id,
                 reply_to_bot_message_id=reply_to_bot_id,
                 reply_targets=list(msg.reply_targets),
                 inbound_body=msg.text or "",
@@ -374,7 +374,7 @@ class Bot:
         raw_json = json.dumps(msg.raw_data, ensure_ascii=False) if msg.raw_data else ""
         if msg.dm_user_id is not None:
             self._message_store.persist_dm(
-                message_id=msg.msgid,
+                message_id=msg.message_id,
                 dm_user_id=msg.dm_user_id,
                 sender_id=msg.sender_id or msg.sender_imid or "",
                 sender_name=msg.sender_name or "",
@@ -386,7 +386,7 @@ class Bot:
             )
         elif msg.group_id is not None:
             self._message_store.persist_group(
-                message_id=msg.msgid,
+                message_id=msg.message_id,
                 group_id=msg.group_id,
                 sender_id=msg.sender_id or msg.sender_imid or "",
                 sender_name=msg.sender_name or "",
@@ -409,9 +409,9 @@ class Bot:
         """Build event and dispatch to agent via adapter."""
         # Propagate mid via contextvar so send() can trace it
         from .adapter import _inbound_mid
-        _inbound_mid.set(msg.msgid or "")
+        _inbound_mid.set(msg.message_id or "")
         _send_path_cv.set(decision.trigger_reason or "")
-        hint = msg.msgid or None
+        hint = msg.message_id or None
         try:
             with recall_inbound_message_id_hint_scope(hint):
                 event = await adapter.build_message_event(msg, decision)
@@ -486,7 +486,7 @@ class Bot:
             chunks = [""]
 
         store_key = self._normalize_store_key(group_id, dm_user_id)
-        last_msgid: str = ""
+        last_message_id: str = ""
         first_error: str = ""
         failed = 0
         succeeded = 0
@@ -510,7 +510,7 @@ class Bot:
 
             if result.success:
                 succeeded += 1
-                mid = result.msgid
+                mid = result.message_id
                 if mid:
                     self._sent_store.record(
                         chat_id=store_key,
@@ -519,10 +519,10 @@ class Bot:
                         digest=chunk[:80],
                     )
                     self._record_sent(
-                        msgid=mid, text=chunk,
+                        message_id=mid, text=chunk,
                         group_id=group_id, dm_user_id=dm_user_id,
                     )
-                    last_msgid = mid
+                    last_message_id = mid
             else:
                 failed += 1
                 if not first_error:
@@ -540,13 +540,13 @@ class Bot:
         if first_error:
             return SentResult(
                 success=False,
-                msgid=last_msgid,
+                message_id=last_message_id,
                 error=(
                     f"{first_error} (succeeded={succeeded}, failed={failed} of {len(chunks)} chunks)"
                     if succeeded else first_error
                 ),
             )
-        return SentResult(success=True, msgid=last_msgid)
+        return SentResult(success=True, message_id=last_message_id)
 
     # ======================================================================
     # OUTBOUND — send image
@@ -578,14 +578,14 @@ class Bot:
 
         if result.success:
             store_key = self._normalize_store_key(group_id, dm_user_id)
-            mid = result.msgid
+            mid = result.message_id
             if mid:
                 self._sent_store.record(
                     chat_id=store_key, messageid=mid,
                     msgseqid=result.msgseqid, digest="[image]",
                 )
                 self._record_sent(
-                    msgid=mid, text="[image]",
+                    message_id=mid, text="[image]",
                     group_id=group_id, dm_user_id=dm_user_id,
                 )
             if group_id:
@@ -606,10 +606,10 @@ class Bot:
         *,
         group_id: str | None = None,
         dm_user_id: str | None = None,
-        msgid: str | None = None,
+        message_id: str | None = None,
         msgseqid: str = "",
         count: int = 1,
-        current_inbound_msgid: str | None = None,
+        current_inbound_message_id: str | None = None,
         session: Any = None,
     ) -> RecallResult:
         """Recall one or more bot-sent messages.
@@ -623,18 +623,18 @@ class Bot:
         account_id = self._settings.get("app_key") or "default"
 
         # Resolve current inbound hint
-        if current_inbound_msgid is None:
-            current_inbound_msgid = get_recall_inbound_message_id_hint()
+        if current_inbound_message_id is None:
+            current_inbound_message_id = get_recall_inbound_message_id_hint()
 
-        # Aggressive guard: when a hint is present, only treat msgid
+        # Aggressive guard: when a hint is present, only treat message_id
         # as the inbound id if it matches the hint.
-        if msgid:
+        if message_id:
             inbound_key_for_aggressive: str | None = None
-            if current_inbound_msgid:
-                if msgid == current_inbound_msgid:
-                    inbound_key_for_aggressive = current_inbound_msgid
+            if current_inbound_message_id:
+                if message_id == current_inbound_message_id:
+                    inbound_key_for_aggressive = current_inbound_message_id
             else:
-                inbound_key_for_aggressive = msgid
+                inbound_key_for_aggressive = message_id
 
             corrected = None
             if inbound_key_for_aggressive:
@@ -647,25 +647,25 @@ class Bot:
             if corrected is not None and corrected.get("kind") == "swap":
                 gw_log().info(
                     "[bot:recall] auto-swap inbound id=%s -> bot msg id=%s",
-                    msgid, corrected.get("message_id"),
+                    message_id, corrected.get("message_id"),
                 )
-                msgid = str(corrected["message_id"])
+                message_id = str(corrected["message_id"])
             elif corrected is not None and corrected.get("kind") == "drop_to_count":
                 gw_log().info("[bot:recall] auto-correct: drop to count=1")
-                msgid = None
+                message_id = None
                 count = 1
 
-        targets: list[tuple[str, str]] = []  # (msgid, msgseqid)
+        targets: list[tuple[str, str]] = []  # (message_id, msgseqid)
 
-        if msgid:
-            entry = self._sent_store.find(store_key, msgid)
+        if message_id:
+            entry = self._sent_store.find(store_key, message_id)
             need_reply_fallback = (
                 entry is None or not (entry.msgseqid or "").strip()
             ) if group_id else entry is None
 
-            if need_reply_fallback and current_inbound_msgid:
+            if need_reply_fallback and current_inbound_message_id:
                 fb_entry = reply_to_bot_from_current_inbound(
-                    current_inbound_message_id=current_inbound_msgid,
+                    current_inbound_message_id=current_inbound_message_id,
                     store_key=store_key,
                     account_id=account_id,
                     sent_store=self._sent_store,
@@ -674,14 +674,14 @@ class Bot:
                     ok_use = (group_id is None) or bool((fb_entry.msgseqid or "").strip())
                     if ok_use:
                         gw_log().info(
-                            "[bot:recall] fallback: msgid=%s -> bot id=%s",
-                            msgid, fb_entry.messageid,
+                            "[bot:recall] fallback: message_id=%s -> bot id=%s",
+                            message_id, fb_entry.messageid,
                         )
-                        msgid = fb_entry.messageid
+                        message_id = fb_entry.messageid
                         entry = fb_entry
 
             seq = (entry.msgseqid if entry else "") or ""
-            targets.append((msgid, seq))
+            targets.append((message_id, seq))
         else:
             for entry in self._sent_store.recent(store_key, max(1, count)):
                 targets.append((entry.messageid, entry.msgseqid))
@@ -733,7 +733,7 @@ class Bot:
     def _record_sent(
         self,
         *,
-        msgid: str,
+        message_id: str,
         text: str,
         group_id: str | None = None,
         dm_user_id: str | None = None,
@@ -742,7 +742,7 @@ class Bot:
         try:
             if group_id is not None:
                 self._message_store.persist_group(
-                    message_id=msgid,
+                    message_id=message_id,
                     group_id=group_id,
                     sender_id=self._robot_id or "",
                     sender_name=self._settings.get("robot_name") or "",
@@ -753,7 +753,7 @@ class Bot:
                 )
             elif dm_user_id is not None:
                 self._message_store.persist_dm(
-                    message_id=msgid,
+                    message_id=message_id,
                     dm_user_id=dm_user_id,
                     sender_id=self._robot_id or "",
                     sender_name=self._settings.get("robot_name") or "",

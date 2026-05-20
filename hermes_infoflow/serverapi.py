@@ -189,7 +189,7 @@ class ServerAPI:
                 )
 
         return IncomingMessage(
-            msgid=str(parser_inbound.message_id or ""),
+            message_id=str(parser_inbound.message_id or ""),
             text=parser_inbound.text or "",
             group_id=(
                 parser_inbound.group_id
@@ -307,7 +307,7 @@ class ServerAPI:
             if res.get("ok"):
                 return SentResult(
                     success=True,
-                    msgid=str(res.get("messageid") or ""),
+                    message_id=str(res.get("messageid") or ""),
                     msgseqid=str(res.get("msgseqid") or ""),
                     raw_response=res,
                 )
@@ -353,7 +353,7 @@ class ServerAPI:
             if res.get("ok"):
                 return SentResult(
                     success=True,
-                    msgid=str(res.get("messageid") or res.get("msgkey") or ""),
+                    message_id=str(res.get("messageid") or res.get("msgkey") or ""),
                     msgseqid=str(res.get("msgseqid") or ""),
                     raw_response=res,
                 )
@@ -402,7 +402,7 @@ class ServerAPI:
             if res.get("ok"):
                 return SentResult(
                     success=True,
-                    msgid=str(res.get("messageid") or ""),
+                    message_id=str(res.get("messageid") or ""),
                     msgseqid=str(res.get("msgseqid") or ""),
                     raw_response=res,
                 )
@@ -448,7 +448,7 @@ class ServerAPI:
             if res.get("ok"):
                 return SentResult(
                     success=True,
-                    msgid=str(res.get("messageid") or res.get("msgkey") or ""),
+                    message_id=str(res.get("messageid") or res.get("msgkey") or ""),
                     msgseqid=str(res.get("msgseqid") or ""),
                     raw_response=res,
                 )
@@ -461,7 +461,7 @@ class ServerAPI:
     async def recall_group_message(
         self,
         group_id: str,
-        msgid: str,
+        message_id: str,
         msgseqid: str,
         *,
         session: aiohttp.ClientSession | None = None,
@@ -472,7 +472,7 @@ class ServerAPI:
                 res = await _api.recall_group_message(
                     self._api_account,
                     group_id=int(group_id),
-                    messageid=msgid,
+                    messageid=message_id,
                     msgseqid=msgseqid,
                     session=sess,
                 )
