@@ -5,10 +5,10 @@ home directory.
 
 ```bash
 # default: pip download + tar + rsync into ~/.hermes/plugins/infoflow/
-pipx run hermes-infoflow-tools update --version 0.2.1
+pipx run hermes-infoflow-tools update --version 0.2.2
 
 # or, install into site-packages and load via entry-point
-pipx run hermes-infoflow-tools update --version 0.2.1 --mode pip
+pipx run hermes-infoflow-tools update --version 0.2.2 --mode pip
 ```
 
 See the main repo README for the full installation matrix and trade-offs

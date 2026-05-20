@@ -8,6 +8,16 @@ versioning (with prerelease suffixes such as `0.1.0b1` for betas).
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-05-20
+
+### Fixed
+
+- First successful upload of ``hermes-infoflow-tools`` to PyPI (Trusted
+  Publisher for the sibling project had not been registered when 0.2.0
+  and 0.2.1 tags were pushed).
+- Remove accidentally committed ``scripts/test_prompts_results.json``
+  test-output artifact and add it to ``.gitignore``.
+
 ## [0.2.1] - 2026-05-20
 
 ### Fixed

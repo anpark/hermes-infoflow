@@ -32,6 +32,7 @@ build/
 htmlcov/
 coverage.xml
 *.cover
+scripts/test_prompts_results.json
 
 # Other Python test runners
 .tox/
