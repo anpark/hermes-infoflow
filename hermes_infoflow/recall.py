@@ -49,6 +49,8 @@ class _InboundContext:
     inbound_body: str
     registered_at: float
     sender_imid: str = ""
+    sender_id: str = ""  # uuapName for humans, "" for bots
+    sender_agent_id: str = ""  # agentId (int-as-str) for bots, "" for humans
     msgseqid: str | None = None
 
 
@@ -211,6 +213,23 @@ def get_inbound_sender_imid(message_id: str) -> str:
     ctx = _lookup_inbound_context(message_id)
     if ctx is None:
         return ""
+    return ctx.sender_imid or ""
+
+
+def get_inbound_sender_id(message_id: str) -> str:
+    """Return the sender's canonical identity for ``message_id``.
+
+    Human: uuapName (e.g. "chengbo05").
+    Bot: agentId as str (e.g. "12345").
+    Falls back to imid if neither is available.
+    """
+    ctx = _lookup_inbound_context(message_id)
+    if ctx is None:
+        return ""
+    if ctx.sender_agent_id:
+        return ctx.sender_agent_id
+    if ctx.sender_id:
+        return ctx.sender_id
     return ctx.sender_imid or ""
 
 

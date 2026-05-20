@@ -28,6 +28,8 @@ class ReplyInfo:
     preview: str = ""  # Preview snippet of the original message
     replytype: str = "1"  # "1" = reply (引用回复), "2" = quote (仅引用)
     sender_imid: str = ""  # imid of the original message sender (for Reply X: display)
+    sender_id: str = ""  # uuapName for humans, "" for bots
+    sender_agent_id: str = ""  # agentId (int-as-str) for bots, "" for humans
 
 
 # ---------------------------------------------------------------------------

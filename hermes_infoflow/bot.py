@@ -302,12 +302,20 @@ class Bot:
 
         # Step 4b: If this message @mentioned the bot, record sender mention
         # for follow-up engaged/passive template selection.
-        if getattr(msg, "bot_was_mentioned", False) and msg.group_id and msg.sender_id:
-            self._policy.record_sender_mention(msg.group_id, msg.sender_id)
-            gw_log().info(
-                "[iflow:decision] mid=%s step=record_mention sender=%s group=%s",
-                msg.msgid or "-", msg.sender_id, msg.group_id,
-            )
+        if getattr(msg, "bot_was_mentioned", False) and msg.group_id:
+            _mention_key = ""
+            if msg.sender_is_bot:
+                _aid = getattr(msg, "sender_agent_id", "") or ""
+                if _aid and not _aid.startswith("IMID:"):
+                    _mention_key = str(_aid)
+            else:
+                _mention_key = msg.sender_id or ""
+            if _mention_key:
+                self._policy.record_sender_mention(msg.group_id, _mention_key)
+                gw_log().info(
+                    "[iflow:decision] mid=%s step=record_mention sender=%s group=%s",
+                    msg.msgid or "-", _mention_key, msg.group_id,
+                )
 
         # Step 5: Policy evaluation
         decision = evaluate_inbound(msg, self._policy)
@@ -355,6 +363,8 @@ class Bot:
                 reply_targets=list(msg.reply_targets),
                 inbound_body=msg.text or "",
                 sender_imid=msg.sender_imid or "",
+                sender_id=msg.sender_id if not msg.sender_is_bot else "",
+                sender_agent_id=str(getattr(msg, "sender_agent_id", "") or ""),
                 registered_at=time.time(),
                 msgseqid=msg.msgseqid,
             )
@@ -520,11 +530,12 @@ class Bot:
 
         # Follow-up window: record bot reply timestamp for group messages
         if succeeded and group_id:
+            _reply_key = getattr(reply_info, 'sender_id', '') or ''
             self._policy.record_bot_reply(
                 group_id,
-                reply_to_sender=getattr(reply_info, 'sender_imid', '') or '',
+                reply_to_sender=_reply_key,
             )
-            gw_log().info("[iflow:send] mid=%s step=record_bot_reply group=%s", _mid_var.get(""), group_id)
+            gw_log().info("[iflow:send] mid=%s step=record_bot_reply group=%s reply_to=%s", _mid_var.get(""), group_id, _reply_key)
 
         if first_error:
             return SentResult(
@@ -552,6 +563,7 @@ class Bot:
         session: Any = None,
     ) -> SentResult:
         """Send an image (optionally with caption)."""
+        from .adapter import _inbound_mid as _mid_var
         if group_id is not None:
             result = await self._serverapi.send_image_to_group(
                 group_id, image_bytes,
@@ -577,11 +589,12 @@ class Bot:
                     group_id=group_id, dm_user_id=dm_user_id,
                 )
             if group_id:
+                _reply_key = getattr(reply_info, 'sender_id', '') or ''
                 self._policy.record_bot_reply(
                     group_id,
-                    reply_to_sender=getattr(reply_info, 'sender_imid', '') or '',
+                    reply_to_sender=_reply_key,
                 )
-                gw_log().info("[iflow:send] mid=%s step=record_bot_reply group=%s (image)", _mid_var.get(""), group_id)
+                gw_log().info("[iflow:send] mid=%s step=record_bot_reply group=%s (image) reply_to=%s", _mid_var.get(""), group_id, _reply_key)
         return result
 
     # ======================================================================

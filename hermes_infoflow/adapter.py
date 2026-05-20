@@ -175,7 +175,7 @@ from .policy import (
     normalize_reply_mode,
 )
 from .message_store import MessageStore
-from .recall import get_inbound_body, get_inbound_sender_imid
+from .recall import get_inbound_body, get_inbound_sender_imid, get_inbound_sender_id
 from .sent_store import SentMessageStore
 from .utils import (
     _ImageLoadError,
@@ -747,8 +747,15 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     from .policy import build_follow_up_prompt
                     _sender_engaged = False
                     if hasattr(self._policy, "sender_engaged_recently"):
+                        _engaged_key = ""
+                        if msg.sender_is_bot:
+                            _aid = getattr(msg, "sender_agent_id", "") or ""
+                            if _aid and not _aid.startswith("IMID:"):
+                                _engaged_key = str(_aid)
+                        if not _engaged_key:
+                            _engaged_key = msg.sender_id or msg.sender_imid
                         _sender_engaged = self._policy.sender_engaged_recently(
-                            msg.group_id, msg.sender_id or msg.sender_imid,
+                            msg.group_id, _engaged_key,
                         )
                     prompt = build_follow_up_prompt(
                         fromid=msg.sender_imid,
@@ -919,6 +926,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     messageid=reply_to,
                     preview=body[:MAX_PREVIEW_LENGTH],
                     sender_imid=get_inbound_sender_imid(reply_to),
+                    sender_id=get_inbound_sender_id(reply_to),
                 )
 
         # Build send options from Hermes metadata
@@ -1052,6 +1060,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     messageid=reply_to,
                     preview=body[:MAX_PREVIEW_LENGTH],
                     sender_imid=get_inbound_sender_imid(reply_to),
+                    sender_id=get_inbound_sender_id(reply_to),
                 )
 
         bot_result = await self._bot.send_image(
