@@ -131,6 +131,7 @@ async def resolve_member_identity(
             for m in state["members"]:
                 if _match(m):
                     return _to_dict(m)
+            return {}  # debounce window — members list is fresh, skip remote fetch
 
         # Reuse inflight task or create a new one
         if state["task"] is None or state["task"].done():
