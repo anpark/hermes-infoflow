@@ -270,7 +270,7 @@ def _coerce_body_item(raw: dict[str, Any]) -> BodyItem:
         robotid=_stringify(raw.get("robotid")),
         atall=bool(raw.get("atall")),
         downloadurl=_stringify(raw.get("downloadurl")),
-        messageid=_stringify(raw.get("messageid")),
+        messageid=_stringify(raw.get("messageid") or raw.get("sBasemsgId")),
         preview=_stringify(raw.get("preview")),
         is_bot_message=bool(raw.get("isBotMessage") or raw.get("is_bot_message")),
     )
@@ -354,7 +354,7 @@ def _extract_reply_targets(
         targets.append(
             {
                 "messageid": item.messageid,
-                "preview": item.preview,
+                "preview": item.preview or item.content,
                 "isBotMessage": is_bot,
             }
         )
@@ -393,6 +393,9 @@ def _build_body_for_agent(body_items: list[BodyItem]) -> tuple[str, str, list[st
             if label:
                 raw_parts.append(f" {label} ")
                 agent_parts.append(f" {label} ")
+        elif t in ("REPLYDATA", "REPLY"):
+            if item.messageid:
+                agent_parts.append(f"<引用 messageid:{item.messageid}>{item.content}</引用>\n")
         elif t == "IMAGE":
             if item.downloadurl:
                 image_urls.append(item.downloadurl)
