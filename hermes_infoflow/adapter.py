@@ -1178,7 +1178,6 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         message_id: str | None = None,
         *,
         count: int = 1,
-        current_inbound_message_id: str | None = None,
     ) -> "SendResult":
         """Recall one or more bot-sent messages (Hermes interface → bot layer)."""
         session = self._effective_session(self._http_session)
@@ -1189,7 +1188,6 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             msgid=message_id,
             msgseqid="",
             count=count,
-            current_inbound_msgid=current_inbound_message_id,
             session=session,
         )
 

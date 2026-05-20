@@ -473,7 +473,6 @@ def test_delete_message_corrects_inbound_id_via_reply_target(
         return await adapter.delete_message(
             "alice",
             message_id="INBOUND-7",  # the LLM's mistake
-            current_inbound_message_id="INBOUND-7",
         )
 
     result = asyncio.run(_go())
@@ -515,7 +514,6 @@ def test_delete_message_drops_to_count_one_on_recall_latest_intent(
         return await adapter.delete_message(
             "alice",
             message_id="INBOUND-X",
-            current_inbound_message_id="INBOUND-X",
         )
 
     result = asyncio.run(_go())
@@ -534,7 +532,6 @@ def test_delete_message_surface_candidates_when_unknown(
         return await adapter.delete_message(
             "group:99",
             message_id="UNKNOWN",
-            current_inbound_message_id=None,
         )
 
     result = asyncio.run(_go())
@@ -580,7 +577,6 @@ def test_delete_message_group_falls_back_via_current_inbound_reply(
         return await adapter.delete_message(
             "group:42",
             message_id="HALLUCINATED",
-            current_inbound_message_id="USER123",
         )
 
     result = asyncio.run(_go())
@@ -623,7 +619,6 @@ def test_delete_message_group_no_fallback_when_target_mismatches_inbound_ctx(
         return await adapter.delete_message(
             "group:42",
             message_id="HALLUCINATED",
-            current_inbound_message_id="USER123",
         )
 
     result = asyncio.run(_go())
@@ -672,9 +667,8 @@ def test_delete_message_group_falls_back_via_context_hint(
         with recall_inbound_message_id_hint_scope("USER123"):
             return await adapter.delete_message(
                 "group:42",
-                message_id="HALLUCINATED",
-                current_inbound_message_id=None,
-            )
+            message_id="HALLUCINATED",
+        )
 
     result = asyncio.run(_go())
     assert result.success is True

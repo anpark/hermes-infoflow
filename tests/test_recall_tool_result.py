@@ -45,7 +45,6 @@ def test_recall_handler_success_returns_json_string() -> None:
         message_id=None,
         *,
         count=1,
-        current_inbound_message_id=None,
     ):
         return SimpleNamespace(
             success=True,

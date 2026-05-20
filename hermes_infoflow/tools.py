@@ -99,14 +99,6 @@ RECALL_TOOL_SCHEMA = {
                 "maximum": 10,
                 "default": 1,
             },
-            "current_inbound_message_id": {
-                "type": "string",
-                "description": (
-                    "Optional: the message_id of the inbound message currently "
-                    "being processed. When provided, enables auto-correction if "
-                    "the LLM accidentally passed this same id as message_id."
-                ),
-            },
         },
         "required": ["target"],
     },
@@ -257,7 +249,6 @@ def make_recall_handler():
     async def _handler(args: dict, **_kwargs) -> str:
         target = args.get("target")
         message_id = args.get("message_id") or None
-        current_inbound = args.get("current_inbound_message_id") or None
         try:
             count = int(args.get("count", 1))
         except (TypeError, ValueError):
@@ -277,7 +268,6 @@ def make_recall_handler():
             target,
             message_id,
             count=count,
-            current_inbound_message_id=current_inbound,
         ))
         if not result.success:
             return tool_result_json({"error": result.error or "recall failed"})
