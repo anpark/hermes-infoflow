@@ -8,6 +8,17 @@ versioning (with prerelease suffixes such as `0.1.0b1` for betas).
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-05-20
+
+### Fixed
+
+- ``hermes-infoflow-tools`` sdist build failed on PyPI due to an invalid
+  classifier ``Topic :: Software Development :: Installation/Setup`` —
+  corrected to ``Topic :: System :: Installation/Setup``.
+- ``publish.yml`` now passes ``skip-existing: true`` to
+  ``pypa/gh-action-pypi-publish`` so partial-failure reruns don't break
+  on already-published versions.
+
 ## [0.2.0] - 2026-05-20
 
 ### Added — OpenClaw parity pass

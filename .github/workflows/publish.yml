@@ -23,6 +23,8 @@ jobs:
           python -m build
       - name: Publish
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
 
   publish-tools:
     name: Publish hermes-infoflow-tools
@@ -45,3 +47,4 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: tools/hermes-infoflow-tools/dist/
+          skip-existing: true
