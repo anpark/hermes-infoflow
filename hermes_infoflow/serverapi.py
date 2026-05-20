@@ -50,8 +50,115 @@ _MEMBERS_CACHE_TTL = 300  # 5 minutes
 
 
 # ---------------------------------------------------------------------------
-# Parser account proxy (duck-typed for parser.py)
+# resolve_member_identity — unified member lookup with guarded fetch
 # ---------------------------------------------------------------------------
+
+from enum import Enum
+
+
+class CacheRetrievalPolicy(Enum):
+    """Control when ``resolve_member_identity`` hits the network."""
+    RETRIEVE_FROM_CACHE_ONLY = "cache_only"
+    RETRIEVE_FROM_REMOTE_ONLY = "remote_only"
+    RETRIEVE_FROM_CACHE_THEN_REMOTE = "cache_then_remote"  # default
+
+
+# Per-group guarded-fetch state (module-level for singleton semantics)
+_guarded_state: dict[str, dict] = {}  # group_id → {task, last_ts, members}
+_DEBOUNCE_SECONDS = 3.0
+
+
+async def resolve_member_identity(
+    group_id: str,
+    *,
+    bot_name: str | None = None,
+    agent_id: int | None = None,
+    imid: str | None = None,
+    cache_policy: CacheRetrievalPolicy = CacheRetrievalPolicy.RETRIEVE_FROM_CACHE_THEN_REMOTE,
+    session: aiohttp.ClientSession | None = None,
+    serverapi: "ServerApi | None" = None,
+) -> dict:
+    """Look up a group member by *any* of the provided identity fields.
+
+    Returns the matching ``GroupMember`` as a plain dict (same fields as the
+    dataclass), or an empty dict if not found.
+
+    Guarantees at most **one** concurrent remote fetch per group_id.
+    Multiple concurrent callers share the same in-flight task.
+    A 3-second debounce suppresses redundant fetches after a successful one.
+    """
+    import asyncio
+
+    if not any(v is not None for v in (bot_name, agent_id, imid)):
+        return {}
+
+    gid = str(group_id)
+
+    # --- helpers ---
+    def _match(m: GroupMember) -> bool:
+        if bot_name is not None and m.name == bot_name and m.is_bot:
+            return True
+        if agent_id is not None and m.agent_id == agent_id:
+            return True
+        if imid is not None and str(m.imid) == str(imid):
+            return True
+        return False
+
+    def _to_dict(m: GroupMember) -> dict:
+        return {
+            "uid": m.uid,
+            "name": m.name,
+            "imid": m.imid,
+            "agent_id": m.agent_id,
+            "is_bot": m.is_bot,
+        }
+
+    # --- try cache first (unless REMOTE_ONLY) ---
+    if cache_policy != CacheRetrievalPolicy.RETRIEVE_FROM_REMOTE_ONLY:
+        cached = _MEMBERS_CACHE.get(gid)
+        if cached and cached[0]:
+            for m in cached[0]:
+                if _match(m):
+                    return _to_dict(m)
+
+    # --- remote fetch (unless CACHE_ONLY) ---
+    if cache_policy != CacheRetrievalPolicy.RETRIEVE_FROM_CACHE_ONLY:
+        state = _guarded_state.setdefault(gid, {"task": None, "last_ts": 0.0, "members": None})
+
+        # Skip if within debounce window and we already have members
+        now = time.time()
+        if state["members"] is not None and (now - state["last_ts"]) < _DEBOUNCE_SECONDS:
+            for m in state["members"]:
+                if _match(m):
+                    return _to_dict(m)
+
+        # Reuse inflight task or create a new one
+        if state["task"] is None or state["task"].done():
+            async def _fetch():
+                if serverapi is None:
+                    return []
+                try:
+                    members = await serverapi.get_group_members(
+                        gid, session=session, force_refresh=True,
+                    )
+                    state["members"] = members
+                    state["last_ts"] = time.time()
+                    return members
+                except Exception:
+                    state["task"] = None  # allow retry
+                    return []
+            state["task"] = asyncio.ensure_future(_fetch())
+
+        members = await state["task"]
+        if members:
+            for m in members:
+                if _match(m):
+                    return _to_dict(m)
+
+    return {}
+
+
+
 
 
 @dataclass

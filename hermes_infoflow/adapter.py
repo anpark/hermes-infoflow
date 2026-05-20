@@ -610,46 +610,31 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
           - Bot without agent_id  → ``IMID:{imid}`` (agent-level ops may fail)
           - Human without userId  → ``IMID:{imid}``
         """
-        from .serverapi import _MEMBERS_CACHE
+        from .serverapi import CacheRetrievalPolicy, resolve_member_identity
 
-        sender_info = None  # GroupMember | None
+        if not msg.group_id:
+            return
 
-        # 1. Try cache
-        cached = _MEMBERS_CACHE.get(msg.group_id)
-        if cached:
-            for m in cached[0]:
-                if str(m.imid) == str(msg.sender_imid):
-                    sender_info = m
-                    break
+        sender_info = await resolve_member_identity(
+            msg.group_id,
+            imid=msg.sender_imid,
+            cache_policy=CacheRetrievalPolicy.RETRIEVE_FROM_CACHE_THEN_REMOTE,
+            serverapi=self._serverapi,
+        )
 
-        # 2. Cache miss → API (6s timeout, stale fallback inside serverapi)
-        if sender_info is None:
-            try:
-                members = await self._serverapi.get_group_members(msg.group_id)
-                for m in members:
-                    if str(m.imid) == str(msg.sender_imid):
-                        sender_info = m
-                        break
-            except Exception as exc:
-                gw_log().warning(
-                    "[infoflow] get_group_members(%s) failed: %s",
-                    msg.group_id, exc,
-                )
-
-        # 3. Apply enriched info
         if sender_info:
-            if sender_info.is_bot:
+            if sender_info["is_bot"]:
                 if not msg.sender_name or msg.sender_name == msg.sender_imid:
-                    msg.sender_name = sender_info.name or msg.sender_name
-                if sender_info.agent_id:
-                    msg.sender_agent_id = str(sender_info.agent_id)
+                    msg.sender_name = sender_info["name"] or msg.sender_name
+                if sender_info["agent_id"]:
+                    msg.sender_agent_id = str(sender_info["agent_id"])
             else:
-                if sender_info.uid and (not msg.sender_id or msg.sender_id == msg.sender_imid):
-                    msg.sender_id = sender_info.uid
+                if sender_info["uid"] and (not msg.sender_id or msg.sender_id == msg.sender_imid):
+                    msg.sender_id = sender_info["uid"]
                 if not msg.sender_name or msg.sender_name == msg.sender_imid:
-                    msg.sender_name = sender_info.name or msg.sender_id
+                    msg.sender_name = sender_info["name"] or msg.sender_id
 
-        # 4. Degradation: ensure mandatory fields exist
+        # Degradation: ensure mandatory fields exist
         _degraded = False
         if msg.sender_is_bot and not getattr(msg, "sender_agent_id", ""):
             msg.sender_agent_id = f"IMID:{msg.sender_imid}"
