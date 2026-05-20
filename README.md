@@ -37,7 +37,7 @@ hermes plugins enable infoflow
 hermes gateway restart
 ```
 
-hermes 内置命令；`git clone --depth 1` 到 `~/.hermes/plugins/infoflow/`。
+hermes 内置命令；`git clone --depth 1` 到 `~/.hermes/plugins/infoflow/`。仓库根目录已包含 `__init__.py`（代理到 `hermes_infoflow/` 子包），无需手动扁平化即可直接工作。
 
 ### B. `hermes-infoflow-tools`（对齐 `npx ... update`）
 

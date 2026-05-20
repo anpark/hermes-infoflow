@@ -34,10 +34,13 @@ run_cmd mkdir -p "$PLUGIN_DIR"
 
 # hermes-agent's directory-plugin loader (hermes_cli/plugins.py::
 # _load_directory_module) requires ``__init__.py`` to live directly at
-# ``$PLUGIN_DIR``. Our repo keeps the source nested inside ``hermes_infoflow/``
-# so the same code also works as a pip-installed package via the
-# ``hermes_agent.plugins`` entry point. Bridge the two by flattening at
-# deploy time:
+# ``$PLUGIN_DIR``.  The repo root already ships such a file (it re-exports
+# from ``hermes_infoflow/``), so ``hermes plugins install`` works without
+# any extra step.
+#
+# This script still flattens the layout for backward compatibility with
+# older deployments and to align with the ``--mode extract`` path of
+# ``hermes-infoflow-tools``. The flattening rsyncs:
 #
 #   1. ``hermes_infoflow/*``  →  ``$PLUGIN_DIR/*``   (with --delete)
 #   2. ``plugin.yaml``        →  ``$PLUGIN_DIR/plugin.yaml``
@@ -45,10 +48,9 @@ run_cmd mkdir -p "$PLUGIN_DIR"
 #                                 hermes-infoflow-tools --mode extract
 #                                 can find deploy-common.sh on re-runs)
 #
-# Internal imports inside the package are all relative (``from .adapter
-# import register``), and hermes-agent sets
-# ``submodule_search_locations=[plugin_dir]`` on the loaded module, so
-# the relative imports keep resolving against the flat layout.
+# After flattening, relative imports (``from .adapter import register``)
+# resolve correctly because hermes-agent sets
+# ``submodule_search_locations=[plugin_dir]`` on the loaded module.
 PACKAGE_DIR="$PROJECT_DIR/hermes_infoflow"
 if [[ ! -d "$PACKAGE_DIR" ]]; then
   echo "✗ expected Python package directory not found: $PACKAGE_DIR" >&2

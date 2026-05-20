@@ -2,15 +2,16 @@
 
 hermes-agent's directory loader
 (``hermes_cli/plugins.py::_load_directory_module``) requires
-``__init__.py`` to live directly at ``<plugin_dir>``. Our repo keeps the
-source nested inside ``hermes_infoflow/`` so the same code also works
-as a pip-installed package via the ``hermes_agent.plugins`` entry point.
+``__init__.py`` to live directly at ``<plugin_dir>``.  The repo ships a
+root-level ``__init__.py`` that re-exports from ``hermes_infoflow/``, so
+``hermes plugins install`` works without flattening.
+
 ``scripts/deploy.sh`` (and ``hermes-infoflow-tools update --mode extract``)
-bridge those two by flattening the layout at deploy time. These tests
-lock that contract: if a refactor reverts the flattening, hermes-agent
-silently fails with ``No __init__.py in <plugin_dir>`` on gateway start
-— hard to debug without reading hermes-agent's loader. We'd rather see
-a red test here than a confusing gateway log later.
+*also* flatten the layout for backward compatibility — these tests lock that
+contract too.  If a refactor reverts the flattening, hermes-agent silently
+fails with ``No __init__.py in <plugin_dir>`` on gateway start — hard to
+debug without reading hermes-agent's loader.  We'd rather see a red test
+here than a confusing gateway log later.
 """
 
 from __future__ import annotations
@@ -185,3 +186,118 @@ def test_flat_layout_loads_like_hermes_agent_does(deployed: Path) -> None:
         for name in list(sys.modules):
             if name == ns_parent or name.startswith(ns_parent + "."):
                 sys.modules.pop(name, None)
+
+
+def test_plugins_install_layout_loads_like_hermes_agent_does(_REPO_ROOT) -> None:
+    """Mimic ``hermes plugins install`` — repo root IS the plugin dir.
+
+    ``hermes plugins install`` does ``git clone --depth 1`` + ``shutil.move``
+    into ``~/.hermes/plugins/infoflow/``.  The repo root ships a
+    ``__init__.py`` that re-exports from ``hermes_infoflow/``; the directory
+    loader sets ``submodule_search_locations=[plugin_dir]`` so the import
+    resolves against ``plugin_dir/hermes_infoflow/``.
+
+    This test uses the actual repo root as the plugin dir — no flattening,
+    no deploy.sh — to prove that path works.
+    """
+    pytest.importorskip("gateway.platform_registry")
+
+    repo_root = Path(_REPO_ROOT)
+    init_file = repo_root / "__init__.py"
+    assert init_file.is_file(), (
+        f"root __init__.py missing — hermes plugins install would fail"
+    )
+
+    ns_parent = "hermes_plugins_test_git_install"
+    module_name = f"{ns_parent}.infoflow"
+
+    if ns_parent not in sys.modules:
+        ns_pkg = types.ModuleType(ns_parent)
+        ns_pkg.__path__ = []  # type: ignore[attr-defined]
+        ns_pkg.__package__ = ns_parent
+        sys.modules[ns_parent] = ns_pkg
+
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        init_file,
+        submodule_search_locations=[str(repo_root)],
+    )
+    assert spec is not None and spec.loader is not None
+
+    module = importlib.util.module_from_spec(spec)
+    module.__package__ = module_name
+    module.__path__ = [str(repo_root)]  # type: ignore[attr-defined]
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+        assert callable(getattr(module, "register", None)), (
+            "loaded module has no register() entry point"
+        )
+    finally:
+        for name in list(sys.modules):
+            if name == ns_parent or name.startswith(ns_parent + "."):
+                sys.modules.pop(name, None)
+
+
+def test_root_init_py_mirrors_package_exports() -> None:
+    """Root ``__init__.py`` and ``hermes_infoflow/__init__.py`` must export
+    the same ``__all__`` and ``__version__`` so ``hermes plugins install``
+    and pip installs behave identically.
+    """
+    repo_root = Path(_REPO_ROOT)
+
+    import ast
+
+    root_init = ast.parse((repo_root / "__init__.py").read_text())
+    pkg_init = ast.parse(
+        (repo_root / "hermes_infoflow" / "__init__.py").read_text()
+    )
+
+    # Extract __all__ lists
+    def _get_all(tree: ast.AST) -> list[str]:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id == "__all__":
+                        if isinstance(node.value, ast.List):
+                            return [
+                                elt.value
+                                for elt in node.value.elts
+                                if isinstance(elt, ast.Constant)
+                                and isinstance(elt.value, str)
+                            ]
+        return []
+
+    root_all = _get_all(root_init)
+    pkg_all = _get_all(pkg_init)
+    assert root_all == pkg_all, (
+        f"root __init__.py __all__ ({root_all}) != "
+        f"hermes_infoflow/__init__.py __all__ ({pkg_all})"
+    )
+
+    # Extract __version__
+    def _get_version(tree: ast.AST) -> str | None:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id == "__version__":
+                        if isinstance(node.value, ast.Constant):
+                            return node.value.value
+        return None
+
+    root_ver = _get_version(root_init)
+    pkg_ver = _get_version(pkg_init)
+    # Root __init__.py imports __version__ from hermes_infoflow rather than
+    # defining it inline, so _get_version returns None for the root.
+    # Verify that the import exists and the sub-package version is set.
+    assert pkg_ver is not None, "hermes_infoflow/__init__.py has no __version__"
+    # Verify root has a `from hermes_infoflow import ... __version__` import.
+    has_version_import = any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "hermes_infoflow"
+        and any(alias.name == "__version__" for alias in node.names)
+        for node in ast.walk(root_init)
+    )
+    assert has_version_import, (
+        "root __init__.py must import __version__ from hermes_infoflow"
+    )

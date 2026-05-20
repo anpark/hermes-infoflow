@@ -9,12 +9,29 @@
 # plugins and they may shadow each other unpredictably.
 #
 # Layout note: hermes-agent's directory loader requires ``__init__.py`` at the
-# plugin dir root (``hermes_cli/plugins.py::_load_directory_module``). The repo
-# keeps the source nested in ``hermes_infoflow/`` so the same code also serves
-# the entry-point install. ``scripts/deploy.sh`` flattens the layout at deploy
-# time — see ``tests/test_deploy_layout.py`` for the contract. There is NO
-# ``entry_module`` field hermes-agent reads; pointing at a nested package via
-# the manifest would not help.
+# plugin dir root (``hermes_cli/plugins.py::_load_directory_module``).  This
+# repo ships a root-level ``__init__.py`` that re-exports the public API from
+# the ``hermes_infoflow/`` sub-package.  This makes all four install paths work
+# without flattening:
+#
+#   A. ``hermes plugins install`` — git clone + move; root ``__init__.py``
+#      imports from ``hermes_infoflow`` via the submodule search path that
+#      the directory loader sets on the loaded module.
+#   B. ``hermes-infoflow-tools --mode extract`` — unpacks sdist then rsyncs
+#      ``hermes_infoflow/*`` to the plugin dir root (overwrites root
+#      ``__init__.py`` with the flattened copy).
+#   C. ``pip install`` — entry-point loads ``hermes_infoflow`` directly;
+#      root ``__init__.py`` is never touched.
+#   D. ``scripts/deploy.sh`` — rsync flattens ``hermes_infoflow/*`` to the
+#      plugin dir root (same as B-extract).
+#
+# There is NO ``entry_module`` field hermes-agent reads; pointing at a nested
+# package via the manifest would not help.
+#
+# IMPORTANT: the root ``__init__.py`` mirrors exports from
+# ``hermes_infoflow/__init__.py``.  When adding public symbols or bumping the
+# version, update BOTH files.  See the root ``__init__.py`` header comment
+# for the full maintenance rules.
 manifest_version: 1
 name: infoflow
 label: Infoflow (如流)
