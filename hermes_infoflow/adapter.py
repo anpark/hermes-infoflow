@@ -32,8 +32,7 @@ import logging
 import os
 import re
 import socket as _socket
-from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import aiohttp
 
@@ -143,8 +142,8 @@ try:
         MessageType,
         Platform,
         SendResult,
+        cache_image_from_bytes,  # type: ignore[import-not-found]
     )
-    from gateway.platforms.base import cache_image_from_bytes  # type: ignore[import-not-found]
 
     HERMES_AVAILABLE = True
 except ImportError:
@@ -159,33 +158,24 @@ except ImportError:
 
 # ── Plugin modules ────────────────────────────────────────────────────
 
-from .serverapi import ServerAPI
-from .itypes import IncomingMessage, SendOptions, SentResult, ReplyInfo
-from .webhook import parse_webhook_request
 from .iftools import (
     RECALL_TOOL_SCHEMA,
     REPLY_TOOL_SCHEMA,
     make_recall_handler,
     make_reply_handler,
 )
+from .itypes import IncomingMessage, ReplyInfo, SendOptions
+from .message_store import MessageStore
 from .policy import (
+    _SENDER_FORMAT_DOC,
     GroupConfigOverride,
     GroupPolicy,
     PolicyDecision,
-    _SENDER_FORMAT_DOC,
     normalize_reply_mode,
 )
-from .message_store import MessageStore
-from .recall import get_inbound_body, get_inbound_sender_imid, get_inbound_sender_id
+from .recall import get_inbound_body, get_inbound_sender_id, get_inbound_sender_imid
 from .sent_store import SentMessageStore
-from .utils import (
-    _ImageLoadError,
-    _allowed_media_roots,
-    _download_inbound_image,
-    _is_safe_outbound_url,
-    _resolve_safe_local_path,
-    gw_log,
-)
+from .serverapi import ServerAPI
 from .settings import (
     DEFAULT_BODY_LIMIT_BYTES,
     DEFAULT_HOST,
@@ -203,6 +193,14 @@ from .settings import (
     _validate_config,
 )
 from .standalone import standalone_send
+from .utils import (
+    _download_inbound_image,
+    _ImageLoadError,
+    _is_safe_outbound_url,
+    _resolve_safe_local_path,
+    gw_log,
+)
+from .webhook import parse_webhook_request
 
 # ---------------------------------------------------------------------------
 # Sender tag builder — used by both group and DM paths
@@ -243,7 +241,9 @@ def _build_sender_tag(msg: Any, admin_uid: str = "") -> str:
     else:
         tag += "(restricted — 仅可回复文本和公开信息，不可执行敏感操作)"
     return tag
-from .bot import Bot, get_recall_inbound_message_id_hint  # noqa: E402
+import contextlib
+
+from .bot import Bot  # noqa: E402
 
 if TYPE_CHECKING:
     from aiohttp import web as _web_module
@@ -497,17 +497,15 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             pass
         self._site = None
         if self._runner is not None:
-            try:
+            with contextlib.suppress(Exception):
                 await self._runner.cleanup()
-            except Exception:
-                pass
             self._runner = None
 
     # ------------------------------------------------------------------
     # Webhook handler
     # ------------------------------------------------------------------
 
-    async def _handle_webhook(self, request: "_web_module.Request") -> "_web_module.Response":
+    async def _handle_webhook(self, request: _web_module.Request) -> _web_module.Response:
         """Receive an Infoflow webhook hit, dispatch in the background, return 200."""
         try:
             raw_bytes = await request.read()
@@ -599,7 +597,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
     # _enrich_sender: resolve sender name/agent_id from group members
     # ------------------------------------------------------------------
 
-    async def _enrich_sender(self, msg: "IncomingMessage") -> None:
+    async def _enrich_sender(self, msg: IncomingMessage) -> None:
         """Populate sender_name / sender_agent_id from group member cache or API.
 
         Called for ALL group messages in the webhook handler (before dispatch
@@ -733,9 +731,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     bt = (b.type or "").upper()
                     if bt == "AT" and not b.atall:
                         name = b.name or b.userid or b.robotid or "?"
-                        if b.robotid:
-                            _mention_parts.append(f"@{name}")
-                        elif b.userid:
+                        if b.robotid or b.userid:
                             _mention_parts.append(f"@{name}")
             if _mention_parts:
                 text_for_agent = f"（仅@了以下对象，无正文：{' '.join(_mention_parts)}）"
@@ -938,7 +934,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _is_session_valid(session: "aiohttp.ClientSession | None") -> bool:
+    def _is_session_valid(session: aiohttp.ClientSession | None) -> bool:
         """Check whether *session* is usable on the current event loop.
 
         ``aiohttp`` sessions are bound to the loop that created them.
@@ -961,7 +957,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         return session_loop is current_loop
 
     @staticmethod
-    def _effective_session(session: "aiohttp.ClientSession | None") -> "aiohttp.ClientSession | None":
+    def _effective_session(session: aiohttp.ClientSession | None) -> aiohttp.ClientSession | None:
         """Return *session* if valid on the current loop, else ``None``."""
         return session if InfoflowAdapter._is_session_valid(session) else None
 
@@ -996,7 +992,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         content: str,
         reply_to: str | None = None,
         metadata: dict[str, Any] | None = None,
-    ) -> "SendResult":
+    ) -> SendResult:
         """Send a text/markdown message (Hermes interface → bot layer)."""
         session = self._effective_session(self._http_session)
         kind, group_id, dm_user = self._parse_target(chat_id)
@@ -1127,7 +1123,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         caption: str | None = None,
         reply_to: str | None = None,
         metadata: dict[str, Any] | None = None,
-    ) -> "SendResult":
+    ) -> SendResult:
         """Send an image (Hermes interface → bot layer)."""
         session = self._effective_session(self._http_session)
         kind, group_id, dm_user = self._parse_target(chat_id)
@@ -1179,7 +1175,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         *,
         count: int = 1,
         current_inbound_message_id: str | None = None,
-    ) -> "SendResult":
+    ) -> SendResult:
         """Recall one or more bot-sent messages (Hermes interface → bot layer)."""
         session = self._effective_session(self._http_session)
         kind, group_id, dm_user = self._parse_target(chat_id)
@@ -1263,8 +1259,9 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
 # ---------------------------------------------------------------------------
 
 try:
-    from aiohttp import web as _aiohttp_web_module  # noqa: E402
-    AIOHTTP_WEB_AVAILABLE = True
+    import importlib.util
+
+    AIOHTTP_WEB_AVAILABLE = importlib.util.find_spec("aiohttp.web") is not None
 except ImportError:
     AIOHTTP_WEB_AVAILABLE = False
 

@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 from typing import Any
 
 import pytest
 
 from hermes_infoflow import api
-
 
 # ---------------------------------------------------------------------------
 # Pure helpers
@@ -30,8 +28,8 @@ def test_build_private_payload_text_default() -> None:
     payload = api._build_private_payload("alice", [api.ContentItem("text", "hi")])
     assert payload == {
         "touser": "alice",
-        "msgtype": "text",
-        "text": {"content": "hi"},
+        "msgtype": "md",
+        "md": {"content": "hi"},
     }
 
 
@@ -73,8 +71,8 @@ def test_build_group_body_items_handles_all_types() -> None:
     )
     assert has_md is True
     types = [b["type"] for b in body]
-    assert "TEXT" in types
     assert "MD" in types
+    assert "TEXT" not in types  # plain text is folded into MD-only outbound path
     assert "LINK" in types
     assert "IMAGE" in types
     at_items = [b for b in body if b["type"] == "AT"]
@@ -246,7 +244,9 @@ def test_recall_private_message_body_uses_json_dumps(monkeypatch):
     captured = {}
 
     class _Resp:
-        def __init__(self, text): self._t = text; self.status = 200
+        def __init__(self, text):
+            self._t = text
+            self.status = 200
         async def __aenter__(self): return self
         async def __aexit__(self, *_): return None
         async def text(self): return self._t

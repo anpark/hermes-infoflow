@@ -12,7 +12,8 @@ unwanted outbound messages, so its acceptance rules need to be precise:
 
 from __future__ import annotations
 
-from hermes_infoflow.bot import _send_path_cv, no_reply_sentinel_hits as _sentinel_hits
+from hermes_infoflow.bot import _send_path_cv
+from hermes_infoflow.bot import no_reply_sentinel_hits as _sentinel_hits
 
 
 def test_plain_no_reply_suppresses() -> None:

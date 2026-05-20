@@ -536,10 +536,7 @@ def build_group_inbound(
 
     raw_group_id = msg_data.get("groupid") or (header or {}).get("groupid")
     group_id_str: str | None
-    if raw_group_id is None or raw_group_id == "":
-        group_id_str = None
-    else:
-        group_id_str = _stringify(raw_group_id)
+    group_id_str = None if raw_group_id is None or raw_group_id == "" else _stringify(raw_group_id)
 
     raw_time = msg_data.get("time") or (header or {}).get("servertime")
     try:
@@ -564,9 +561,7 @@ def build_group_inbound(
         robot_id=account.robot_id,
     )
     event_type = _stringify(msg_data.get("eventtype"))
-    if msg_data.get("wasMentioned") is True:
-        was_mentioned = True
-    elif event_type == "MESSAGE_RECEIVE":
+    if msg_data.get("wasMentioned") is True or event_type == "MESSAGE_RECEIVE":
         was_mentioned = True
     else:
         was_mentioned = was_mentioned_flag

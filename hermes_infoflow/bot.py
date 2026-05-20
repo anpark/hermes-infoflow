@@ -18,10 +18,18 @@ import logging
 import os
 import re
 import time
-from typing import Any, TYPE_CHECKING
 from contextlib import contextmanager
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
+from .itypes import (
+    IncomingMessage,
+    ProcessResult,
+    RecallResult,
+    ReplyInfo,
+    SendOptions,
+    SentResult,
+)
 from .message_store import MessageStore
 from .policy import (
     Action,
@@ -37,20 +45,12 @@ from .recall import (
     no_recall_error,
     reply_to_bot_from_current_inbound,
 )
-from .sent_store import SentMessageStore, SentMessage
-from .itypes import (
-    IncomingMessage,
-    ProcessResult,
-    RecallResult,
-    ReplyInfo,
-    SendOptions,
-    SentResult,
-)
+from .sent_store import SentMessageStore
 from .utils import gw_log
 
 if TYPE_CHECKING:  # pragma: no cover — avoid circular import at runtime
-    from .serverapi import ServerAPI
     from .adapter import InfoflowAdapter
+    from .serverapi import ServerAPI
 
 logger = logging.getLogger(__name__)
 

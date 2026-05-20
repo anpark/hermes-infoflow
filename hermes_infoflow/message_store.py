@@ -20,9 +20,8 @@ busy_timeout=5000 ms、synchronous=NORMAL。
 
 from __future__ import annotations
 
-import json
+import contextlib
 import logging
-import os
 import sqlite3
 import threading
 import time
@@ -330,10 +329,8 @@ class MessageStore:
             f"PRAGMA busy_timeout={_DB_BUSY_TIMEOUT_MS}",
             "PRAGMA synchronous=NORMAL",
         ):
-            try:
+            with contextlib.suppress(sqlite3.Error):
                 conn.execute(pragma)
-            except sqlite3.Error:
-                pass
 
         # 确保两张表都存在（幂等）。
         if not self._dm_db_initialized or not self._group_db_initialized:
@@ -433,10 +430,8 @@ class MessageStore:
             except sqlite3.Error as exc:
                 logger.warning("[infoflow:message_store] dm upsert failed: %s", exc)
             finally:
-                try:
+                with contextlib.suppress(sqlite3.Error):
                     conn.close()
-                except sqlite3.Error:
-                    pass
 
     def _query_one_dm(self, sql: str, params: tuple | list = ()) -> tuple | None:
         with self._db_lock:
@@ -449,10 +444,8 @@ class MessageStore:
                 logger.warning("[infoflow:message_store] dm query failed: %s", exc)
                 return None
             finally:
-                try:
+                with contextlib.suppress(sqlite3.Error):
                     conn.close()
-                except sqlite3.Error:
-                    pass
 
     def _execute_dm(self, sql: str, params: tuple | list = ()) -> None:
         with self._db_lock:
@@ -464,10 +457,8 @@ class MessageStore:
             except sqlite3.Error as exc:
                 logger.warning("[infoflow:message_store] dm execute failed: %s", exc)
             finally:
-                try:
+                with contextlib.suppress(sqlite3.Error):
                     conn.close()
-                except sqlite3.Error:
-                    pass
 
     def _list_dm(
         self,
@@ -500,10 +491,8 @@ class MessageStore:
                 logger.warning("[infoflow:message_store] dm list failed: %s", exc)
                 return []
             finally:
-                try:
+                with contextlib.suppress(sqlite3.Error):
                     conn.close()
-                except sqlite3.Error:
-                    pass
 
     @staticmethod
     def _row_to_dm(row: tuple) -> DMMessageRecord:
@@ -569,10 +558,8 @@ class MessageStore:
             except sqlite3.Error as exc:
                 logger.warning("[infoflow:message_store] group upsert failed: %s", exc)
             finally:
-                try:
+                with contextlib.suppress(sqlite3.Error):
                     conn.close()
-                except sqlite3.Error:
-                    pass
 
     def _query_one_group(self, sql: str, params: tuple | list = ()) -> tuple | None:
         with self._db_lock:
@@ -585,10 +572,8 @@ class MessageStore:
                 logger.warning("[infoflow:message_store] group query failed: %s", exc)
                 return None
             finally:
-                try:
+                with contextlib.suppress(sqlite3.Error):
                     conn.close()
-                except sqlite3.Error:
-                    pass
 
     def _execute_group(self, sql: str, params: tuple | list = ()) -> None:
         with self._db_lock:
@@ -600,10 +585,8 @@ class MessageStore:
             except sqlite3.Error as exc:
                 logger.warning("[infoflow:message_store] group execute failed: %s", exc)
             finally:
-                try:
+                with contextlib.suppress(sqlite3.Error):
                     conn.close()
-                except sqlite3.Error:
-                    pass
 
     def _list_group(
         self,
@@ -639,10 +622,8 @@ class MessageStore:
                 logger.warning("[infoflow:message_store] group list failed: %s", exc)
                 return []
             finally:
-                try:
+                with contextlib.suppress(sqlite3.Error):
                     conn.close()
-                except sqlite3.Error:
-                    pass
 
     @staticmethod
     def _row_to_group(row: tuple) -> GroupMessageRecord:

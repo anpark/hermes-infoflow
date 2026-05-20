@@ -33,6 +33,7 @@ recall-history persistence, not for the inbound-replay dedup window.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import sqlite3
 import threading
@@ -285,10 +286,8 @@ class SentMessageStore:
             f"PRAGMA busy_timeout={self._DB_BUSY_TIMEOUT_MS}",
             "PRAGMA synchronous=NORMAL",
         ):
-            try:
+            with contextlib.suppress(sqlite3.Error):
                 conn.execute(pragma)
-            except sqlite3.Error:
-                pass
 
         if not self._db_initialized:
             try:
@@ -353,10 +352,8 @@ class SentMessageStore:
             except sqlite3.Error as exc:
                 logger.warning("[infoflow:sent_store] persist failed: %s", exc)
             finally:
-                try:
+                with contextlib.suppress(sqlite3.Error):
                     conn.close()
-                except sqlite3.Error:
-                    pass
 
     def _db_recent(self, chat_id: str, count: int) -> list[SentMessage]:
         if self.db_path is None:
@@ -386,10 +383,8 @@ class SentMessageStore:
                 logger.warning("[infoflow:sent_store] db_recent failed: %s", exc)
                 return []
             finally:
-                try:
+                with contextlib.suppress(sqlite3.Error):
                     conn.close()
-                except sqlite3.Error:
-                    pass
 
     def _db_find(self, chat_id: str, messageid: str) -> SentMessage | None:
         if self.db_path is None:
@@ -419,10 +414,8 @@ class SentMessageStore:
                 logger.warning("[infoflow:sent_store] db_find failed: %s", exc)
                 return None
             finally:
-                try:
+                with contextlib.suppress(sqlite3.Error):
                     conn.close()
-                except sqlite3.Error:
-                    pass
 
     def _db_find_any(self, messageid: str) -> SentMessage | None:
         if self.db_path is None:
@@ -451,10 +444,8 @@ class SentMessageStore:
                 logger.warning("[infoflow:sent_store] db_find_any failed: %s", exc)
                 return None
             finally:
-                try:
+                with contextlib.suppress(sqlite3.Error):
                     conn.close()
-                except sqlite3.Error:
-                    pass
 
     def _db_delete(self, chat_id: str, messageid: str) -> None:
         if self.db_path is None:
@@ -472,10 +463,8 @@ class SentMessageStore:
             except sqlite3.Error as exc:
                 logger.warning("[infoflow:sent_store] db_delete failed: %s", exc)
             finally:
-                try:
+                with contextlib.suppress(sqlite3.Error):
                     conn.close()
-                except sqlite3.Error:
-                    pass
 
 
 __all__ = [

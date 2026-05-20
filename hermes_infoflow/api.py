@@ -29,9 +29,9 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import time
 import uuid
-import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -208,22 +208,21 @@ async def get_app_access_token(
     url = _join(account.api_host, INFOFLOW_AUTH_PATH)
     payload = {"app_key": account.app_key, "app_secret": md5_secret}
 
-    async with _ensure_session(session) as sess:
-        async with sess.post(
-            url,
-            json=payload,
-            timeout=aiohttp.ClientTimeout(total=timeout),
-            headers={"Content-Type": "application/json"},
-        ) as resp:
-            text = await resp.text()
-            if resp.status >= 400:
-                raise InfoflowAPIError(
-                    f"token endpoint HTTP {resp.status}: {text[:200]}"
-                )
-            try:
-                data = json.loads(text)
-            except json.JSONDecodeError as exc:
-                raise InfoflowAPIError(f"token response is not JSON: {exc}") from exc
+    async with _ensure_session(session) as sess, sess.post(
+        url,
+        json=payload,
+        timeout=aiohttp.ClientTimeout(total=timeout),
+        headers={"Content-Type": "application/json"},
+    ) as resp:
+        text = await resp.text()
+        if resp.status >= 400:
+            raise InfoflowAPIError(
+                f"token endpoint HTTP {resp.status}: {text[:200]}"
+            )
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise InfoflowAPIError(f"token response is not JSON: {exc}") from exc
 
     errcode = data.get("errcode")
     if errcode not in (None, 0):
@@ -325,9 +324,8 @@ def _build_private_payload(to_user: str, contents: list[ContentItem]) -> dict[st
     text_parts: list[str] = []
     for item in contents:
         t = item.type.lower()
-        if t in ("text", "md", "markdown"):
-            if item.content:
-                text_parts.append(item.content)
+        if t in ("text", "md", "markdown") and item.content:
+            text_parts.append(item.content)
     if not text_parts:
         return None
     merged = "\n".join(text_parts)
@@ -390,14 +388,13 @@ async def send_private_message(
     gw_log().info("[infoflow:send_payload] %s", _log_payload)
     headers = _auth_headers(token)
 
-    async with _ensure_session(session) as sess:
-        async with sess.post(
-            url,
-            data=body_str.encode("utf-8"),
-            headers=headers,
-            timeout=aiohttp.ClientTimeout(total=timeout),
-        ) as resp:
-            text = await resp.text()
+    async with _ensure_session(session) as sess, sess.post(
+        url,
+        data=body_str.encode("utf-8"),
+        headers=headers,
+        timeout=aiohttp.ClientTimeout(total=timeout),
+    ) as resp:
+        text = await resp.text()
     return _parse_send_response(text, kind="private")
 
 
@@ -577,14 +574,13 @@ async def send_group_message(
         body_str = json.dumps(payload, ensure_ascii=False)
         _log_payload = _truncate_image_payload(body_str)
         gw_log().info("[infoflow:send_payload] %s", _log_payload)
-        async with _ensure_session(session) as sess:
-            async with sess.post(
-                url,
-                data=body_str.encode("utf-8"),
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=timeout),
-            ) as resp:
-                text = await resp.text()
+        async with _ensure_session(session) as sess, sess.post(
+            url,
+            data=body_str.encode("utf-8"),
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=timeout),
+        ) as resp:
+            text = await resp.text()
         return _parse_send_response(text, kind="group")
 
     last_messageid: str | None = None
@@ -656,14 +652,13 @@ async def get_group_members(
     headers = _auth_headers(token, content_type="application/json")
     body = json.dumps({"groupId": int(group_id), "recallType": 0})
 
-    async with _ensure_session(session) as sess:
-        async with sess.post(
-            url,
-            data=body.encode("utf-8"),
-            headers=headers,
-            timeout=aiohttp.ClientTimeout(total=timeout),
-        ) as resp:
-            text = await resp.text()
+    async with _ensure_session(session) as sess, sess.post(
+        url,
+        data=body.encode("utf-8"),
+        headers=headers,
+        timeout=aiohttp.ClientTimeout(total=timeout),
+    ) as resp:
+        text = await resp.text()
 
     try:
         data = json.loads(text)
@@ -746,14 +741,13 @@ async def recall_group_message(
     gw_log().info("[infoflow:recall_payload] group mid=%s seq=%s body=%s", mid, seq, body)
     headers = _auth_headers(token)
 
-    async with _ensure_session(session) as sess:
-        async with sess.post(
-            url,
-            data=body.encode("utf-8"),
-            headers=headers,
-            timeout=aiohttp.ClientTimeout(total=timeout),
-        ) as resp:
-            text = await resp.text()
+    async with _ensure_session(session) as sess, sess.post(
+        url,
+        data=body.encode("utf-8"),
+        headers=headers,
+        timeout=aiohttp.ClientTimeout(total=timeout),
+    ) as resp:
+        text = await resp.text()
     return _parse_recall_response(text, kind="group")
 
 
@@ -790,14 +784,13 @@ async def recall_private_message(
     gw_log().info("[infoflow:recall_payload] private msgkey=%s body=%s", msgkey, body)
     headers = _auth_headers(token)
 
-    async with _ensure_session(session) as sess:
-        async with sess.post(
-            url,
-            data=body.encode("utf-8"),
-            headers=headers,
-            timeout=aiohttp.ClientTimeout(total=timeout),
-        ) as resp:
-            text = await resp.text()
+    async with _ensure_session(session) as sess, sess.post(
+        url,
+        data=body.encode("utf-8"),
+        headers=headers,
+        timeout=aiohttp.ClientTimeout(total=timeout),
+    ) as resp:
+        text = await resp.text()
     return _parse_recall_response(text, kind="private")
 
 

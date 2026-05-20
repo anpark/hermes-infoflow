@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hermes-infoflow"
-version = "0.1.0"
+version = "0.2.0"
 description = "Baidu Infoflow (如流) channel plugin for Hermes Agent"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -94,6 +94,10 @@ ignore = [
     "E501",   # line length handled by formatter
     "B008",   # function-call-in-default-arg (we use sentinels intentionally)
 ]
+
+[tool.ruff.lint.per-file-ignores]
+# Late imports after optional hermes-agent / gateway shims (see adapter module docstring).
+"hermes_infoflow/adapter.py" = ["E402"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

@@ -8,6 +8,8 @@ versioning (with prerelease suffixes such as `0.1.0b1` for betas).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-05-20
+
 ### Added — OpenClaw parity pass
 
 - **Own-message guard.** Inbound events whose root ``fromid`` equals the
@@ -81,7 +83,7 @@ versioning (with prerelease suffixes such as `0.1.0b1` for betas).
   hermes-infoflow already supported these in practice (the codebase runs
   cleanly on 3.14 locally); this change locks in regression coverage.
 
-## [0.1.0] - TBD
+## [0.1.0] - 2026-05-01
 
 ### Added
 
@@ -103,4 +105,4 @@ versioning (with prerelease suffixes such as `0.1.0b1` for betas).
 
 - Single-account only (no multi-account `accounts.*` subconfig yet).
 - Webhook connection mode only — no WebSocket gateway.
-- `count`-based recall is best-effort per gateway process (cross-process not supported).
+- `count`-based recall across cron sub-processes requires SQLite sent-message store (enabled by default since 0.2.0); in-memory-only fallback is gateway-process-local.

@@ -7,6 +7,7 @@ can delegate config plumbing to a dedicated module.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -179,10 +180,8 @@ def _env_enablement() -> dict | None:
         "encoding_aes_key": encoding_aes_key,
     }
     if os.getenv("INFOFLOW_APP_AGENT_ID", "").strip():
-        try:
+        with contextlib.suppress(ValueError):
             seed["app_agent_id"] = int(os.environ["INFOFLOW_APP_AGENT_ID"].strip())
-        except ValueError:
-            pass
     for env_key, settings_key in (
         ("INFOFLOW_ROBOT_NAME", "robot_name"),
         ("INFOFLOW_ROBOT_ID", "robot_id"),

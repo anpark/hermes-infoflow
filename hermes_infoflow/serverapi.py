@@ -17,8 +17,8 @@ Responsibilities
 
 from __future__ import annotations
 
-import base64
 import asyncio
+import base64
 import contextlib
 import logging
 import time
@@ -38,7 +38,7 @@ from .itypes import (
 )
 
 if TYPE_CHECKING:
-    from .parser import AccountConfig, InboundMessage
+    from .parser import InboundMessage
 
 logger = logging.getLogger(__name__)
 

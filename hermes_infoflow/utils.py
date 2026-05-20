@@ -8,14 +8,12 @@ tested independently and to keep the adapter lean.
 
 from __future__ import annotations
 
-import asyncio
 import ipaddress as _ipaddress
 import logging
 import mimetypes
 import os
 import tempfile
 from pathlib import Path
-from typing import Any
 from urllib.parse import urlparse
 
 import aiohttp
@@ -150,7 +148,7 @@ async def _download_inbound_image(
         except aiohttp.ClientError as exc:
             logger.debug("[infoflow:inbound image] GET failed: %s", exc)
             return None
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.debug("[infoflow:inbound image] GET timed out")
             return None
 

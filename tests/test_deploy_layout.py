@@ -77,8 +77,9 @@ def deployed(tmp_path: Path) -> Path:
     )
     if result.returncode != 0:
         pytest.fail(
-            "scripts/deploy.sh failed (rc=%d)\n---- stdout ----\n%s\n---- stderr ----\n%s"
-            % (result.returncode, result.stdout, result.stderr)
+            f"scripts/deploy.sh failed (rc={result.returncode})\n"
+            f"---- stdout ----\n{result.stdout}\n"
+            f"---- stderr ----\n{result.stderr}"
         )
     return home / ".hermes" / "plugins" / "infoflow"
 

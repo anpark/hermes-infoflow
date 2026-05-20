@@ -5,10 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from .adapter import InfoflowAdapter
+    pass
 
 logger = logging.getLogger("infoflow.tools")
 
@@ -39,6 +39,7 @@ def _get_live_adapter() -> Any | None:
         return None
     try:
         from gateway.config import Platform  # type: ignore[import-not-found]
+
         from .adapter import InfoflowAdapter as _IA
         adapter = runner.adapters.get(Platform("infoflow"))
         if not isinstance(adapter, _IA):

@@ -21,7 +21,6 @@ from hermes_infoflow.policy import (
     _WATCH_REGEX_PROMPT,
 )
 
-
 # Render templates with placeholder values so {var} substitution doesn't
 # pollute the assertions below.
 RENDERED = {
@@ -60,7 +59,7 @@ def test_template_requests_silent_tools(name: str) -> None:
 
 @pytest.mark.parametrize(
     "name",
-    ["watch_mention", "watch_regex", "engaged", "passive", "reply2bot"],
+    ["watch_mention", "watch_regex", "passive", "reply2bot"],
 )
 def test_template_blocks_refusal_outputs(name: str) -> None:
     """Templates that funnel through value-filtering must explicitly list

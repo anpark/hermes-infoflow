@@ -8,19 +8,20 @@ Baidu Infoflow（如流）Channel 插件 for [Hermes Agent](https://github.com/n
 
 ---
 
-## 功能（balanced scope · v1）
+## 功能（balanced scope · v0.2）
 
 - ✅ Webhook 接入 + AES-ECB 解密 + echostr 签名校验
 - ✅ 群聊 / 私聊 文本 & Markdown 双向（含分块）
 - ✅ 图片入站（含 `Bearer-` 鉴权 fallback 下载）+ 出站（含 path-traversal 校验）
-- ✅ @-mention 检测：`require_mention` + `mention-only` / `mention-and-watch` + `watch_mentions`
-- ✅ 消息撤回（recall）：私聊 + 群聊；agent tool `infoflow_recall_message`
+- ✅ @-mention 检测：`require_mention` + 五种 `reply_mode`（`ignore` / `record` / `mention-only` / `mention-and-watch` / `proactive`）+ `watch_mentions` + `watch_regex`
+- ✅ 群聊 follow-up 窗口（`INFOFLOW_FOLLOW_UP`）与 per-group 配置覆盖（`INFOFLOW_GROUPS`）
+- ✅ 自有消息回环防护（robotId 自动发现后丢弃 bot 自身转发）
+- ✅ 消息撤回（recall）：私聊 + 群聊；agent tool `infoflow_recall_message`；SQLite 持久化 sent-message store（cron 子进程可 `count` 撤回）
 - ✅ 长整型 message_id 精度保护（19 位数字不丢精度）
 - ✅ cron `deliver=infoflow` 投递（home channel）+ 独立进程发送（`standalone_sender_fn`）
 - ⚠️ 已知限制（计划在后续版本支持）：
   - 单账号（不支持 OpenClaw 的 `accounts.*` 子配置）
   - WebSocket 接入模式未实现（仅 webhook）
-  - `replyMode=record/proactive` 会自动降级为 `mention-and-watch` 并打 warning
 
 ---
 
@@ -46,7 +47,7 @@ hermes 内置命令；`git clone --depth 1` 到 `~/.hermes/plugins/infoflow/`。
 
 <!-- sync:hermes-infoflow-version:latest -->
 ```bash
-pipx run hermes-infoflow-tools update --version 0.1.0
+pipx run hermes-infoflow-tools update --version 0.2.0
 ```
 <!-- /sync:hermes-infoflow-version:latest -->
 
@@ -54,7 +55,7 @@ Beta 版（PEP 440 prerelease；不会被默认 `pip install` 拉到）：
 
 <!-- sync:hermes-infoflow-version:beta -->
 ```bash
-pipx run hermes-infoflow-tools update --version 0.1.0b1
+pipx run hermes-infoflow-tools update --version 0.2.0b1
 ```
 <!-- /sync:hermes-infoflow-version:beta -->
 
@@ -117,12 +118,17 @@ bash scripts/deploy.sh --dry-run   # 仅打印操作
 | `INFOFLOW_WEBHOOK_PATH` | `/webhook/infoflow` | Webhook 路径 |
 | `INFOFLOW_HOME_CHANNEL` | 无 | cron `deliver=infoflow` 缺省目标，如 `bob` 或 `group:12345` |
 | `INFOFLOW_HOME_CHANNEL_NAME` | 同上 | Home channel 显示名 |
-| `INFOFLOW_REPLY_MODE` | `mention-and-watch` | `ignore` / `mention-only` / `mention-and-watch`（`record`/`proactive` 自动降级） |
+| `INFOFLOW_REPLY_MODE` | `mention-and-watch` | `ignore` / `record` / `mention-only` / `mention-and-watch` / `proactive` |
 | `INFOFLOW_REQUIRE_MENTION` | `true` | 群消息是否仅在 @ 时响应 |
 | `INFOFLOW_WATCH_MENTIONS` | 无 | 逗号分隔；命中后即使没 @ 机器人也会触发 |
+| `INFOFLOW_WATCH_REGEX` | 无 | 正则匹配触发（多行或 `|||` 分隔） |
+| `INFOFLOW_FOLLOW_UP` | `true` | 机器人回复后群聊 follow-up 窗口是否开启 |
+| `INFOFLOW_FOLLOW_UP_WINDOW` | `300` | follow-up 窗口秒数 |
+| `INFOFLOW_GROUPS` | 无 | 按群 ID 的 JSON 配置覆盖 |
+| `INFOFLOW_ADMIN_USER` | 无 | 管理员 uuapName（敏感工具权限） |
 | `INFOFLOW_ALLOWED_USERS` | 无 | 逗号分隔的 uuapName allowlist |
 | `INFOFLOW_ALLOW_ALL_USERS` | `false` | 允许所有人（仅开发） |
-| `INFOFLOW_CONNECTION_MODE` | `webhook` | 保留位；目前仅支持 `webhook` |
+| `HERMES_STATE_DIR` | `~/.hermes/state` | sent-messages.db 等状态目录 |
 
 设置完后：
 
@@ -195,7 +201,7 @@ ingress:
 { "target": "alice", "count": 1 }
 ```
 
-⚠️ **跨进程限制**：按 `count` 撤回只在 *gateway 进程内* 有效（撤回信息存在内存 ring buffer 里）。如果消息是 cron 子进程 / `send_message` 工具发出的，只能用 `message_id` 显式撤回。
+⚠️ **跨进程撤回**：自 v0.2.0 起，出站消息默认写入 `~/.hermes/state/infoflow/sent-messages.db`（可用 `HERMES_STATE_DIR` 覆盖），cron 子进程与 gateway 共享 `count` 撤回。若 SQLite 不可用则回退为 gateway 进程内内存 ring buffer。
 
 ⚠️ 切勿把 *用户发来的入站 message_id* 当成撤回目标 —— 那是用户的消息，不是机器人的，API 会返回失败。机器人发出的消息 id 在 LLM 的工具结果里能拿到；或者用 `count=1` 撤回最近一条。
 
@@ -265,9 +271,9 @@ pip install hermes-infoflow==<X.Y.ZbN>           # 显式锁定
 
 <!-- sync:hermes-infoflow-version -->
 ```bash
-hatch version 0.1.0
-git tag 0.1.0
-git push origin 0.1.0
+hatch version 0.2.0
+git tag 0.2.0
+git push origin 0.2.0
 ```
 <!-- /sync:hermes-infoflow-version -->
 

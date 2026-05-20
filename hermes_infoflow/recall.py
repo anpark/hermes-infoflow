@@ -15,7 +15,7 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # pragma: no cover — avoid circular import at runtime
     from .sent_store import SentMessage, SentMessageStore
@@ -123,7 +123,7 @@ def correct_inbound_confusion(
     inbound_message_id: str,
     store_key: str,
     account_id: str,
-    sent_store: "SentMessageStore",
+    sent_store: SentMessageStore,
 ) -> dict[str, Any] | None:
     """Return a correction directive, or None if context isn't actionable.
 
@@ -154,8 +154,8 @@ def reply_to_bot_from_current_inbound(
     current_inbound_message_id: str,
     store_key: str,
     account_id: str,
-    sent_store: "SentMessageStore",
-) -> "SentMessage | None":
+    sent_store: SentMessageStore,
+) -> SentMessage | None:
     """Resolve a stored bot-sent message from the current inbound's quote-reply.
 
     Mirrors openclaw-infoflow ``resolveInboundReplyToMessageId`` + store lookup.
@@ -173,7 +173,7 @@ def reply_to_bot_from_current_inbound(
     return sent_store.find(store_key, bid)
 
 
-def format_recall_candidates(sent_store: "SentMessageStore", store_key: str, limit: int = 5) -> str:
+def format_recall_candidates(sent_store: SentMessageStore, store_key: str, limit: int = 5) -> str:
     """Format the last ``limit`` bot-sent messages for an error hint to the LLM."""
     records = sent_store.recent(store_key, limit)
     if not records:
@@ -184,7 +184,7 @@ def format_recall_candidates(sent_store: "SentMessageStore", store_key: str, lim
     )
 
 
-def no_recall_error(sent_store: "SentMessageStore", store_key: str) -> str:
+def no_recall_error(sent_store: SentMessageStore, store_key: str) -> str:
     """Human-readable error when no bot messages are available for recall."""
     candidates = format_recall_candidates(sent_store, store_key)
     if candidates:

@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 from hermes_infoflow.sent_store import (
-    DEFAULT_MAX_DEDUP_ENTRIES,
     SentMessageStore,
 )
 

@@ -19,9 +19,8 @@ gateway_base = pytest.importorskip("gateway.platforms.base")  # noqa: F401  (pre
 
 from hermes_infoflow import api as _api  # noqa: E402
 from hermes_infoflow import crypto as _crypto  # noqa: E402
-from hermes_infoflow.sent_store import SentMessageStore  # noqa: E402
 from hermes_infoflow.adapter import InfoflowAdapter  # noqa: E402
-from hermes_infoflow.parser import AccountConfig  # noqa: E402
+from hermes_infoflow.sent_store import SentMessageStore  # noqa: E402
 from tests._aes_helpers import aes_ecb_encrypt_b64url, aes_key_b64url  # noqa: E402
 
 
@@ -261,7 +260,7 @@ def test_send_image_private_sends_native_image(configured_env, monkeypatch, tmp_
     adapter = InfoflowAdapter(_make_config())
 
     # Write a small fake image into an allowed media root.
-    media_root = adapter._allowed_media_roots_for_test() if hasattr(adapter, "_allowed_media_roots_for_test") else None
+    adapter._allowed_media_roots_for_test() if hasattr(adapter, "_allowed_media_roots_for_test") else None
     # Simplest: monkeypatch _load_image_bytes to return fixed bytes.
     async def fake_load(self, url):
         return b"\x89PNG\r\n\x1a\n" + b"x" * 100

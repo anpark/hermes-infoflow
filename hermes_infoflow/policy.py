@@ -38,12 +38,10 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
-from .parser import BodyItem
 from .itypes import IncomingMessage
-
 
 # All five OpenClaw modes are now first-class. Legacy aliases route to the
 # closest match, with a warning to encourage a config update.
@@ -60,7 +58,7 @@ DEFAULT_FOLLOW_UP = True
 DEFAULT_FOLLOW_UP_WINDOW_SECONDS = 120
 
 
-class Action(str, Enum):
+class Action(StrEnum):
     """What the adapter should do with an inbound message."""
 
     DISPATCH = "dispatch"      # send to the agent (normal path)
@@ -193,9 +191,7 @@ class GroupPolicy:
             return True
         # Check 2: bot replied to this sender within engaged_window
         reply_time = self.last_reply_to_sender.get(group_id, {}).get(sender_id)
-        if reply_time is not None and reply_time >= cutoff:
-            return True
-        return False
+        return bool(reply_time is not None and reply_time >= cutoff)
 
 
 @dataclass(frozen=True)
@@ -322,7 +318,7 @@ def _within_follow_up_window(
 
 
 def _has_other_mentions(
-    inbound: "IncomingMessage",
+    inbound: IncomingMessage,
     watch_mentions: tuple[str, ...],
 ) -> bool:
     """True if the message @'s someone other than bot, watch list, or regex.
@@ -339,9 +335,7 @@ def _has_other_mentions(
         if _normalize_name(uid) not in watch_set:
             return True
     # Any mentioned agent (other bots) always counts as "other person"
-    if inbound.mention_agent_ids:
-        return True
-    return False
+    return bool(inbound.mention_agent_ids)
 
 
 def _resolve_for_group(policy: GroupPolicy, group_id: str | None) -> dict[str, Any]:
@@ -570,7 +564,7 @@ def _join_prompt(*parts: str) -> str:
 
 
 def evaluate_inbound(
-    inbound: "IncomingMessage",
+    inbound: IncomingMessage,
     policy: GroupPolicy,
     *,
     now: float | None = None,
