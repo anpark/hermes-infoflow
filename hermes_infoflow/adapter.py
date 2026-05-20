@@ -62,14 +62,15 @@ def _at_iter(text: str) -> list[tuple[str, int, int]]:
 def _extract_mentions(
     text: str,
     members: list[Any] | None,
-) -> tuple[list[str], list[int], bool, list[str]]:
+) -> tuple[list[str], list[int], bool, list[str], str]:
     """Extract @ mentions from text and resolve against group members.
 
-    Returns (user_ids, agent_ids, at_all, unmatched).
+    Returns (user_ids, agent_ids, at_all, unmatched, modified_text).
     - user_ids: list of uuapName strings (humans)
     - agent_ids: list of agentId ints (bots) — for Infoflow API atagentids
     - at_all: True if @所有人 or @all found
     - unmatched: mentions that didn't match any member
+    - modified_text: text with bot-name mentions replaced by @agentId
     """
     user_ids: list[str] = []
     agent_ids: list[int] = []  # agentId (int), not imid
@@ -79,13 +80,21 @@ def _extract_mentions(
     # Pre-build lookup sets for O(1) member resolution
     _human_uids: set[str] | None = None
     _bot_aids: set[int] | None = None
+    _bot_name_map: dict[str, int] | None = None  # name_lower → agentId
     seen_users: set[str] = set()
     seen_agents: set[int] = set()
     if members:
         _human_uids = {mb.uid for mb in members if not mb.is_bot}
         _bot_aids = {mb.agent_id for mb in members if mb.is_bot}
+        _bot_name_map = {
+            mb.name.lower(): mb.agent_id
+            for mb in members
+            if mb.is_bot and mb.name
+        }
 
     mentions = _at_iter(text)
+    # Track replacements: (start, end, new_text) for bot-name → @agentId
+    replacements: list[tuple[int, int, str]] = []
     for m, _start, _end in mentions:
         ml = m[1:].lower()  # strip leading @
         if ml in ("所有人", "all"):
@@ -107,10 +116,21 @@ def _extract_mentions(
             if _human_uids is not None and name_part in _human_uids:
                 user_ids.append(name_part)
                 seen_users.add(name_part)
+            elif _bot_name_map is not None and ml in _bot_name_map:
+                # Matched a bot by display name → use agentId
+                aid = _bot_name_map[ml]
+                if aid not in seen_agents:
+                    agent_ids.append(aid)
+                    seen_agents.add(aid)
+                replacements.append((_start, _end, f"@{aid}"))
             else:
                 unmatched.append(name_part)
 
-    return user_ids, agent_ids, at_all, unmatched
+    # Apply replacements (reverse order to preserve positions)
+    for start, end, new_text in sorted(replacements, reverse=True):
+        text = text[:start] + new_text + text[end:]
+
+    return user_ids, agent_ids, at_all, unmatched, text
 
 # ── Hermes symbols (soft-import for testability) ──────────────────────
 
@@ -151,9 +171,9 @@ from .policy import (
     GroupConfigOverride,
     GroupPolicy,
     PolicyDecision,
+    _SENDER_FORMAT_DOC,
     normalize_reply_mode,
 )
-from .iflogging import get_logger as _get_api_logger
 from .message_store import MessageStore
 from .recall import get_inbound_body, get_inbound_sender_imid
 from .sent_store import SentMessageStore
@@ -163,6 +183,7 @@ from .utils import (
     _download_inbound_image,
     _is_safe_outbound_url,
     _resolve_safe_local_path,
+    gw_log,
 )
 from .settings import (
     DEFAULT_BODY_LIMIT_BYTES,
@@ -187,11 +208,6 @@ if TYPE_CHECKING:
     from aiohttp import web as _web_module
 
 logger = logging.getLogger(__name__)
-
-
-def gw_log() -> logging.Logger:
-    """Return the gateway.run logger so audit lines reach gateway.log."""
-    return logging.getLogger("gateway.run")
 
 
 # ---------------------------------------------------------------------------
@@ -492,16 +508,15 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         msg = self._serverapi.to_incoming(wh_result.raw_inbound)
 
         # --- Stage 1: [iflow:raw] — decoded plaintext payload ---
-        if msg.is_group:
-            try:
-                import json as _json
-                _raw = wh_result.raw_inbound.raw_msgdata if hasattr(wh_result.raw_inbound, "raw_msgdata") else {}
-                gw_log().info(
-                    "[iflow:raw] mid=%s payload=%s",
-                    msg.msgid, _json.dumps(_raw, ensure_ascii=False, default=str)[:2000],
-                )
-            except Exception:
-                pass
+        try:
+            import json as _json
+            _raw = wh_result.raw_inbound.raw_msgdata if hasattr(wh_result.raw_inbound, "raw_msgdata") else {}
+            gw_log().info(
+                "[iflow:raw] mid=%s payload=%s",
+                msg.msgid, _json.dumps(_raw, ensure_ascii=False, default=str)[:2000],
+            )
+        except Exception:
+            pass
 
         # --- Enrich sender info from group member cache (ALL group messages) ---
         # Bot: must have agent_id; Human: must have userId.
@@ -510,26 +525,25 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             await self._enrich_sender(msg)
 
         # --- Stage 2: [iflow:event] — enriched message event fields ---
-        if msg.is_group:
-            try:
-                gw_log().info(
-                    "[iflow:event] mid=%s sender_id=%s sender_name=%s sender_imid=%s "
-                    "sender_agent_id=%s is_bot=%s mentioned=%s "
-                    "mention_users=%s mention_agents=%s reply_to_bot=%s body=%s",
-                    msg.msgid, msg.sender_id, msg.sender_name, msg.sender_imid,
-                    getattr(msg, "sender_agent_id", ""), msg.sender_is_bot,
-                    msg.bot_was_mentioned,
-                    msg.mention_user_ids, msg.mention_agent_ids,
-                    msg.is_reply_to_bot, (msg.body_for_agent or "")[:200],
-                )
-                for _i, _b in enumerate(msg.body_items or []):
-                    if hasattr(_b, "type"):
-                        gw_log().info(
-                            "[iflow:event] body_item[%d] type=%s name=%s userid=%s robotid=%s",
-                            _i, _b.type, _b.name, _b.userid, _b.robotid,
-                        )
-            except Exception:
-                pass
+        try:
+            gw_log().info(
+                "[iflow:event] mid=%s sender_id=%s sender_name=%s sender_imid=%s "
+                "sender_agent_id=%s is_bot=%s mentioned=%s "
+                "mention_users=%s mention_agents=%s reply_to_bot=%s body=%s",
+                msg.msgid, msg.sender_id, msg.sender_name, msg.sender_imid,
+                getattr(msg, "sender_agent_id", ""), msg.sender_is_bot,
+                msg.bot_was_mentioned,
+                msg.mention_user_ids, msg.mention_agent_ids,
+                msg.is_reply_to_bot, (msg.body_for_agent or "")[:200],
+            )
+            for _i, _b in enumerate(msg.body_items or []):
+                if hasattr(_b, "type"):
+                    gw_log().info(
+                        "[iflow:event] body_item[%d] type=%s name=%s userid=%s robotid=%s",
+                        _i, _b.type, _b.name, _b.userid, _b.robotid,
+                    )
+        except Exception:
+            pass
 
         # Delegate to bot for policy/dedup/context
         result = await self._bot.process_inbound(msg)
@@ -661,7 +675,30 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         )
 
         message_type = MessageType.PHOTO if local_media else MessageType.TEXT
-        text_for_agent = msg.body_for_agent or msg.text or "<media:image>"
+        text_for_agent = msg.body_for_agent or msg.text or ""
+        # Pure-AT message (no TEXT/MD body): build a description for the LLM
+        # so it knows who was @mentioned and can decide whether to respond.
+        if not text_for_agent.strip() and not local_media:
+            _mention_parts: list[str] = []
+            if msg.body_items:
+                _atall = any(
+                    (b.type or "").upper() == "AT" and b.atall
+                    for b in msg.body_items
+                )
+                if _atall:
+                    _mention_parts.append("@所有人")
+                for b in msg.body_items:
+                    bt = (b.type or "").upper()
+                    if bt == "AT" and not b.atall:
+                        name = b.name or b.userid or b.robotid or "?"
+                        if b.robotid:
+                            _mention_parts.append(f"@{name}")
+                        elif b.userid:
+                            _mention_parts.append(f"@{name}")
+            if _mention_parts:
+                text_for_agent = f"（仅@了以下对象，无正文：{' '.join(_mention_parts)}）"
+            else:
+                text_for_agent = "<空消息>"
 
         raw_message: dict[str, Any] = {
             "raw_text": msg.text,
@@ -684,6 +721,20 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             raw_message["policy_reason"] = decision.reason
             raw_message["trigger_reason"] = decision.trigger_reason
 
+            # Group system prompt + sender format doc: set once for all group messages,
+            # independent of dispatch strategy (follow-up, proactive, watch, etc.)
+            if msg.group_id:
+                raw_message["group_system_prompt"] = (
+                    decision.group_system_prompt + "\n\n" + _SENDER_FORMAT_DOC
+                )
+
+            def _build_sender_tag(msg) -> str:
+                """Build [Sender: name | human] or [Sender: name | bot: agentId]."""
+                _name = msg.sender_name or msg.sender_id or "unknown"
+                if getattr(msg, "sender_agent_id", ""):
+                    return f"[Sender: {_name} | bot: {msg.sender_agent_id}]"
+                return f"[Sender: {_name} | human]"
+
             # Follow-up: enrich with sender context.
             # CRITICAL: inject follow-up instructions as a PREFIX of the user
             # message text (NOT into channel_prompt / system prompt).
@@ -695,16 +746,10 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 try:
                     from .policy import build_follow_up_prompt
                     _sender_engaged = False
-                    if hasattr(self._policy, "sender_mentioned_in_window"):
-                        _sender_engaged = self._policy.sender_mentioned_in_window(
+                    if hasattr(self._policy, "sender_engaged_recently"):
+                        _sender_engaged = self._policy.sender_engaged_recently(
                             msg.group_id, msg.sender_id or msg.sender_imid,
                         )
-                    # If message text contains bot name, treat as implicit engaged.
-                    _bot_name = self._settings.get("robot_name") or ""
-                    if (not _sender_engaged and _bot_name
-                            and len(_bot_name) >= 2
-                            and _bot_name.lower() in (msg.text or "").lower()):
-                        _sender_engaged = True
                     prompt = build_follow_up_prompt(
                         fromid=msg.sender_imid,
                         sender_name=msg.sender_name or msg.sender_id,
@@ -726,15 +771,13 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     # Inject follow-up context as prefix of the user message text.
                     # This goes into event.text → gateway sends it as user message,
                     # giving it much higher priority than system prompt content.
-                    _followup_prefix = f"[Follow-up context]\n{prompt}\n---\n[User message]\n"
-                    text_for_agent = _followup_prefix + (text_for_agent or "")
+                    _sender_tag = _build_sender_tag(msg)
+                    text_for_agent = f"{prompt}\n\n{_sender_tag}\n[Message]\n{text_for_agent or ''}"
                 except Exception as exc:
                     gw_log().warning(
                         "[infoflow] failed to build follow-up context for %s: %s",
                         msg.group_id, exc,
                     )
-            elif decision.group_system_prompt:
-                raw_message["group_system_prompt"] = decision.group_system_prompt
 
             # Per-message judgement prompt (watch, proactive, etc.) → user message prefix.
             # Same rationale as follow-up: per-message instructions in the system prompt
@@ -742,12 +785,17 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             # user-message prefix guarantees the LLM evaluates the instruction.
             _per_msg = getattr(decision, "per_message_prompt", "")
             if _per_msg:
-                _dispatch_prefix = f"[Dispatch context]\n{_per_msg}\n---\n[User message]\n"
-                text_for_agent = _dispatch_prefix + (text_for_agent or "")
+                _sender_tag = _build_sender_tag(msg)
+                text_for_agent = f"{_per_msg}\n\n{_sender_tag}\n[Message]\n{text_for_agent or ''}"
                 gw_log().info(
                     "[iflow:dispatch] mid=%s per_message_prompt_len=%d",
                     msg.msgid or "-", len(_per_msg),
                 )
+
+        # AT-only message: append explicit guidance so LLM doesn't output NO_REPLY
+        if getattr(msg, "is_at_only", False):
+            _at_hint = "\n\n[注意] 用户 @ 了你但没有输入正文。如果上下文中没有与你相关的事项或待办任务，请主动询问用户有什么需要帮忙的。"
+            text_for_agent = (text_for_agent or "") + _at_hint
 
         # Log the complete user message sent to the LLM (gateway truncates to 80 chars)
         gw_log().info(
@@ -778,31 +826,16 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         )
         # Bridge group_system_prompt → channel_prompt for gateway injection
         group_prompt = raw_message.pop("group_system_prompt", None)
-        _sender_guide = (
-            "## Message Sender Identity\n"
-            "- Human messages are prefixed with [uid] — uid is the human's unique identifier (uuapName, e.g. chengbo05).\n"
-            "- Bot messages are prefixed with [botname 🤖:agentId] — agentId (e.g. 6471) is the bot's unique "
-            "identifier; the bot also has a name which may change but rarely does.\n"
-            "\n"
-            "## Mentioning Users in Messages\n"
-            "- To @ a human user, use @<their uuapName>, e.g. @chengbo05\n"
-            "- To @ a bot, use @<their agentId> (a number), e.g. @6471\n"
-            "- To @ everyone, use @all\n"
-            "- The @ must have a space before it (e.g. \"你好 @chengbo05\" not \"你好@chengbo05\").\n"
-            "Note: you do NOT need to use send_message metadata (at_all/mention_user_ids) — "
-            "just include @mentions in the message text and the platform handles the rest."
-        )
         _full_prompt = ""
         if _bot_identity:
             _full_prompt = _bot_identity
         if group_prompt:
             _full_prompt = (_full_prompt + "\n\n" + group_prompt).strip()
         if msg.is_group:
-            _full_prompt = _sender_guide + "\n\n" + _privacy_rule + "\n\n" + _full_prompt
+            _full_prompt = _privacy_rule + "\n\n" + _full_prompt
         if _full_prompt:
             event.channel_prompt = _full_prompt
-            gw_log().info("[iflow:debug] channel_prompt len=%d preview=%s", len(_full_prompt), repr(_full_prompt[:300]))
-            gw_log().info("[iflow:debug] channel_prompt FULL=\n%s", _full_prompt)
+            gw_log().info("[iflow:debug] channel_prompt len=%d FULL=\n%s", len(_full_prompt), _full_prompt)
         # Quote-reply: only surface bot message ids
         if msg.reply_info:
             event.reply_to_message_id = msg.reply_info.messageid or None
@@ -910,7 +943,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 members = await self._serverapi.get_group_members(
                     str(group_id), session=session,
                 )
-                uids, aids, at_all, unmatched = _extract_mentions(content, members)
+                uids, aids, at_all, unmatched, content = _extract_mentions(content, members)
 
                 # Unmatched → force-refresh group members and retry once
                 if unmatched:

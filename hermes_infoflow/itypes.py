@@ -85,6 +85,10 @@ class IncomingMessage:
     # Robot discovery (populated when the message reveals the bot's own robotId)
     discovered_robot_id: str | None = None
 
+    # True when the message body contains only AT items with no TEXT/MD content.
+    # The bot was pinged but no question or instruction was typed.
+    is_at_only: bool = False
+
     # Raw payload (retained for debugging / forward-compat)
     raw_data: dict[str, Any] = field(default_factory=dict)
     event_type: str = ""  # Original event type string from Infoflow

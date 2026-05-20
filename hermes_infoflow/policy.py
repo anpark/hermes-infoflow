@@ -57,7 +57,7 @@ VALID_REPLY_MODES = (
 
 DEFAULT_REPLY_MODE = "mention-and-watch"
 DEFAULT_FOLLOW_UP = True
-DEFAULT_FOLLOW_UP_WINDOW_SECONDS = 300
+DEFAULT_FOLLOW_UP_WINDOW_SECONDS = 120
 
 
 class Action(str, Enum):
@@ -133,27 +133,33 @@ class GroupPolicy:
     # the policy can read it; the dict is shared by reference.
     last_reply_at: dict[str, float] = field(default_factory=dict)
     # Map[group_id_str -> {sender_id: timestamp}].  Records who @mentioned the
-    # bot within each group's follow-up window.  Used by build_follow_up_prompt
-    # to select engaged vs passive template.
+    # bot within each group.  Used by sender_engaged_recently() to determine
+    # Template A (engaged) eligibility.
     sender_mention_at: dict[str, dict[str, float]] = field(default_factory=dict)
+    # Map[group_id_str -> {sender_id: timestamp}].  Records who the bot
+    # replied to (via quote/reply) within each group.  Used together with
+    # sender_mention_at by sender_engaged_recently().
+    last_reply_to_sender: dict[str, dict[str, float]] = field(default_factory=dict)
 
-    def record_bot_reply(self, group_id: str, *, now: float | None = None) -> None:
+    def record_bot_reply(
+        self,
+        group_id: str,
+        *,
+        reply_to_sender: str = "",
+        now: float | None = None,
+    ) -> None:
         """Mark that the bot has just replied to ``group_id``.
 
-        Used to gate the follow-up window. Callers should hand the same
-        dict over so multiple ``evaluate_inbound`` calls share state.
+        Used to gate the follow-up window.  ``reply_to_sender`` records
+        which sender the bot replied to (via quote/reply), so
+        ``sender_engaged_recently`` can detect recent 1-on-1 interaction.
         """
         if not group_id:
             return
         _now = now if now is not None else time.time()
         self.last_reply_at[group_id] = _now
-        # Update mention timestamps to the bot-reply time so that
-        # sender_mentioned_in_window(mention_time >= window_start) stays True
-        # for senders who @mentioned the bot earlier in this conversation.
-        # (The @mention always happens BEFORE the bot replies, so T_mention < T_reply;
-        #  without this update, `mention_time >= window_start` would always be False.)
-        for sid in list(self.sender_mention_at.get(group_id, {})):
-            self.sender_mention_at[group_id][sid] = _now
+        if reply_to_sender:
+            self.last_reply_to_sender.setdefault(group_id, {})[reply_to_sender] = _now
 
     def record_sender_mention(self, group_id: str, sender_id: str, *, now: float | None = None) -> None:
         """Record that ``sender_id`` @mentioned the bot in ``group_id``."""
@@ -162,18 +168,34 @@ class GroupPolicy:
         _now = now if now is not None else time.time()
         self.sender_mention_at.setdefault(group_id, {})[sender_id] = _now
 
-    def sender_mentioned_in_window(self, group_id: str, sender_id: str, *, now: float | None = None) -> bool:
-        """Check whether ``sender_id`` @mentioned the bot within the current follow-up window."""
+    def sender_engaged_recently(
+        self,
+        group_id: str,
+        sender_id: str,
+        *,
+        now: float | None = None,
+        engaged_window: float = 27,
+    ) -> bool:
+        """True if *sender_id* @mentioned the bot or the bot replied to them
+        within *engaged_window* seconds of *now*.
+
+        Unlike the old ``sender_mentioned_in_window`` (relative to
+        ``last_reply_at``), this checks absolute time distance from *now* —
+        no dependency on mention-time refresh logic.
+        """
         if not group_id or not sender_id:
             return False
-        window_start = self.last_reply_at.get(group_id)
-        if window_start is None:
-            return False
-        mentions = self.sender_mention_at.get(group_id, {})
-        mention_time = mentions.get(sender_id)
-        if mention_time is None:
-            return False
-        return mention_time >= window_start
+        _now = now if now is not None else time.time()
+        cutoff = _now - engaged_window
+        # Check 1: sender @mentioned bot within engaged_window
+        mention_time = self.sender_mention_at.get(group_id, {}).get(sender_id)
+        if mention_time is not None and mention_time >= cutoff:
+            return True
+        # Check 2: bot replied to this sender within engaged_window
+        reply_time = self.last_reply_to_sender.get(group_id, {}).get(sender_id)
+        if reply_time is not None and reply_time >= cutoff:
+            return True
+        return False
 
 
 @dataclass(frozen=True)
@@ -299,6 +321,29 @@ def _within_follow_up_window(
     return (ts - last) <= window_seconds
 
 
+def _has_other_mentions(
+    inbound: "IncomingMessage",
+    watch_mentions: tuple[str, ...],
+) -> bool:
+    """True if the message @'s someone other than bot, watch list, or regex.
+
+    This is used to short-circuit follow-up dispatch: if someone is clearly
+    talking to another person (not bot, not a watched user), just RECORD.
+    ``mention_user_ids`` and ``mention_agent_ids`` already exclude the bot
+    itself (parser strips bot's own id).
+    """
+    # watch_mentions may contain user ids — normalize for comparison
+    watch_set = {_normalize_name(w) for w in watch_mentions if w}
+    # Check if any mentioned user is NOT in the watch list
+    for uid in inbound.mention_user_ids:
+        if _normalize_name(uid) not in watch_set:
+            return True
+    # Any mentioned agent (other bots) always counts as "other person"
+    if inbound.mention_agent_ids:
+        return True
+    return False
+
+
 def _resolve_for_group(policy: GroupPolicy, group_id: str | None) -> dict[str, Any]:
     """Merge per-group overrides on top of the account-level policy."""
     override = policy.per_group_overrides.get(group_id or "")
@@ -364,10 +409,16 @@ _WATCH_REGEX_PROMPT = """\
 **Output:要么回复正文,要么单独一行 NO_REPLY。**"""
 
 _MENTION_PROMPT = """\
-[Dispatch] 用户在群里直接 @ 了你,必须回复。
+**用户在群里直接 @ 了你。被 @ 时必须回复，绝不允许输出 NO_REPLY。**
 
-允许并鼓励多轮静默调用 tools / skills 去解决问题;过程中不发"我帮你看看 / 让我查一下 / 稍等"等任何中间消息。
-拿到结论后直接给最终答案;即使确实做不到,也用自然语气如实说(如"这个我暂时帮不上"),**不要**输出 NO_REPLY。
+**处理原则：先读上下文，再处理消息。**
+
+1. 回顾近期群消息，了解讨论背景和进行中的话题
+2. 以本条消息正文为准进行处理；如果没有正文（纯 @提醒），则检查上下文中是否有你未完成的事项或待跟进的任务，有则处理并回复结论
+3. 如果没有待处理事项且无法判断意图，简要询问（如"有什么需要帮忙的？"）
+
+即使最终无结论，也必须回复（如"暂时没找到相关信息"），绝不允许 NO_REPLY。
+允许并鼓励多轮静默调用 tools / skills 去解决问题；过程中不发中间消息。
 不要输出 JSON、不要解释自己在做什么。"""
 
 _PROACTIVE_PROMPT = """\
@@ -383,25 +434,21 @@ _PROACTIVE_PROMPT = """\
 
 # --- Follow-up prompt templates (injected into channel_prompt at dispatch time) ---
 
-# Template A: sender @mentioned bot earlier in the current follow-up window.
+# Template A: sender @mentioned bot or bot replied to sender within 27s.
 # Default: RESPOND.  Only NO_REPLY for clear conversation-closing signals.
 _FOLLOW_UP_ENGAGED_TEMPLATE = """\
-**Follow-up — 对方在窗口内 @过你,默认回复。** Sender: {sender_label}
+**Follow-up — 你可能刚和对方有过对话。**
 
-仅在以下任一条件命中时输出 NO_REPLY:
-1. 收件人显然是别人:"李四 …"、"张三,…"、"@老王 …"、"老刘:"、"帮我问问王哥"
-2. 独立成句的结束 / 反应词:"没事了 / 不用回复了 / 谢谢 / 好的 / 收到 / 👍 / 哈哈 / 666 / ..."
-3. 你将要发出的内容是拒绝声明("我没法 / 我无法 / 作为AI")、空礼貌、与原消息脱钩的发散
+一般是期望你进行回复的，只有以下情况例外，命中时只回复 NO_REPLY 即可:
+1. 消息明确是和别人说的（@了别人 / "张三,帮我…" / 明确引用了别人的消息且内容不是和你说的）
+2. 对方的消息是明确的结束信号（好的/收到/谢谢/👍/哈哈/666 独立成句）
 
-其余一律静默调 tools / skills 直至拿到结论,再**简洁直接**地回答——今天周几、日期、计算、追问、对你上一句的延展都属于"该回"。调用过程不输出任何中间消息("我帮你看看 / 稍等 / 先确认一下" 一律不要)。
-拿不准时:能答就答;要发的像拒绝就 NO_REPLY。
-
-**Output:要么回复正文,要么单独一行 NO_REPLY。**"""
+允许静默调 tools / skills；不发中间消息；不要输出 JSON、不要解释自己在做什么。"""
 
 # Template B: sender has NOT @mentioned bot in the current follow-up window.
 # Default: DO NOT respond.  Only reply when clearly directed at bot.
 _FOLLOW_UP_PASSIVE_TEMPLATE = """\
-**⚠️ STRICT MODE — 对方在窗口内**没有** @过你,默认 NO_REPLY。** Sender: {sender_label}
+**⚠️ STRICT MODE — 对方在窗口内**没有** @过你,默认 NO_REPLY。**
 
 第一步 · 收件人门槛(不过则直接 NO_REPLY,**不进入下一步、不调任何 tools**):
 仅当下列**全部** YES 才能继续:
@@ -427,7 +474,7 @@ _FOLLOW_UP_PASSIVE_TEMPLATE = """\
 # Template C: message is a direct reply/quote to bot's previous message.
 # Always respond unless it's an explicit conversation closer.
 _FOLLOW_UP_REPLY_TO_BOT_CONTEXT_TEMPLATE = """\
-**Follow-up — 这条消息直接回复/引用了你的上一条,目标就是你。** Sender: {sender_label}
+**Follow-up — 这条消息直接回复/引用了你的上一条,目标就是你。**
 
 NO_REPLY 仅限两种:
 - 对方明确结束("不用回复了 / 没事了 / 谢谢 / 好的 / 收到 / 👍 / 哈哈 / 666" 独立成句)
@@ -436,6 +483,34 @@ NO_REPLY 仅限两种:
 其余 → 静默调 tools / skills(**不发**"我帮你看看 / 稍等"等中间消息)拿到结论后,直接给出有信息量的回复。
 
 **Output:要么回复正文,要么单独一行 NO_REPLY。**"""
+
+
+# --- Sender format documentation (appended to group system prompt) ---
+
+_SENDER_FORMAT_DOC = """\
+## 群消息格式
+
+每条 user message 的结构：
+```
+(提示指令)
+
+[Sender: 名字 | human]  或  [Sender: 名字 | bot: agentId]
+[Message]
+(消息正文)
+```
+
+### 消息来源标识
+- `[Sender: 名字 | human]` — 人类用户
+- `[Sender: 名字 | bot: agentId]` — 机器人
+
+### 在消息中 @ 其他人
+- @ 人类用户：`@名字`（如 `@chengbo05`）
+- @ 机器人：`@agentId`（如 `@6471`）
+- @ 所有人：`@all`
+- 同时 @ 多人（含 @all）时，`@all` 尽量放最前面（如 `@all @chengbo05 @6471 ...`）
+- `@` 前面必须有空格（如 `你好 @chengbo05` 而非 `你好@chengbo05`）
+- `@xxxx` 后面必须有空格或换行（如 `@chengbo05 你好` 而非 `@chengbo05你好`）
+- 只需在消息正文中写 `@` 即可，不需要使用 send_message 的 metadata 参数"""
 
 
 def build_follow_up_prompt(
@@ -447,25 +522,17 @@ def build_follow_up_prompt(
     is_reply_to_bot: bool = False,
     sender_engaged: bool = False,
 ) -> str:
-    """Build a context-aware follow-up prompt with sender info.
+    """Build a follow-up judgement prompt (pure instruction, no sender metadata).
 
-    ``sender_engaged`` is True when the sender @mentioned the bot earlier in
-    the current follow-up window (template A), False otherwise (template B).
-    Template C is used for direct reply-to-bot regardless of engaged state.
+    Sender metadata is handled by adapter.py as a [Sender: ...] tag
+    separate from the instruction block.
     """
-    if is_bot:
-        sender_label = f"{sender_name} (agentId: {agent_id}, bot)"
-    else:
-        sender_label = f"{sender_name} (userId: {fromid}, human)"
     if is_reply_to_bot:
-        tmpl = _FOLLOW_UP_REPLY_TO_BOT_CONTEXT_TEMPLATE
+        return _FOLLOW_UP_REPLY_TO_BOT_CONTEXT_TEMPLATE
     elif sender_engaged:
-        tmpl = _FOLLOW_UP_ENGAGED_TEMPLATE
+        return _FOLLOW_UP_ENGAGED_TEMPLATE
     else:
-        tmpl = _FOLLOW_UP_PASSIVE_TEMPLATE
-    return tmpl.format(
-        sender_label=sender_label,
-    )
+        return _FOLLOW_UP_PASSIVE_TEMPLATE
 
 
 def _join_prompt(*parts: str) -> str:
@@ -539,12 +606,18 @@ def evaluate_inbound(
             and group_id
             and _within_follow_up_window(policy, group_id, eff["follow_up_window"], now=now)
         ):
+            if _has_other_mentions(inbound, eff["watch_mentions"]):
+                return PolicyDecision(
+                    should_dispatch=False,
+                    reason="mention-only: follow-up but @-ing others",
+                    action=Action.RECORD,
+                )
             return PolicyDecision(
                 should_dispatch=True,
                 reason="mention-only: follow-up window",
                 action=Action.DISPATCH,
                 trigger_reason="followUp",
-                group_system_prompt="",  # adapter will enrich with sender context
+                group_system_prompt=eff["system_prompt"],
                 needs_sender_context=True,
             )
         if not policy.require_mention:
@@ -599,12 +672,18 @@ def evaluate_inbound(
         and group_id
         and _within_follow_up_window(policy, group_id, eff["follow_up_window"], now=now)
     ):
+        if _has_other_mentions(inbound, eff["watch_mentions"]):
+            return PolicyDecision(
+                should_dispatch=False,
+                reason="mention-and-watch: follow-up but @-ing others",
+                action=Action.RECORD,
+            )
         return PolicyDecision(
             should_dispatch=True,
             reason="mention-and-watch: follow-up window",
             action=Action.DISPATCH,
             trigger_reason="followUp",
-            group_system_prompt="",  # adapter will enrich with sender context
+            group_system_prompt=eff["system_prompt"],
             needs_sender_context=True,
         )
     if not policy.require_mention:

@@ -23,6 +23,11 @@ import aiohttp
 logger = logging.getLogger(__name__)
 
 
+def gw_log() -> logging.Logger:
+    """Return the gateway.run logger so audit lines reach gateway.log."""
+    return logging.getLogger("gateway.run")
+
+
 # ---------------------------------------------------------------------------
 # Config helpers
 # ---------------------------------------------------------------------------

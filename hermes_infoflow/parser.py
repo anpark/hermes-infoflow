@@ -77,6 +77,7 @@ class BodyItem:
     name: str = ""
     userid: str = ""
     robotid: str = ""   # stored as str to preserve precision; "" when absent
+    atall: bool = False  # True when {"type": "AT", "atall": true}
     downloadurl: str = ""
     messageid: str = ""  # for replyData items, the quoted message id (str)
     preview: str = ""    # for replyData items
@@ -113,6 +114,7 @@ class InboundMessage:
     # events. Empty string when nothing was discovered. Mirrors OpenClaw
     # bot.ts::getBotRobotidFromBody.
     discovered_robot_id: str = ""
+    is_at_only: bool = False  # True when body has only AT items, no TEXT/MD
     # The raw root-level ``fromid`` from the inbound payload (group events).
     # Used by the adapter to compare against the persisted robotId for the
     # "ignore own bot message" guard (OpenClaw bot.ts:766-775).
@@ -266,6 +268,7 @@ def _coerce_body_item(raw: dict[str, Any]) -> BodyItem:
         name=_stringify(raw.get("name")),
         userid=_stringify(raw.get("userid")),
         robotid=_stringify(raw.get("robotid")),
+        atall=bool(raw.get("atall")),
         downloadurl=_stringify(raw.get("downloadurl")),
         messageid=_stringify(raw.get("messageid")),
         preview=_stringify(raw.get("preview")),
@@ -579,20 +582,30 @@ def build_group_inbound(
         sent_message_ids=sent_message_ids,
     )
 
-    if not raw_text and not image_urls and not reply_targets:
+    if not raw_text.strip() and not image_urls and not reply_targets and not body_for_agent:
         return None
+
+    _is_at_only = False  # will be set True if AT-only message
+
+    # Strip raw_text early so whitespace-only content is treated as empty
+    _raw_stripped = raw_text.strip()
 
     # Mirror OpenClaw bot.ts:838-844: when there's no text but media / reply
     # context exists, fall back to a placeholder so the message isn't dropped.
-    if not raw_text and image_urls:
+    if not _raw_stripped and image_urls:
         if len(image_urls) > 1:
             text_out = f"<media:image> ({len(image_urls)} images)"
         else:
             text_out = "<media:image>"
-    elif not raw_text and reply_targets:
+    elif not _raw_stripped and reply_targets:
         text_out = "(引用回复)"
+    elif not _raw_stripped and body_for_agent:
+        # AT-only message (no TEXT/MD body, e.g. user just @'s the bot)
+        text_out = body_for_agent
+        _is_at_only = True
     else:
         text_out = raw_text
+        _is_at_only = False
 
     # Sender display name: prefer header.username / nickname (OpenClaw bot.ts:849).
     sender_display = _stringify(
@@ -640,6 +653,7 @@ def build_group_inbound(
         is_reply_to_bot=is_reply_to_bot,
         was_mentioned=was_mentioned,
         discovered_robot_id=discovered_robot_id,
+        is_at_only=_is_at_only,
         fromid=fromid_str,
         event_type=event_type,
         is_bot_sender=_bot_sender,

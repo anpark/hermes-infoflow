@@ -48,7 +48,7 @@ class Case:
     history: list[dict[str, str]] | None = None  # extra assistant/user turns before user_msg
 
 
-_SENDER = "张三 (uid=zhang, human)"
+
 
 CASES: list[Case] = [
     # ① _MENTION_PROMPT — @bot, must reply (even if cannot help)
@@ -88,19 +88,19 @@ CASES: list[Case] = [
     # ④ _FOLLOW_UP_ENGAGED_TEMPLATE
     Case(
         "engaged-should-reply",
-        _FOLLOW_UP_ENGAGED_TEMPLATE.format(sender_label=_SENDER),
+        _FOLLOW_UP_ENGAGED_TEMPLATE,
         "今天周几",
         "reply",
     ),
     Case(
         "engaged-addressed-other",
-        _FOLLOW_UP_ENGAGED_TEMPLATE.format(sender_label=_SENDER),
+        _FOLLOW_UP_ENGAGED_TEMPLATE,
         "李四 你那边好了没",
         "no_reply",
     ),
     Case(
         "engaged-closing-signal",
-        _FOLLOW_UP_ENGAGED_TEMPLATE.format(sender_label=_SENDER),
+        _FOLLOW_UP_ENGAGED_TEMPLATE,
         "好的,谢谢",
         "no_reply",
     ),
@@ -108,13 +108,13 @@ CASES: list[Case] = [
     # ⑤ _FOLLOW_UP_PASSIVE_TEMPLATE
     Case(
         "passive-not-addressed",
-        _FOLLOW_UP_PASSIVE_TEMPLATE.format(sender_label="王五 (uid=wang, human)"),
+        _FOLLOW_UP_PASSIVE_TEMPLATE,
         "晚上吃啥",
         "no_reply",
     ),
     Case(
         "passive-public-question",
-        _FOLLOW_UP_PASSIVE_TEMPLATE.format(sender_label="王五 (uid=wang, human)"),
+        _FOLLOW_UP_PASSIVE_TEMPLATE,
         "有人知道国庆放几天吗",
         "reply",
     ),
@@ -123,7 +123,7 @@ CASES: list[Case] = [
     # prior bot answer; supply it as assistant history so GLM has context.
     Case(
         "reply2bot-continue",
-        _FOLLOW_UP_REPLY_TO_BOT_CONTEXT_TEMPLATE.format(sender_label=_SENDER),
+        _FOLLOW_UP_REPLY_TO_BOT_CONTEXT_TEMPLATE,
         "那明天呢",
         "reply",
         note="承接 bot 上一条'今天是周三',应回复'周四'",
@@ -134,7 +134,7 @@ CASES: list[Case] = [
     ),
     Case(
         "reply2bot-closing",
-        _FOLLOW_UP_REPLY_TO_BOT_CONTEXT_TEMPLATE.format(sender_label=_SENDER),
+        _FOLLOW_UP_REPLY_TO_BOT_CONTEXT_TEMPLATE,
         "不用回复了,谢了",
         "no_reply",
         history=[

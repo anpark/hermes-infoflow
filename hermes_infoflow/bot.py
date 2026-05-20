@@ -46,17 +46,13 @@ from .itypes import (
     SendOptions,
     SentResult,
 )
+from .utils import gw_log
 
 if TYPE_CHECKING:  # pragma: no cover — avoid circular import at runtime
     from .serverapi import ServerAPI
     from .adapter import InfoflowAdapter
 
 logger = logging.getLogger(__name__)
-
-
-def gw_log() -> logging.Logger:
-    """Return the gateway.run logger so audit lines reach gateway.log."""
-    return logging.getLogger("gateway.run")
 
 
 # ---------------------------------------------------------------------------
@@ -258,7 +254,7 @@ class Bot:
         _text_preview = (msg.text or "")[:120]
 
         # Audit log
-        logger.info(
+        gw_log().info(
             "[infoflow] inbound decoded: from=%s chat=%s group=%s mentioned=%s mid=%s text=%r",
             msg.sender_id, _chat, msg.is_group, msg.bot_was_mentioned,
             msg.msgid or "-", _text_preview,
@@ -268,11 +264,10 @@ class Bot:
         if msg.discovered_robot_id and msg.discovered_robot_id != self._robot_id:
             self._robot_id = msg.discovered_robot_id
             self._serverapi.robot_id = self._robot_id
-            logger.info(
+            gw_log().info(
                 "[infoflow] discovered robotId=%s for account %s",
                 self._robot_id, self._settings.get("app_agent_id"),
             )
-            gw_log().info("[infoflow] discovered robotId=%s", self._robot_id)
             _persist_robot_id(self._robot_id)
 
         # Step 2: Dedup check (before echo filter — plugin-sent echoes are already mark_seen)
@@ -414,7 +409,7 @@ class Bot:
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("[infoflow] inbound dispatch failed")
+            gw_log().exception("[infoflow] inbound dispatch failed")
         finally:
             _send_path_cv.set("")
 
@@ -525,7 +520,10 @@ class Bot:
 
         # Follow-up window: record bot reply timestamp for group messages
         if succeeded and group_id:
-            self._policy.record_bot_reply(group_id)
+            self._policy.record_bot_reply(
+                group_id,
+                reply_to_sender=getattr(reply_info, 'sender_imid', '') or '',
+            )
             gw_log().info("[iflow:send] mid=%s step=record_bot_reply group=%s", _mid_var.get(""), group_id)
 
         if first_error:
@@ -579,7 +577,10 @@ class Bot:
                     group_id=group_id, dm_user_id=dm_user_id,
                 )
             if group_id:
-                self._policy.record_bot_reply(group_id)
+                self._policy.record_bot_reply(
+                    group_id,
+                    reply_to_sender=getattr(reply_info, 'sender_imid', '') or '',
+                )
                 gw_log().info("[iflow:send] mid=%s step=record_bot_reply group=%s (image)", _mid_var.get(""), group_id)
         return result
 
@@ -631,13 +632,13 @@ class Bot:
                     sent_store=self._sent_store,
                 )
             if corrected is not None and corrected.get("kind") == "swap":
-                logger.info(
+                gw_log().info(
                     "[bot:recall] auto-swap inbound id=%s -> bot msg id=%s",
                     msgid, corrected.get("message_id"),
                 )
                 msgid = str(corrected["message_id"])
             elif corrected is not None and corrected.get("kind") == "drop_to_count":
-                logger.info("[bot:recall] auto-correct: drop to count=1")
+                gw_log().info("[bot:recall] auto-correct: drop to count=1")
                 msgid = None
                 count = 1
 
@@ -659,7 +660,7 @@ class Bot:
                 if fb_entry is not None:
                     ok_use = (group_id is None) or bool((fb_entry.msgseqid or "").strip())
                     if ok_use:
-                        logger.info(
+                        gw_log().info(
                             "[bot:recall] fallback: msgid=%s -> bot id=%s",
                             msgid, fb_entry.messageid,
                         )

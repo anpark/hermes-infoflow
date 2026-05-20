@@ -40,6 +40,35 @@ import aiohttp
 logger = logging.getLogger(__name__)
 
 
+def gw_log() -> logging.Logger:
+    """Return the gateway.run logger so audit lines reach gateway.log."""
+    return logging.getLogger("gateway.run")
+
+
+def _truncate_image_payload(payload_str: str, max_bytes: int = 500) -> str:
+    """Truncate base64 image content in JSON payload for logging.
+
+    Detects ``"content": "<base64...>"`` inside image body items and replaces
+    the value with a placeholder so the log line stays readable.
+    """
+    # Fast path: no image content at all
+    if '"content"' not in payload_str:
+        return payload_str
+    try:
+        obj = json.loads(payload_str)
+        body = obj.get("message", {}).get("body", [])
+        for item in body:
+            if isinstance(item, dict) and item.get("type") == "IMAGE":
+                img = item.get("image", {})
+                if isinstance(img, dict) and isinstance(img.get("content"), str):
+                    raw_len = len(img["content"])
+                    img["content"] = f"<base64 {raw_len} bytes>"
+        return json.dumps(obj, ensure_ascii=False)
+    except Exception:
+        # Fallback: return original if parsing fails
+        return payload_str[:2000]
+
+
 DEFAULT_TIMEOUT_SECONDS = 30.0
 TOKEN_TTL_BUFFER_SECONDS = 300
 TOKEN_DEFAULT_LIFETIME_SECONDS = 7200
@@ -357,6 +386,8 @@ async def send_private_message(
 
     url = _join(account.api_host, INFOFLOW_PRIVATE_SEND_PATH)
     body_str = json.dumps(payload, ensure_ascii=False)
+    _log_payload = _truncate_image_payload(body_str)
+    gw_log().info("[infoflow:send_payload] %s", _log_payload)
     headers = _auth_headers(token)
 
     async with _ensure_session(session) as sess:
@@ -417,9 +448,10 @@ def _build_group_body_items(contents: list[ContentItem]) -> tuple[list[dict[str,
     """
     body: list[dict[str, Any]] = []
 
-    # ── Pass 1: collect AT items ──
+    # ── Pass 1: collect AT fields into a single merged dict ──
     at_all = False
-    at_items: list[dict[str, Any]] = []
+    at_user_ids: list[str] = []
+    at_agent_ids: list[int] = []
 
     for item in contents:
         t = item.type.lower()
@@ -428,21 +460,16 @@ def _build_group_body_items(contents: list[ContentItem]) -> tuple[list[dict[str,
                 at_all = True
             else:
                 ids = [s.strip() for s in item.content.split(",") if s.strip()]
-                if ids:
-                    for uid in ids:
-                        at_items.append({"type": "AT", "atuserids": [uid]})
+                at_user_ids.extend(ids)
         elif t == "at-agent":
-            ids_int: list[int] = []
             for raw in item.content.split(","):
                 s = raw.strip()
                 if not s:
                     continue
                 try:
-                    ids_int.append(int(s))
+                    at_agent_ids.append(int(s))
                 except ValueError:
                     continue
-            if ids_int:
-                at_items.append({"type": "AT", "atagentids": ids_int})
 
     # ── Pass 2: build body items ──
     md_items: list[dict[str, Any]] = []
@@ -465,12 +492,17 @@ def _build_group_body_items(contents: list[ContentItem]) -> tuple[list[dict[str,
                 body.append({"type": "IMAGE", "content": item.content})
         # "text", "at", "at-agent" are skipped (text always sent as MD now)
 
-    # Prepend AT items before MD content
-    at_prefix: list[dict[str, Any]] = []
+    # Build a single merged AT body item — Infoflow API requires one AT item
+    # containing all at fields (atall, atuserids, atagentids).
+    at_item: dict[str, Any] = {"type": "AT"}
     if at_all:
-        at_prefix.append({"type": "AT", "atall": True, "atuserids": []})
-    for d in at_items:
-        at_prefix.append(d)
+        at_item["atall"] = True
+    if at_user_ids:
+        at_item["atuserids"] = at_user_ids
+    if at_agent_ids:
+        at_item["atagentids"] = at_agent_ids
+
+    at_prefix = [at_item] if len(at_item) > 1 else []
 
     body = at_prefix + md_items + body
     return body, True  # has_markdown always True
@@ -492,6 +524,7 @@ async def send_group_message(
         return {"ok": False, "error": "contents array is empty"}
 
     body_items, has_markdown = _build_group_body_items(contents)
+    logger.info("[infoflow:debug] contents=%s body_items=%s", [(c.type, c.content) for c in contents], body_items)
     if not body_items:
         return {"ok": False, "error": "no valid content for group message"}
 
@@ -535,15 +568,15 @@ async def send_group_message(
             if reply.imid:
                 reply_block["imid"] = reply.imid
             payload["message"]["reply"] = reply_block
-        _log = logging.getLogger("hermes_plugins.infoflow.api")
-        _log.debug(
+        logger.debug(
             "[infoflow] reply payload: messageid=%s preview=%r replytype=%s",
             reply.messageid if reply else None,
             reply.preview[:80] if reply else None,
             reply.replytype if reply else None,
         )
         body_str = json.dumps(payload, ensure_ascii=False)
-        logger.info("[infoflow:send_payload] %s", body_str)
+        _log_payload = _truncate_image_payload(body_str)
+        gw_log().info("[infoflow:send_payload] %s", _log_payload)
         async with _ensure_session(session) as sess:
             async with sess.post(
                 url,
@@ -617,7 +650,6 @@ async def get_group_members(
 
     Returns a list of :class:`GroupMember` objects (both humans and bots).
     """
-    _log = logging.getLogger("hermes_plugins.infoflow.api")
     api_host = ensure_https(account.api_host)
     token = await get_app_access_token(account, session=session)
     url = f"{api_host}/api/v1/robot/group/memberList"
@@ -636,7 +668,7 @@ async def get_group_members(
     try:
         data = json.loads(text)
     except Exception:
-        _log.warning("[infoflow] get_group_members: non-JSON response: %s", text[:200])
+        logger.warning("[infoflow] get_group_members: non-JSON response: %s", text[:200])
         return []
 
     inner = data.get("data", data)
@@ -666,7 +698,7 @@ async def get_group_members(
             imid=str(a.get("imId", "")),  # robot imId = webhook fromid
         ))
 
-    _log.debug(
+    logger.debug(
         "[infoflow] get_group_members(%s): %d members (%d humans, %d bots)",
         group_id, len(members),
         sum(1 for m in members if not m.is_bot),
@@ -711,6 +743,7 @@ async def recall_group_message(
 
     url = _join(account.api_host, INFOFLOW_GROUP_RECALL_PATH)
     body = f'{{"groupId":{gid},"messageid":{mid},"msgseqid":{seq}}}'
+    gw_log().info("[infoflow:recall_payload] group mid=%s seq=%s body=%s", mid, seq, body)
     headers = _auth_headers(token)
 
     async with _ensure_session(session) as sess:
@@ -754,6 +787,7 @@ async def recall_private_message(
     # int. We deliberately do NOT manually splice msgkey because an attacker-controlled
     # msgkey could otherwise break out of the JSON literal.
     body = json.dumps({"msgkey": str(msgkey), "agentid": int(account.app_agent_id)})
+    gw_log().info("[infoflow:recall_payload] private msgkey=%s body=%s", msgkey, body)
     headers = _auth_headers(token)
 
     async with _ensure_session(session) as sess:

@@ -218,6 +218,7 @@ class ServerAPI:
             msgseqid=str(parser_inbound.msgseqid or ""),
             timestamp=(parser_inbound.timestamp_ms or 0) / 1000.0,
             discovered_robot_id=parser_inbound.discovered_robot_id or None,
+            is_at_only=parser_inbound.is_at_only,
             raw_data=parser_inbound.raw_msgdata or {},
             event_type=parser_inbound.event_type or "",
         )
@@ -238,30 +239,30 @@ class ServerAPI:
         items: list[_api.ContentItem] = []
         at_prefix_parts: list[str] = []
 
-        # --- AT items ---
+        # --- AT items (independent — at_all, users, agents can coexist) ---
         if options.at_all:
             items.append(_api.ContentItem("at", "all"))
-            # Ensure text has @all placeholder for MD rendering
             text_lower = text.lower()
             if text and "@all" not in text_lower and "@所有人" not in text:
                 at_prefix_parts.append("@all")
-        else:
+
+        if options.mention_user_ids:
             user_ids_for_api: list[str] = []
-            if options.mention_user_ids:
-                for uid in (s.strip() for s in options.mention_user_ids.split(",") if s.strip()):
-                    user_ids_for_api.append(uid)
-                    if not (text and f"@{uid}" in text):
-                        at_prefix_parts.append(f"@{uid}")
+            for uid in (s.strip() for s in options.mention_user_ids.split(",") if s.strip()):
+                user_ids_for_api.append(uid)
+                if not (text and f"@{uid}" in text):
+                    at_prefix_parts.append(f"@{uid}")
             if user_ids_for_api:
                 items.append(_api.ContentItem("at", ",".join(user_ids_for_api)))
-            if options.mention_agent_ids:
-                agent_ids_for_api: list[str] = []
-                for aid in (s.strip() for s in options.mention_agent_ids.split(",") if s.strip()):
-                    agent_ids_for_api.append(aid)
-                    if not (text and f"@{aid}" in text):
-                        at_prefix_parts.append(f"@{aid}")
-                if agent_ids_for_api:
-                    items.append(_api.ContentItem("at-agent", ",".join(agent_ids_for_api)))
+
+        if options.mention_agent_ids:
+            agent_ids_for_api: list[str] = []
+            for aid in (s.strip() for s in options.mention_agent_ids.split(",") if s.strip()):
+                agent_ids_for_api.append(aid)
+                if not (text and f"@{aid}" in text):
+                    at_prefix_parts.append(f"@{aid}")
+            if agent_ids_for_api:
+                items.append(_api.ContentItem("at-agent", ",".join(agent_ids_for_api)))
 
         # --- Markdown (always MD) ---
         if text:
