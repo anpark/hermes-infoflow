@@ -703,6 +703,12 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         else:
             text_for_agent = f"{_envelope}{text_for_agent or ''}"
 
+        # Log the complete user message sent to the LLM
+        gw_log().info(
+            "[iflow:user_message] mid=%s len=%d text=\n%s",
+            msg.message_id or "-", len(text_for_agent or ""), text_for_agent or "",
+        )
+
         event = MessageEvent(
             text=text_for_agent,
             message_type=message_type,

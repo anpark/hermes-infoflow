@@ -521,11 +521,13 @@ def build_private_inbound(
         rt = reply_targets[0]
         reply_prefix = f"<引用 message_id:{rt['messageid']}>{rt['preview']}</引用>\n"
 
-    if not text and not image_urls:
+    if not text and not image_urls and not reply_targets:
         return None
 
     if not text and image_urls:
         text = "<media:image>"
+    elif not text and reply_targets:
+        text = "(引用回复)"
 
     body_for_agent = reply_prefix + text
 
