@@ -40,11 +40,11 @@ from .crypto import InfoflowCryptoError, decrypt_message, verify_echostr_signatu
 
 # Regex matches IDs with 16 or more digits — anything shorter is safe to
 # leave as a Python int. The capture groups are (field_name, digits).
-_ID_FIELD_RE = re.compile(r'"(messageid|msgid|MsgId|msgkey|msgseqid|fromid)"\s*:\s*(\d{16,})')
+_ID_FIELD_RE = re.compile(r'"(messageid|msgid|MsgId|msgkey|msgseqid|fromid|msgid2)"\s*:\s*(\d{16,})')
 
 # Field names we patch through ``patch_precise_ids``. Listed here for
 # documentation; the regex is the authoritative source.
-ID_FIELDS = ("messageid", "msgid", "MsgId", "msgkey", "msgseqid", "fromid")
+ID_FIELDS = ("messageid", "msgid", "MsgId", "msgkey", "msgseqid", "fromid", "msgid2")
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +99,7 @@ class InboundMessage:
     message_id: str | None = None
     group_id: str | None = None       # numeric string, "" when DM
     msgseqid: str | None = None
+    msgid2: str = ""                  # top-level webhook msgid2 (group only; emoji API)
     timestamp_ms: int | None = None
     raw_msgdata: dict[str, Any] = field(default_factory=dict)
     body_items: list[BodyItem] = field(default_factory=list)
@@ -575,6 +576,9 @@ def build_group_inbound(
     )
     message_id = _stringify(raw_msg_id) if raw_msg_id is not None else None
 
+    raw_msgid2 = msg_data.get("msgid2")
+    msgid2 = _stringify(raw_msgid2) if raw_msgid2 not in (None, "") else ""
+
     msgseqid_raw = (header or {}).get("msgseqid") or msg_data.get("msgseqid")
     msgseqid = _stringify(msgseqid_raw) if msgseqid_raw is not None else None
 
@@ -682,6 +686,7 @@ def build_group_inbound(
         message_id=message_id,
         group_id=group_id_str,
         msgseqid=msgseqid,
+        msgid2=msgid2,
         timestamp_ms=timestamp_ms,
         raw_msgdata=msg_data,
         body_items=body_items,

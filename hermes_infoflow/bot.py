@@ -154,6 +154,9 @@ _REFUSAL_RE = re.compile(
 # like "NO_REPLY。" / "NO_REPLY ~" still suppress.
 _NO_REPLY_PUNCT = "。，,.！!？?~～ \t\n;；:："
 
+# Emoji reaction shown while LLM is processing (敲键盘).
+_EMOJI_PROCESSING = ("d135", "(qjp)")
+
 
 def no_reply_sentinel_hits(text: str | None) -> bool:
     """True iff ``text`` should be suppressed by the NO_REPLY sentinel.
@@ -486,6 +489,7 @@ class Bot:
                 sender_agent_id=str(getattr(msg, "sender_agent_id", "") or ""),
                 registered_at=time.time(),
                 msgseqid=msg.msgseqid,
+                msgid2=msg.msgid2 or None,
             )
         )
 
@@ -513,9 +517,96 @@ class Bot:
                 sender_is_bot=msg.sender_is_bot,
                 is_inbound=True,
                 bot_was_mentioned=msg.bot_was_mentioned,
+                msgid2=msg.msgid2 or "",
                 text=msg.text or "",
                 raw_json=raw_json,
             )
+
+    # -- emoji reaction lifecycle (processing indicator) --------------------
+
+    def _build_reaction_handle(
+        self,
+        msg: IncomingMessage,
+        decision: PolicyDecision,
+    ) -> dict[str, str] | None:
+        """Return reaction API params if this dispatch should show a processing emoji."""
+        if not msg.is_group or not msg.group_id or not msg.msgid2:
+            return None
+        if not msg.message_id:
+            return None
+        if getattr(decision, "command_text", ""):
+            return None
+
+        trig = decision.trigger_reason or ""
+        eligible = False
+        if trig == "bot-mentioned":
+            eligible = True
+        elif trig == "followUp":
+            if msg.is_reply_to_bot:
+                eligible = True
+            else:
+                key = self._engaged_key(msg)
+                if key and self._policy.sender_engaged_recently(msg.group_id, key):
+                    eligible = True
+        if not eligible:
+            return None
+
+        from_uid = self._reaction_from_uid(msg)
+        if not from_uid:
+            return None
+        return {
+            "group_id": msg.group_id,
+            "base_msg_id": msg.message_id,
+            "msgid2": msg.msgid2,
+            "from_uid": from_uid,
+            "emoji_code": _EMOJI_PROCESSING[0],
+            "emoji_desc": _EMOJI_PROCESSING[1],
+        }
+
+    @staticmethod
+    def _reaction_from_uid(msg: IncomingMessage) -> str:
+        """fromUid for emoji API: sender uuapName or bot agentId.
+
+        Returns "" when identity is degraded (``IMID:xxx``) — the Ruliu API
+        expects either a uuapName or numeric agentId, not the IMID fallback.
+        """
+        if msg.sender_is_bot:
+            aid = (getattr(msg, "sender_agent_id", "") or "").strip()
+            if aid and not aid.startswith("IMID:"):
+                return aid
+            return ""
+        sid = msg.sender_id or ""
+        if sid.startswith("IMID:"):
+            return ""
+        return sid
+
+    @staticmethod
+    def _engaged_key(msg: IncomingMessage) -> str:
+        """Policy key for sender_engaged_recently (same as adapter follow-up)."""
+        if msg.sender_is_bot:
+            aid = (getattr(msg, "sender_agent_id", "") or "").strip()
+            if aid and not aid.startswith("IMID:"):
+                return aid
+            return ""
+        return msg.sender_id or ""
+
+    async def _try_add_reaction(self, handle: dict[str, str]) -> bool:
+        try:
+            res = await self._serverapi.add_message_reaction(**handle)
+            if not res.success:
+                gw_log().warning("[iflow:reaction] add failed: %s", res.error)
+            return res.success
+        except Exception:
+            gw_log().exception("[iflow:reaction] add raised")
+            return False
+
+    async def _try_delete_reaction(self, handle: dict[str, str]) -> None:
+        try:
+            res = await self._serverapi.delete_message_reaction(**handle)
+            if not res.success:
+                gw_log().warning("[iflow:reaction] del failed: %s", res.error)
+        except Exception:
+            gw_log().exception("[iflow:reaction] del raised")
 
     # -- dispatch orchestration ---------------------------------------------
 
@@ -531,6 +622,13 @@ class Bot:
         _inbound_mid.set(msg.message_id or "")
         _send_path_cv.set(decision.trigger_reason or "")
         hint = msg.message_id or None
+
+        reaction = self._build_reaction_handle(msg, decision)
+        if reaction:
+            ok = await self._try_add_reaction(reaction)
+            if not ok:
+                reaction = None
+
         try:
             with recall_inbound_message_id_hint_scope(hint):
                 event = await adapter.build_message_event(msg, decision)
@@ -540,6 +638,8 @@ class Bot:
         except Exception:
             gw_log().exception("[infoflow] inbound dispatch failed")
         finally:
+            if reaction:
+                await self._try_delete_reaction(reaction)
             _send_path_cv.set("")
 
     def spawn_dispatch(

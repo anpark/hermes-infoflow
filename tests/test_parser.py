@@ -228,6 +228,41 @@ def test_empty_text_plain_body_returns_400_not_500(account):
 # ---------------------------------------------------------------------------
 
 
+def test_group_message_extracts_msgid2(account):
+    acct, raw_key = account
+    payload = {
+        "groupid": 4507088,
+        "msgid2": 300014580,
+        "message": {
+            "header": {
+                "fromuserid": "bob",
+                "groupid": 4507088,
+                "messageid": "1865794273048386548",
+            },
+            "body": [{"type": "TEXT", "content": "hi"}],
+        },
+    }
+    ct = aes_ecb_encrypt_b64url(json.dumps(payload), raw_key)
+    res = parser.parse_webhook(content_type="text/plain", raw_body=ct, account=acct)
+    assert res.kind == "message"
+    assert res.inbound.msgid2 == "300014580"
+    assert res.inbound.message_id == "1865794273048386548"
+
+
+def test_group_message_without_msgid2_defaults_empty(account):
+    acct, raw_key = account
+    payload = {
+        "message": {
+            "header": {"fromuserid": "bob", "groupid": 1, "messageid": 1},
+            "body": [{"type": "TEXT", "content": "hi"}],
+        },
+    }
+    ct = aes_ecb_encrypt_b64url(json.dumps(payload), raw_key)
+    res = parser.parse_webhook(content_type="text/plain", raw_body=ct, account=acct)
+    assert res.kind == "message"
+    assert res.inbound.msgid2 == ""
+
+
 def test_group_message_exposes_fromid_and_event_type(account):
     acct, raw_key = account
     payload = {

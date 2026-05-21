@@ -288,6 +288,27 @@ def test_recall_private_message_body_uses_json_dumps(monkeypatch):
     assert captured["headers"]["Authorization"] == "Bearer-TOK"
 
 
+def test_build_emoji_reaction_body() -> None:
+    body = api._build_emoji_reaction_body(
+        from_uid="chengbo05",
+        group_id=4507088,
+        base_msg_id="1865794273048386548",
+        msgid2="300014580",
+        emoji_code="d135",
+        emoji_desc="(qjp)",
+    )
+    parsed = json.loads(body)
+    assert parsed == {
+        "fromUid": "chengbo05",
+        "chatType": 2,
+        "chatId": 4507088,
+        "baseMsgId": "1865794273048386548",
+        "msgId2": 300014580,
+        "replyContent": "d135",
+        "replyDesc": "(qjp)",
+    }
+
+
 def test_build_private_payload_image_uses_native_msgtype() -> None:
     payload = api._build_private_payload("alice", [api.ContentItem("image", "BASE64...")])
     assert payload == {

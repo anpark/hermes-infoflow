@@ -52,6 +52,7 @@ class _InboundContext:
     sender_id: str = ""  # uuapName for humans, "" for bots
     sender_agent_id: str = ""  # agentId (int-as-str) for bots, "" for humans
     msgseqid: str | None = None
+    msgid2: str | None = None  # top-level webhook msgid2 (group; emoji API)
 
 
 _inbound_ctx_store: dict[str, _InboundContext] = {}

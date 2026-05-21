@@ -41,6 +41,20 @@ _DB_TIMEOUT_SECONDS = 30.0               # 连接超时（与 sent_store 一致�
 _DB_BUSY_TIMEOUT_MS = 5_000              # SQLite busy 等待（与 sent_store 一致）
 _STATE_BASE_DIR = Path("~/.hermes/state/infoflow")
 
+# Explicit column lists used in SELECT — never use ``SELECT *`` because
+# ALTER TABLE ADD COLUMN appends to the end of the physical schema, which
+# would break positional row indexing on DBs that were upgraded from a
+# pre-msgid2 schema.
+_GROUP_COLUMNS_SQL = (
+    "message_id, group_id, sender_id, sender_name, sender_imid, "
+    "sender_is_bot, is_inbound, bot_was_mentioned, msgid2, "
+    "text, digest, created_at, raw_json"
+)
+_DM_COLUMNS_SQL = (
+    "message_id, dm_user_id, sender_id, sender_name, sender_imid, "
+    "sender_is_bot, is_inbound, text, digest, created_at, raw_json"
+)
+
 
 # ---------------------------------------------------------------------------
 # 数据记录
@@ -91,6 +105,7 @@ class GroupMessageRecord:
         is_inbound:         True = 收到的消息；False = bot 发出的消息。
         bot_was_mentioned:  **bot 自己**是否在此消息中被 @mentioned。
                            （仅入站消息有效；bot 发出的消息固定为 False。）
+        msgid2:             顶层 webhook msgid2（仅群聊入站；表情 API 用）。
         text:               消息文本内容。
         digest:             短文本摘要。
         created_at:         时间戳（秒）。
@@ -105,6 +120,7 @@ class GroupMessageRecord:
     sender_is_bot: bool = False
     is_inbound: bool = True
     bot_was_mentioned: bool = False
+    msgid2: str = ""
     text: str = ""
     digest: str = ""
     created_at: float = 0.0
@@ -225,6 +241,7 @@ class MessageStore:
         sender_is_bot: bool = False,
         is_inbound: bool = True,
         bot_was_mentioned: bool = False,
+        msgid2: str = "",
         text: str = "",
         digest: str = "",
         raw_json: str = "",
@@ -241,6 +258,7 @@ class MessageStore:
             sender_is_bot=sender_is_bot,
             is_inbound=is_inbound,
             bot_was_mentioned=bot_was_mentioned,
+            msgid2=msgid2,
             text=text[:5000],
             digest=digest[:200],
             created_at=time.time(),
@@ -254,7 +272,8 @@ class MessageStore:
         if not message_id:
             return None
         row = self._query_one_group(
-            "SELECT * FROM group_messages WHERE message_id = ?", (message_id,),
+            f"SELECT {_GROUP_COLUMNS_SQL} FROM group_messages WHERE message_id = ?",
+            (message_id,),
         )
         return self._row_to_group(row) if row else None
 
@@ -285,7 +304,7 @@ class MessageStore:
         if not message_id:
             return None
         row = self._query_one_group(
-            "SELECT * FROM group_messages "
+            f"SELECT {_GROUP_COLUMNS_SQL} FROM group_messages "
             "WHERE message_id = ? AND group_id = ? AND is_inbound = 0",
             (message_id, group_id),
         )
@@ -376,6 +395,7 @@ class MessageStore:
                         sender_is_bot      INTEGER NOT NULL DEFAULT 0,
                         is_inbound         INTEGER NOT NULL DEFAULT 1,
                         bot_was_mentioned  INTEGER NOT NULL DEFAULT 0,
+                        msgid2             TEXT NOT NULL DEFAULT '',
                         text               TEXT NOT NULL DEFAULT '',
                         digest             TEXT NOT NULL DEFAULT '',
                         created_at         REAL NOT NULL,
@@ -387,6 +407,11 @@ class MessageStore:
                     "CREATE INDEX IF NOT EXISTS idx_group_time "
                     "ON group_messages(group_id, created_at DESC)"
                 )
+                with contextlib.suppress(sqlite3.OperationalError):
+                    conn.execute(
+                        "ALTER TABLE group_messages "
+                        "ADD COLUMN msgid2 TEXT NOT NULL DEFAULT ''"
+                    )
                 self._group_db_initialized = True
         except sqlite3.Error as exc:
             logger.debug("[infoflow:message_store] schema init deferred: %s", exc)
@@ -530,9 +555,9 @@ class MessageStore:
                     """
                     INSERT INTO group_messages (
                         message_id, group_id, sender_id, sender_name, sender_imid,
-                        sender_is_bot, is_inbound, bot_was_mentioned,
+                        sender_is_bot, is_inbound, bot_was_mentioned, msgid2,
                         text, digest, created_at, raw_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(message_id) DO UPDATE SET
                         group_id          = excluded.group_id,
                         sender_id         = excluded.sender_id,
@@ -541,6 +566,7 @@ class MessageStore:
                         sender_is_bot     = excluded.sender_is_bot,
                         is_inbound        = excluded.is_inbound,
                         bot_was_mentioned = excluded.bot_was_mentioned,
+                        msgid2            = excluded.msgid2,
                         text              = excluded.text,
                         digest            = excluded.digest,
                         created_at        = excluded.created_at,
@@ -550,7 +576,7 @@ class MessageStore:
                         rec.message_id, rec.group_id, rec.sender_id,
                         rec.sender_name, rec.sender_imid,
                         int(rec.sender_is_bot), int(rec.is_inbound),
-                        int(rec.bot_was_mentioned),
+                        int(rec.bot_was_mentioned), rec.msgid2,
                         rec.text, rec.digest, rec.created_at, rec.raw_json,
                     ),
                 )
@@ -609,7 +635,10 @@ class MessageStore:
         if bot_mentioned_only:
             conditions.append("bot_was_mentioned = 1")
         where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
-        sql = f"SELECT * FROM group_messages{where} ORDER BY created_at DESC LIMIT ?"
+        sql = (
+            f"SELECT {_GROUP_COLUMNS_SQL} FROM group_messages{where} "
+            "ORDER BY created_at DESC LIMIT ?"
+        )
         params.append(limit)
         with self._db_lock:
             conn = self._connect()
@@ -631,7 +660,7 @@ class MessageStore:
 
         列顺序与 CREATE TABLE group_messages 一致：
         message_id, group_id, sender_id, sender_name, sender_imid,
-        sender_is_bot, is_inbound, bot_was_mentioned,
+        sender_is_bot, is_inbound, bot_was_mentioned, msgid2,
         text, digest, created_at, raw_json
         """
         return GroupMessageRecord(
@@ -643,10 +672,11 @@ class MessageStore:
             sender_is_bot=bool(row[5]),
             is_inbound=bool(row[6]),
             bot_was_mentioned=bool(row[7]),
-            text=str(row[8] or ""),
-            digest=str(row[9] or ""),
-            created_at=float(row[10] or 0),
-            raw_json=str(row[11] or ""),
+            msgid2=str(row[8] or ""),
+            text=str(row[9] or ""),
+            digest=str(row[10] or ""),
+            created_at=float(row[11] or 0),
+            raw_json=str(row[12] or ""),
         )
 
     # ------------------------------------------------------------------
