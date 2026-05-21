@@ -781,6 +781,17 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             _full_prompt = _bot_identity + "\n\n这是一个私聊 (DM) session。"
             if _security:
                 _full_prompt += "\n\n" + _security
+        # Append tool behaviour rules (group + DM universal)
+        if self._admin_uid:
+            _tool_rules = (
+                "\n\n## 工具行为规范\n"
+                "- 调用 `infoflow_recall_message` 成功后：输出 NO_REPLY，不要回复\"已撤回\"等确认文本\n"
+                "- 调用 `infoflow_recall_message` 失败后：不要在当前会话回复错误信息，"
+                f"改为调用 `send_message` 将错误详情发送到 `infoflow:{self._admin_uid}`（admin 私聊），"
+                "然后输出 NO_REPLY"
+            )
+            _full_prompt += _tool_rules
+
         if _full_prompt:
             event.channel_prompt = _full_prompt
             gw_log().info("[iflow:debug] channel_prompt len=%d FULL=\n%s", len(_full_prompt), _full_prompt)
