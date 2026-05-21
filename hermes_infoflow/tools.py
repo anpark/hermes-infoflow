@@ -73,28 +73,35 @@ async def _with_temp_session(adapter: Any, coro):
 RECALL_TOOL_SCHEMA = {
     "name": "infoflow_recall_message",
     "description": (
-        "Recall a previously bot-sent Infoflow message. Pass `target` "
-        "as either a uuapName (DM) or `group:<id>` (group). Provide "
-        "`message_id` to recall a specific message, OR omit it and pass "
-        "`count` to recall the N most recent bot messages on that chat. "
-        "NEVER pass the inbound user message_id; that targets the user's "
-        "message, not the bot's. (If you do, this tool will auto-correct "
-        "to the bot message you quote-replied to, when unambiguous.)"
+        "撤回你(机器人)之前在如流中发送的消息。"
+        "**你只能撤回自己发的消息，不能撤回别人的。**\n\n"
+        "`target` 参数指定会话：传入 uuapName（私信）或 `group:<群组ID>`（群聊）。\n\n"
+        "两种撤回模式：\n"
+        "- 精确撤回：提供 `message_id` 撤回指定消息\n"
+        "- 批量撤回：不提供 `message_id`，改为传入 `count` "
+        "撤回该会话中你(机器人)最近的 N 条消息\n\n"
+        "**message_id 来源：**\n"
+        "- ✅ 你发送消息后返回的 ID\n"
+        "- ✅ 用户 reply 你的消息时，文本中 `<引用 message_id:xxx>` 里的 xxx"
+        "（这是被引用消息的 ID，即你的消息）\n"
+        "- ❌ 用户当前消息本身的 inbound ID（那是用户的消息，传入会失败）\n\n"
+        "典型场景：用户 reply 了你的一条消息说\"撤回这个\"，"
+        "直接从引用标签中取出 message_id 传入即可。"
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "target": {
                 "type": "string",
-                "description": "uuapName (DM) or group:<id> (group)",
+                "description": "目标会话。私信传 `infoflow:<uuapName>`，群聊传 `infoflow:group:<群组ID>`",
             },
             "message_id": {
                 "type": "string",
-                "description": "Optional: the specific bot message id to recall",
+                "description": "要撤回的消息 ID（必须是你自己发出消息后返回的 ID）。与 `count` 二选一",
             },
             "count": {
                 "type": "integer",
-                "description": "Number of most-recent bot messages to recall (default 1)",
+                "description": "撤回该会话中你(机器人)最近发送的 N 条消息（1-10）。省略 `message_id` 时使用",
                 "minimum": 1,
                 "maximum": 10,
                 "default": 1,
@@ -119,11 +126,13 @@ def tool_result_json(payload: dict[str, Any]) -> str:
 REPLY_TOOL_SCHEMA = {
     "name": "infoflow_reply",
     "description": (
-        "Reply to or quote a specific Infoflow message with a preview of the "
-        "original message. Unlike send_message, this tool supports replying to a "
-        "specific message (the preview shows the original message text). "
-        "If `reply_to` is omitted, automatically replies to the current inbound "
-        "message that triggered this turn."
+        "引用回复如流中的某条消息，回复内容会附带原消息的文本预览。"
+        "与普通 `send_message` 的区别在于：这里发出的消息会显示"
+        "「引用了某条消息」的卡片样式。\n\n"
+        "使用场景：\n"
+        "- 需要针对特定历史消息进行回应时\n"
+        "- 需要让对方明确知道你在回复哪条消息时\n\n"
+        "若省略 `reply_to`，自动引用触发本轮对话的那条用户消息。"
     ),
     "parameters": {
         "type": "object",
@@ -131,28 +140,24 @@ REPLY_TOOL_SCHEMA = {
             "target": {
                 "type": "string",
                 "description": (
-                    "Chat target in infoflow format: uuapName (DM) or group:<id> (group). "
-                    "Omit to send to the home channel."
+                    "目标会话（可选）。私信传 `infoflow:<uuapName>`，"
+                    "群聊传 `infoflow:group:<群组ID>`。省略则发送到当前会话"
                 ),
             },
             "message": {
                 "type": "string",
-                "description": "The reply text to send.",
+                "description": "回复的消息正文内容，支持 Markdown",
             },
             "reply_to": {
                 "type": "string",
-                "description": (
-                    "The Infoflow message_id to reply/quote. "
-                    "If omitted, automatically replies to the inbound user message that "
-                    "triggered this turn."
-                ),
+                "description": "要引用的消息 ID（可选）。省略时自动引用触发本轮的用户消息",
             },
             "reply_type": {
                 "type": "string",
                 "enum": ["1", "2"],
                 "description": (
-                    "'1' = reply (引用回复, default), '2' = quote (仅引用, no notification). "
-                    "Both show the original message preview."
+                    "`1` = 回复并通知（默认，对方收到通知，显示引用原文预览）；"
+                    "`2` = 仅引用（显示引用原文预览，但对方不收到通知）"
                 ),
                 "default": "1",
             },
@@ -255,6 +260,10 @@ def make_recall_handler():
             count = 1
         if not target:
             return tool_result_json({"error": "target is required"})
+
+        # Strip ``infoflow:`` prefix if present (adapter expects raw chat_id).
+        if target.startswith("infoflow:"):
+            target = target[len("infoflow:"):]
 
         adapter = _get_live_adapter()
         if adapter is None:
