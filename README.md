@@ -177,6 +177,61 @@ http://127.0.0.1:8646/webhook/infoflow/dashboard
 
 ---
 
+## Session Tracker（终端风格实时视图）
+
+在 webhook 同一端口上提供 **可通过反代访问** 的只读 Web UI，按群或私聊目标跟踪单个 Hermes session，以 CLI 风格终端展示 tool 行、Hermes 回复框与状态行。
+
+### 访问地址
+
+```
+/webhook/infoflow/sessiontracker?chatType=2&chatId=<群ID>
+/webhook/infoflow/sessiontracker?chatType=7&chatId=<占位>&code=<私聊code>
+```
+
+示例（私聊需有效 `code`，由如流 OAuth 回调提供）：
+
+```
+https://<your-domain>/webhook/infoflow/sessiontracker?chatType=7&chatId=3950087625&code=2cecba82ba9686cb75596bfbe5637f03
+```
+
+- `chatType=2`：群聊，`chatId` 为群号 → 目标 `group:{chatId}`
+- `chatType=7`：私聊，必须带 `code`；插件调用 Infoflow `getuserinfo` 解析为 uuap（`UserId`）作为 DM 目标
+
+详见 [docs/infoflow-getuserinfo-api.md](docs/infoflow-getuserinfo-api.md)。
+
+### 与 Dashboard 的区别
+
+| | Dashboard | Session Tracker |
+|---|-----------|-----------------|
+| 路径 | `{WEBHOOK_PATH}/dashboard` | `{WEBHOOK_PATH}/sessiontracker` |
+| 访问 | 仅 localhost | 可经反代（`code_auth`：私聊需有效 code） |
+| 视图 | Session 列表 + 事件时间线 | 单目标 CLI 终端 + 自动滚动 |
+
+### 展示粒度（Phase A）
+
+当前 **不改 hermes-agent**，通过插件 hooks + outbound 启发式复刻 CLI 输出：
+
+- `post_tool_call`：尽量用 `agent.display.get_cute_tool_message` 生成 tool 行
+- `post_llm_call`：Hermes 回复框
+- `post_api_request`：模型 / token 状态行
+- `outbound.infoflow` 中含 tool emoji 的短文本当作 progress 镜像
+
+**局限**：无逐 token 流式、无 thinking spinner；interim 句仅在最终 `post_llm_call` 出现。
+
+### Phase B（可选，需改 hermes-agent）
+
+在 `hermes_cli/plugins.py` 增加并在 `gateway/run.py` 调用：
+
+- `on_tool_progress` — gateway tool progress 回调
+- `on_stream_delta` — 流式 delta
+- `on_interim_assistant` —  interim 助手句
+
+注册后 Session Tracker 可接近 CLI/TUI 体验。
+
+关闭：`INFOFLOW_SESSIONTRACKER_ENABLED=false`。
+
+---
+
 ## Infoflow 后台 webhook 设置
 
 进入如流企业后台的应用页面，把回调地址填成：

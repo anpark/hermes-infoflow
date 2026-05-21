@@ -150,3 +150,7 @@ optional_env:
     description: "Max events kept per session in dashboard memory (default 2000)"
     prompt: "Dashboard event buffer size"
     password: false
+  - name: INFOFLOW_SESSIONTRACKER_ENABLED
+    description: "Enable Session Tracker Web UI at /webhook/infoflow/sessiontracker (default true)"
+    prompt: "Session Tracker enabled? (true/false)"
+    password: false

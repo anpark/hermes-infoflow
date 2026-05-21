@@ -80,6 +80,7 @@ INFOFLOW_GROUP_RECALL_PATH = "/api/v1/robot/group/msgRecall"
 INFOFLOW_PRIVATE_RECALL_PATH = "/api/v1/app/message/revoke"
 INFOFLOW_EMOJI_ADD_PATH = "/api/v1/im/message/emoji/add"
 INFOFLOW_EMOJI_DEL_PATH = "/api/v1/im/message/emoji/del"
+INFOFLOW_GETUSERINFO_PATH = "/api/v1/app/user/getuserinfo"
 
 # In-memory token cache, keyed by appKey. Survives across InfoflowClient
 # instances within the same process — matches OpenClaw's module-level
@@ -245,6 +246,73 @@ async def get_app_access_token(
         now + max(60, expires_in - TOKEN_TTL_BUFFER_SECONDS),
     )
     return token
+
+
+async def get_user_info_by_code(
+    account: InfoflowAccountAPI,
+    code: str,
+    *,
+    session: aiohttp.ClientSession | None = None,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+) -> str:
+    """Resolve a private-chat ``code`` to the user's uuapName (``UserId``).
+
+    POST ``/api/v1/app/user/getuserinfo`` with body
+    ``{"agentid": <app_agent_id>, "code": "<code>"}``.
+
+    Raises
+    ------
+    InfoflowAPIError
+        On HTTP errors, top-level non-ok ``code``, or ``data.errcode != 0``.
+    ValueError
+        When ``app_agent_id`` is missing on *account*.
+    """
+    if not code or not str(code).strip():
+        raise ValueError("code is required")
+    agent_id = account.app_agent_id
+    if agent_id is None:
+        raise ValueError("app_agent_id is required for getuserinfo")
+
+    token = await get_app_access_token(account, session=session, timeout=timeout)
+    url = _join(account.api_host, INFOFLOW_GETUSERINFO_PATH)
+    payload = {"agentid": int(agent_id), "code": str(code).strip()}
+
+    async with _ensure_session(session) as sess, sess.post(
+        url,
+        json=payload,
+        timeout=aiohttp.ClientTimeout(total=timeout),
+        headers=_auth_headers(token),
+    ) as resp:
+        text = await resp.text()
+        if resp.status >= 400:
+            raise InfoflowAPIError(
+                f"getuserinfo HTTP {resp.status}: {text[:200]}"
+            )
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise InfoflowAPIError(f"getuserinfo response is not JSON: {exc}") from exc
+
+    top_code = data.get("code")
+    if top_code not in (None, "ok", 0):
+        raise InfoflowAPIError(
+            f"getuserinfo top-level code={top_code!r}: {text[:200]}"
+        )
+
+    inner = data.get("data") or {}
+    if not isinstance(inner, dict):
+        raise InfoflowAPIError(f"getuserinfo missing data object: {text[:200]}")
+
+    errcode = inner.get("errcode")
+    if errcode not in (None, 0):
+        raise InfoflowAPIError(
+            f"getuserinfo errcode={errcode} errmsg={inner.get('errmsg')}"
+        )
+
+    user_id = inner.get("UserId") or inner.get("userid") or inner.get("userId")
+    if not user_id:
+        raise InfoflowAPIError(f"getuserinfo missing UserId: {text[:200]}")
+    return str(user_id)
 
 
 def clear_token_cache() -> None:

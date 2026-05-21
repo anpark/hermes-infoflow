@@ -155,9 +155,14 @@ class WebhookServer:
         app.router.add_get("/health", _health_handler)
         if self._tracker is not None:
             from .dashboard import dashboard_enabled, register_routes
+            from .sessiontracker import register_sessiontracker_routes, sessiontracker_enabled
 
             if dashboard_enabled():
                 register_routes(app, self._tracker, base_path=self._webhook_path)
+            if sessiontracker_enabled():
+                register_sessiontracker_routes(
+                    app, self._tracker, base_path=self._webhook_path,
+                )
         self._runner = web.AppRunner(app)
         await self._runner.setup()
         self._site = web.TCPSite(self._runner, self._host, self._port)

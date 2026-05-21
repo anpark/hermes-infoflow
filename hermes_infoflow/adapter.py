@@ -31,8 +31,18 @@ import contextlib
 import contextvars
 import logging
 import os
+import re
 import socket as _socket
 from typing import Any
+
+_PROGRESS_LINE_RE = re.compile(r"^[┊\s]*[🔍⚙️💻🌐📁📝🧠✨]")
+
+
+def _looks_like_progress_line(text: str) -> bool:
+    t = (text or "").strip()
+    if not t or len(t) > 400:
+        return False
+    return bool(_PROGRESS_LINE_RE.match(t)) or "┊" in t[:20]
 
 import aiohttp
 
@@ -65,7 +75,7 @@ except ImportError:
 
 # ── Plugin modules ────────────────────────────────────────────────────
 
-from .dashboard import get_tracker
+from .dashboard import get_tracker, normalize_chat_id
 from .iftools import (
     RECALL_TOOL_SCHEMA,
     REPLY_TOOL_SCHEMA,
@@ -416,7 +426,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         tracker = getattr(self, "_tracker", None)
         if tracker is None:
             return
-        cid = chat_id
+        cid = normalize_chat_id(chat_id)
         if msg is not None:
             cid = cid or self._infoflow_chat_id(msg)
         payload: dict[str, Any] = {"chat_id": cid}
@@ -431,6 +441,12 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             })
         if extra:
             payload.update(extra)
+        if kind == "outbound.infoflow" and extra and extra.get("type") == "text":
+            preview = extra.get("preview")
+            if isinstance(preview, str) and preview:
+                payload["preview"] = preview[:200]
+                if extra.get("is_progress_hint"):
+                    payload["is_progress_hint"] = True
         tracker.push_event(
             "",
             kind,
@@ -857,17 +873,22 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 _mid, chat_id, len(content), bot_result.success,
             )
 
+        extra: dict[str, Any] = {
+            "type": "text",
+            "chars": len(content),
+            "success": bot_result.success,
+            "message_id": bot_result.message_id,
+            "error": bot_result.error,
+        }
+        if content and len(content) <= 500:
+            extra["preview"] = content[:200]
+            if _looks_like_progress_line(content):
+                extra["is_progress_hint"] = True
         self._push_infoflow_event(
             None,
             kind="outbound.infoflow",
             chat_id=chat_id,
-            extra={
-                "type": "text",
-                "chars": len(content),
-                "success": bot_result.success,
-                "message_id": bot_result.message_id,
-                "error": bot_result.error,
-            },
+            extra=extra,
         )
 
         if bot_result.success:

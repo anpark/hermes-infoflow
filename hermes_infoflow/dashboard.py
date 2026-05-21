@@ -160,14 +160,17 @@ class SessionTracker:
         meta.last_event_at = now
         if platform:
             meta.platform = platform
+        if meta.chat_id and chat_id and meta.chat_id != chat_id:
+            pass
+        elif chat_id:
+            meta.chat_id = chat_id
         if model:
             meta.model = model
-        if chat_id:
-            meta.chat_id = chat_id
 
         seq = self._seq.get(sid, 0) + 1
         self._seq[sid] = seq
-        ev = SessionEvent(seq=seq, ts=now, kind=kind, payload=dict(payload or {}))
+        safe_payload = _json_safe(payload or {})
+        ev = SessionEvent(seq=seq, ts=now, kind=kind, payload=safe_payload)
         buf = self._events.setdefault(sid, deque(maxlen=self._buffer_size))
         buf.append(ev)
         meta.n_events = len(buf)
@@ -237,6 +240,35 @@ class SessionTracker:
             "events": [e.to_dict() for e in self.snapshot(session_id, cursor)],
         }
 
+    def bind_latest_pending_to_session(self, session_id: str) -> str | None:
+        """Attach a lone ``pending:{chat_id}`` bucket to *session_id*.
+
+        When multiple pending buckets exist (concurrent chats), skip guessing
+        which chat belongs to this session — ``pre_gateway_dispatch`` should
+        bind via ``bind_chat`` instead.
+        """
+        if not session_id:
+            return None
+        pending_chats: list[str] = [
+            key[len("pending:"):]
+            for key in self._meta
+            if key.startswith("pending:")
+        ]
+        if len(pending_chats) != 1:
+            return None
+        chat_id = pending_chats[0]
+        self.bind_chat(chat_id, session_id)
+        return chat_id
+
+    def lookup_session_id(self, canonical_chat_id: str) -> str | None:
+        sid = self._chat_to_session.get(canonical_chat_id)
+        if sid and not sid.startswith("pending:"):
+            return sid
+        pending = f"pending:{canonical_chat_id}"
+        if pending in self._meta:
+            return pending
+        return None
+
 
 class contextlib_suppress:
     """Minimal suppress helper (avoid extra import for one line)."""
@@ -264,9 +296,36 @@ def dashboard_enabled() -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
+def sessiontracker_enabled() -> bool:
+    raw = os.getenv("INFOFLOW_SESSIONTRACKER_ENABLED", "true").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def normalize_chat_id(chat_id: str) -> str:
+    """``infoflow:group:1`` -> ``group:1``; DM ids unchanged."""
+    cid = (chat_id or "").strip()
+    if cid.startswith("infoflow:"):
+        return cid[len("infoflow:"):]
+    return cid
+
+
 # ---------------------------------------------------------------------------
 # Payload helpers
 # ---------------------------------------------------------------------------
+
+
+def _json_safe(value: Any) -> Any:
+    """Recursively coerce values for ``json.dumps`` / aiohttp JSON responses."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    try:
+        return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+    except Exception:
+        return str(value)
 
 
 def _trunc(value: Any, limit: int = MAX_TEXT_PREVIEW) -> Any:
@@ -314,12 +373,14 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
     def on_session_start(**kw: Any) -> None:
         sid = kw.get("session_id") or ""
         plat = _platform_str(kw.get("platform"))
+        bound_chat = tracker.bind_latest_pending_to_session(sid)
         tracker.push_event(
             sid,
             "session.start",
-            {"model": kw.get("model"), "platform": plat},
+            {"model": kw.get("model"), "platform": plat, "bound_chat_id": bound_chat},
             platform=plat,
             model=str(kw.get("model") or ""),
+            chat_id=bound_chat or "",
         )
 
     @_safe
@@ -376,11 +437,19 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
     def post_llm_call(**kw: Any) -> None:
         sid = kw.get("session_id") or ""
         plat = _platform_str(kw.get("platform"))
+        text = kw.get("assistant_response") or ""
+        tracker.push_event(
+            sid,
+            "display.hermes",
+            {"text": _trunc(text, MAX_TEXT_PREVIEW)},
+            platform=plat,
+            model=str(kw.get("model") or ""),
+        )
         tracker.push_event(
             sid,
             "llm.response",
             {
-                "assistant_response": _trunc(kw.get("assistant_response")),
+                "assistant_response": _trunc(text),
                 "model": kw.get("model"),
             },
             platform=plat,
@@ -390,11 +459,18 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
     @_safe
     def pre_tool_call(**kw: Any) -> None:
         sid = kw.get("session_id") or ""
+        tool_name = kw.get("tool_name") or ""
+        if tool_name == "terminal":
+            tracker.push_event(
+                sid,
+                "display.tool_line",
+                {"line": "┊ 💻 preparing terminal…"},
+            )
         tracker.push_event(
             sid,
             "tool.start",
             {
-                "tool_name": kw.get("tool_name"),
+                "tool_name": tool_name,
                 "args": _trunc(kw.get("args"), MAX_ARGS_PREVIEW),
                 "tool_call_id": kw.get("tool_call_id"),
                 "task_id": kw.get("task_id"),
@@ -404,15 +480,38 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
     @_safe
     def post_tool_call(**kw: Any) -> None:
         sid = kw.get("session_id") or ""
+        tool_name = kw.get("tool_name") or ""
+        args = kw.get("args") if isinstance(kw.get("args"), dict) else {}
+        duration_ms = kw.get("duration_ms") or 0
+        line = ""
+        try:
+            from agent.display import get_cute_tool_message
+
+            result = kw.get("result")
+            is_error = isinstance(result, str) and '"error"' in result[:200].lower()
+            line = get_cute_tool_message(
+                tool_name, args, float(duration_ms) / 1000.0,
+            )
+            if is_error:
+                line = f"{line} [error]"
+        except Exception:
+            line = f"┊ ⚙️ {tool_name}  {float(duration_ms) / 1000.0:.1f}s"
+        if line:
+            tracker.push_event(
+                sid,
+                "display.tool_line",
+                {"line": line},
+            )
         tracker.push_event(
             sid,
             "tool.end",
             {
-                "tool_name": kw.get("tool_name"),
-                "args": _trunc(kw.get("args"), MAX_ARGS_PREVIEW),
+                "tool_name": tool_name,
+                "args": _trunc(args, MAX_ARGS_PREVIEW),
                 "result": _trunc(kw.get("result"), MAX_ARGS_PREVIEW),
-                "duration_ms": kw.get("duration_ms"),
+                "duration_ms": duration_ms,
                 "tool_call_id": kw.get("tool_call_id"),
+                "_skip_fallback": True,
             },
         )
 
@@ -420,18 +519,33 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
     def post_api_request(**kw: Any) -> None:
         sid = kw.get("session_id") or ""
         plat = _platform_str(kw.get("platform"))
+        usage = _json_safe(kw.get("usage"))
+        model = str(kw.get("model") or "")
+        parts = [f"⚕ {model}" if model else "⚕ Hermes"]
+        if isinstance(usage, dict):
+            pt = usage.get("prompt_tokens") or usage.get("input_tokens")
+            ct = usage.get("completion_tokens") or usage.get("output_tokens")
+            if pt is not None and ct is not None:
+                parts.append(f"{pt}+{ct} tokens")
+        tracker.push_event(
+            sid,
+            "display.status",
+            {"line": " │ ".join(parts)},
+            platform=plat,
+            model=model,
+        )
         tracker.push_event(
             sid,
             "llm.usage",
             {
                 "api_duration": kw.get("api_duration"),
                 "finish_reason": kw.get("finish_reason"),
-                "usage": kw.get("usage"),
+                "usage": usage,
                 "api_call_count": kw.get("api_call_count"),
-                "model": kw.get("model"),
+                "model": model,
             },
             platform=plat,
-            model=str(kw.get("model") or ""),
+            model=model,
         )
 
     @_safe
@@ -445,7 +559,7 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
         if source is None:
             return
         plat = _platform_str(getattr(source, "platform", None))
-        chat_id = getattr(source, "chat_id", "") or ""
+        chat_id = normalize_chat_id(getattr(source, "chat_id", "") or "")
         chat_type = getattr(source, "chat_type", "") or ""
         user_id = getattr(source, "user_id", "") or ""
         session_id = ""
@@ -575,6 +689,12 @@ function fmtTime(ts) {
   return new Date(ts * 1000).toLocaleString();
 }
 
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s == null ? '' : String(s);
+  return d.innerHTML;
+}
+
 async function refresh() {
   try {
     const r = await fetch(apiBase + '/sessions?scope=' + encodeURIComponent(scope));
@@ -589,13 +709,14 @@ async function refresh() {
       const sid = s.session_id || '';
       const href = base + '/session/' + encodeURIComponent(sid);
       const st = (s.status || 'active');
+      const sidShort = sid.slice(0, 24) + (sid.length > 24 ? '…' : '');
       return `<tr>
-        <td><a href="${href}">${sid.slice(0, 24)}${sid.length > 24 ? '…' : ''}</a></td>
-        <td>${s.platform || '-'}</td>
-        <td>${s.chat_id || '-'}</td>
-        <td><span class="badge ${st}">${st}</span></td>
-        <td>${s.n_events || 0}</td>
-        <td>${fmtTime(s.last_event_at)}</td>
+        <td><a href="${esc(href)}">${esc(sidShort)}</a></td>
+        <td>${esc(s.platform || '-')}</td>
+        <td>${esc(s.chat_id || '-')}</td>
+        <td><span class="badge ${esc(st)}">${esc(st)}</span></td>
+        <td>${esc(s.n_events || 0)}</td>
+        <td>${esc(fmtTime(s.last_event_at))}</td>
       </tr>`;
     }).join('');
   } catch (e) {
@@ -704,19 +825,6 @@ es.addEventListener('snapshot', (msg) => {
   } catch (_) {}
 });
 
-fetch(apiBase + '/sessions/' + encodeURIComponent(SESSION_ID) + '?cursor=0')
-  .then(r => r.json())
-  .then(data => {
-    if (!data) return;
-    if (data.meta) {
-      const m = data.meta;
-      document.getElementById('meta-line').textContent =
-        (m.platform || '') + ' | ' + (m.chat_id || '') + ' | ' + (m.status || '') +
-        ' | model: ' + (m.model || '-');
-    }
-    (data.events || []).reverse().forEach(prependEvent);
-  })
-  .catch(() => {});
 </script>
 </body>
 </html>
