@@ -535,12 +535,38 @@ class Bot:
         msg: IncomingMessage,
         decision: PolicyDecision,
     ) -> dict[str, str] | None:
-        """Return reaction API params if this dispatch should show a processing emoji."""
-        if not msg.is_group or not msg.group_id or not msg.msgid2:
-            return None
+        """Return reaction API params if this dispatch should show a processing emoji.
+
+        Returns a kwargs dict consumable by ``serverapi.add_message_reaction``
+        and ``delete_message_reaction``. Both group (chat_type="group") and DM
+        (chat_type="dm") paths are supported.
+        """
         if not msg.message_id:
             return None
         if getattr(decision, "command_text", ""):
+            return None
+
+        # DM path: always eligible. Policy guarantees DM always dispatches, and
+        # the user wants every inbound DM to show a processing indicator until
+        # the bot replies (or finalizes silently).
+        if msg.is_dm:
+            from_uid = msg.dm_user_id or ""
+            if not from_uid or from_uid.startswith("IMID:"):
+                # Cannot resolve a uuapName for the emoji API.
+                return None
+            return {
+                "chat_type": "dm",
+                "group_id": None,
+                "base_msg_id": msg.message_id,
+                "msgid2": msg.msgid2 or "",
+                "from_uid": from_uid,
+                "emoji_code": _EMOJI_PROCESSING[0],
+                "emoji_desc": _EMOJI_PROCESSING[1],
+            }
+
+        # Group path: only react when the message is directly addressed to the
+        # bot or part of an engaged follow-up window.
+        if not msg.is_group or not msg.group_id or not msg.msgid2:
             return None
 
         trig = decision.trigger_reason or ""
@@ -561,6 +587,7 @@ class Bot:
         if not from_uid:
             return None
         return {
+            "chat_type": "group",
             "group_id": msg.group_id,
             "base_msg_id": msg.message_id,
             "msgid2": msg.msgid2,

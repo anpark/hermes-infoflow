@@ -587,27 +587,42 @@ class ServerAPI:
             return RecallResult(success=False, error=res.get("error") or "recall failed", raw_response=res)
 
     # ------------------------------------------------------------------
-    # Emoji reactions (group messages)
+    # Emoji reactions (group + DM messages)
     # ------------------------------------------------------------------
 
     async def add_message_reaction(
         self,
         *,
-        group_id: str,
         base_msg_id: str,
-        msgid2: str,
         from_uid: str,
+        msgid2: str = "",
+        chat_type: str = "group",
+        group_id: str | None = None,
         emoji_code: str = "d135",
         emoji_desc: str = "(qjp)",
         session: aiohttp.ClientSession | None = None,
     ) -> RecallResult:
-        """Add an emoji reaction to an inbound group message."""
+        """Add an emoji reaction.
+
+        ``chat_type="group"`` requires ``group_id``;
+        ``chat_type="dm"`` uses ``from_uid`` as the DM peer's uuapName and omits
+        ``group_id``.
+        """
+        gid: int | None = None
+        if chat_type == "group":
+            if group_id in (None, ""):
+                return RecallResult(success=False, error="group_id required for group reaction")
+            try:
+                gid = int(group_id)
+            except (TypeError, ValueError):
+                return RecallResult(success=False, error="group_id must be numeric")
         async with self._ensure_session(session) as sess:
             try:
                 res = await _api.add_message_reaction(
                     self._api_account,
+                    chat_type=chat_type,
                     from_uid=from_uid,
-                    group_id=int(group_id),
+                    group_id=gid,
                     base_msg_id=base_msg_id,
                     msgid2=msgid2,
                     emoji_code=emoji_code,
@@ -628,21 +643,31 @@ class ServerAPI:
     async def delete_message_reaction(
         self,
         *,
-        group_id: str,
         base_msg_id: str,
-        msgid2: str,
         from_uid: str,
+        msgid2: str = "",
+        chat_type: str = "group",
+        group_id: str | None = None,
         emoji_code: str = "d135",
         emoji_desc: str = "(qjp)",
         session: aiohttp.ClientSession | None = None,
     ) -> RecallResult:
-        """Remove an emoji reaction from a group message."""
+        """Remove an emoji reaction (group or DM, mirroring ``add_message_reaction``)."""
+        gid: int | None = None
+        if chat_type == "group":
+            if group_id in (None, ""):
+                return RecallResult(success=False, error="group_id required for group reaction")
+            try:
+                gid = int(group_id)
+            except (TypeError, ValueError):
+                return RecallResult(success=False, error="group_id must be numeric")
         async with self._ensure_session(session) as sess:
             try:
                 res = await _api.delete_message_reaction(
                     self._api_account,
+                    chat_type=chat_type,
                     from_uid=from_uid,
-                    group_id=int(group_id),
+                    group_id=gid,
                     base_msg_id=base_msg_id,
                     msgid2=msgid2,
                     emoji_code=emoji_code,

@@ -288,8 +288,9 @@ def test_recall_private_message_body_uses_json_dumps(monkeypatch):
     assert captured["headers"]["Authorization"] == "Bearer-TOK"
 
 
-def test_build_emoji_reaction_body() -> None:
+def test_build_emoji_reaction_body_group() -> None:
     body = api._build_emoji_reaction_body(
+        chat_type=2,
         from_uid="chengbo05",
         group_id=4507088,
         base_msg_id="1865794273048386548",
@@ -307,6 +308,43 @@ def test_build_emoji_reaction_body() -> None:
         "replyContent": "d135",
         "replyDesc": "(qjp)",
     }
+
+
+def test_build_emoji_reaction_body_dm_omits_chat_id() -> None:
+    """DM (chatType=7) must not include ``chatId`` — the API rejects it."""
+    body = api._build_emoji_reaction_body(
+        chat_type=7,
+        from_uid="chengbo05",
+        base_msg_id="1865798223458853292",
+        msgid2="300016044",
+        emoji_code="d135",
+        emoji_desc="(qjp)",
+    )
+    parsed = json.loads(body)
+    assert parsed == {
+        "fromUid": "chengbo05",
+        "chatType": 7,
+        "baseMsgId": "1865798223458853292",
+        "msgId2": 300016044,
+        "replyContent": "d135",
+        "replyDesc": "(qjp)",
+    }
+    assert "chatId" not in parsed
+
+
+def test_build_emoji_reaction_body_omits_empty_msgid2() -> None:
+    """``msgId2`` is optional and must be skipped when not provided."""
+    body = api._build_emoji_reaction_body(
+        chat_type=7,
+        from_uid="chengbo05",
+        base_msg_id="1865798223458853292",
+        msgid2="",
+        emoji_code="d135",
+        emoji_desc="(qjp)",
+    )
+    parsed = json.loads(body)
+    assert "msgId2" not in parsed
+    assert parsed["chatType"] == 7
 
 
 def test_build_private_payload_image_uses_native_msgtype() -> None:

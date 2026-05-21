@@ -8,9 +8,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from hermes_infoflow.bot import Bot
-from hermes_infoflow.itypes import IncomingMessage
+from hermes_infoflow.itypes import IncomingMessage, RecallResult
 from hermes_infoflow.policy import Action, GroupPolicy, PolicyDecision
-from hermes_infoflow.itypes import RecallResult
 
 
 def _group_msg(**kwargs) -> IncomingMessage:
@@ -21,6 +20,18 @@ def _group_msg(**kwargs) -> IncomingMessage:
         sender_id="bob",
         msgid2="300014580",
         bot_was_mentioned=True,
+    )
+    defaults.update(kwargs)
+    return IncomingMessage(**defaults)
+
+
+def _dm_msg(**kwargs) -> IncomingMessage:
+    defaults = dict(
+        message_id="1865798223458853292",
+        text="hi",
+        dm_user_id="chengbo05",
+        sender_id="chengbo05",
+        msgid2="300016044",
     )
     defaults.update(kwargs)
     return IncomingMessage(**defaults)
@@ -60,10 +71,12 @@ def test_reaction_handle_bot_mentioned() -> None:
     )
     h = bot._build_reaction_handle(msg, decision)
     assert h is not None
+    assert h["chat_type"] == "group"
     assert h["from_uid"] == "bob"
     assert h["msgid2"] == "300014580"
     assert h["base_msg_id"] == "1865794273048386548"
     assert h["emoji_code"] == "d135"
+    assert h["group_id"] == "4507088"
 
 
 def test_reaction_handle_followup_engaged() -> None:
@@ -286,3 +299,96 @@ async def test_dispatch_handle_error_schedules_fallback_cleanup() -> None:
 
     bot._serverapi.delete_message_reaction.assert_not_awaited()
     bot._schedule_reaction_fallback_cleanup.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# DM reaction lifecycle
+# ---------------------------------------------------------------------------
+
+
+def test_reaction_handle_dm_always_eligible() -> None:
+    bot = _bot()
+    msg = _dm_msg()
+    decision = PolicyDecision(
+        should_dispatch=True,
+        action=Action.DISPATCH,
+        trigger_reason="direct-message",
+    )
+    h = bot._build_reaction_handle(msg, decision)
+    assert h is not None
+    assert h["chat_type"] == "dm"
+    assert h["group_id"] is None
+    assert h["from_uid"] == "chengbo05"
+    assert h["msgid2"] == "300016044"
+    assert h["base_msg_id"] == "1865798223458853292"
+
+
+def test_reaction_handle_dm_without_msgid2_still_eligible() -> None:
+    """DM emoji API accepts an empty ``msgId2`` — never block on it."""
+    bot = _bot()
+    msg = _dm_msg(msgid2="")
+    decision = PolicyDecision(
+        should_dispatch=True,
+        action=Action.DISPATCH,
+        trigger_reason="direct-message",
+    )
+    h = bot._build_reaction_handle(msg, decision)
+    assert h is not None
+    assert h["msgid2"] == ""
+
+
+def test_reaction_handle_dm_skipped_when_dm_user_degraded() -> None:
+    bot = _bot()
+    msg = _dm_msg(dm_user_id="IMID:abc")
+    decision = PolicyDecision(
+        should_dispatch=True,
+        action=Action.DISPATCH,
+        trigger_reason="direct-message",
+    )
+    assert bot._build_reaction_handle(msg, decision) is None
+
+
+def test_reaction_handle_dm_skipped_for_slash_command() -> None:
+    bot = _bot()
+    msg = _dm_msg()
+    decision = PolicyDecision(
+        should_dispatch=True,
+        action=Action.DISPATCH,
+        trigger_reason="slash_command",
+        command_text="/new",
+    )
+    assert bot._build_reaction_handle(msg, decision) is None
+
+
+@pytest.mark.asyncio
+async def test_dispatch_dm_adds_reaction_and_deletes_on_reply() -> None:
+    bot = _bot()
+    msg = _dm_msg()
+    decision = PolicyDecision(
+        should_dispatch=True,
+        action=Action.DISPATCH,
+        trigger_reason="direct-message",
+    )
+    adapter = MagicMock()
+    adapter.build_message_event = AsyncMock(return_value={"event": True})
+
+    # Use NO_REPLY sentinel so the test exits the send path via
+    # _delete_current_reaction_promise without needing the gateway truncate util.
+    async def _handle_message(_event):
+        await bot.send_message(dm_user_id="chengbo05", text="NO_REPLY")
+
+    adapter.handle_message = AsyncMock(side_effect=_handle_message)
+
+    await bot.dispatch_inbound(msg, decision, adapter)
+
+    bot._serverapi.add_message_reaction.assert_awaited_once()
+    add_kwargs = bot._serverapi.add_message_reaction.await_args.kwargs
+    assert add_kwargs["chat_type"] == "dm"
+    assert add_kwargs["group_id"] is None
+    assert add_kwargs["from_uid"] == "chengbo05"
+
+    bot._serverapi.delete_message_reaction.assert_awaited_once()
+    del_kwargs = bot._serverapi.delete_message_reaction.await_args.kwargs
+    assert del_kwargs["chat_type"] == "dm"
+    assert del_kwargs["from_uid"] == "chengbo05"
+    assert del_kwargs["group_id"] is None

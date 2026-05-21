@@ -93,6 +93,55 @@ def test_private_message_decrypts_and_extracts_msg_id(account):
     assert inbound.was_mentioned is True
 
 
+def test_private_message_extracts_msgid2(account):
+    """DM webhook carries top-level ``MsgId2`` used by the emoji reaction API."""
+    acct, raw_key = account
+    inner = json.dumps(
+        {
+            "FromUserId": "chengbo05",
+            "FromUserName": "Chengbo",
+            "MsgType": "text",
+            "Content": "hi",
+            "MsgId": "1865798223458853292",
+            "MsgId2": "300016044",
+            "CreateTime": 1_700_000_000,
+        }
+    )
+    ct = aes_ecb_encrypt_b64url(inner, raw_key)
+    body = urlencode({"messageJson": json.dumps({"Encrypt": ct})})
+    res = parser.parse_webhook(
+        content_type="application/x-www-form-urlencoded",
+        raw_body=body,
+        account=acct,
+    )
+    assert res.kind == "message"
+    inbound = res.inbound
+    assert inbound.chat_type == "dm"
+    assert inbound.msgid2 == "300016044"
+    assert inbound.message_id == "1865798223458853292"
+
+
+def test_private_message_without_msgid2_defaults_empty(account):
+    acct, raw_key = account
+    inner = json.dumps(
+        {
+            "FromUserId": "alice",
+            "Content": "hi",
+            "MsgId": "1865798223458853292",
+            "CreateTime": 1_700_000_000,
+        }
+    )
+    ct = aes_ecb_encrypt_b64url(inner, raw_key)
+    body = urlencode({"messageJson": json.dumps({"Encrypt": ct})})
+    res = parser.parse_webhook(
+        content_type="application/x-www-form-urlencoded",
+        raw_body=body,
+        account=acct,
+    )
+    assert res.kind == "message"
+    assert res.inbound.msgid2 == ""
+
+
 def test_private_message_missing_encrypt_field(account):
     acct, _ = account
     body = urlencode({"messageJson": json.dumps({"NotEncrypt": "..."})})

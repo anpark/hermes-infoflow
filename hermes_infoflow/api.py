@@ -803,122 +803,184 @@ async def recall_private_message(
 
 def _build_emoji_reaction_body(
     *,
+    chat_type: int,
     from_uid: str,
-    group_id: int,
     base_msg_id: str,
     msgid2: str,
     emoji_code: str,
     emoji_desc: str,
+    group_id: int | None = None,
 ) -> str:
-    """Hand-build JSON for emoji API so large numeric IDs stay precise."""
-    return (
-        f'{{"fromUid":{json.dumps(from_uid)},'
-        f'"chatType":2,"chatId":{group_id},'
-        f'"baseMsgId":{json.dumps(str(base_msg_id))},'
-        f'"msgId2":{int(msgid2)},'
-        f'"replyContent":{json.dumps(emoji_code)},'
-        f'"replyDesc":{json.dumps(emoji_desc)}}}'
+    """Hand-build JSON for emoji API so large numeric IDs stay precise.
+
+    Group (``chat_type=2``) requires ``group_id`` (sent as ``chatId``);
+    DM (``chat_type=7``) omits ``chatId`` entirely and the ``fromUid`` carries
+    the DM peer's uuapName. ``msgId2`` is included only when supplied (the
+    Infoflow doc marks it optional for both group and DM scenarios).
+    """
+    parts: list[str] = [f'"fromUid":{json.dumps(from_uid)}']
+    parts.append(f'"chatType":{int(chat_type)}')
+    if group_id is not None:
+        parts.append(f'"chatId":{int(group_id)}')
+    parts.append(f'"baseMsgId":{json.dumps(str(base_msg_id))}')
+    if msgid2:
+        try:
+            parts.append(f'"msgId2":{int(msgid2)}')
+        except (TypeError, ValueError):
+            # Non-numeric msgid2 — skip rather than break the request.
+            pass
+    parts.append(f'"replyContent":{json.dumps(emoji_code)}')
+    parts.append(f'"replyDesc":{json.dumps(emoji_desc)}')
+    return "{" + ",".join(parts) + "}"
+
+
+def _resolve_emoji_chat_type(chat_type: str | int) -> int:
+    """Normalize the chat_type argument to the integer the Infoflow API expects."""
+    if isinstance(chat_type, int):
+        return chat_type
+    s = str(chat_type or "").strip().lower()
+    if s in ("group", "g", "2"):
+        return 2
+    if s in ("dm", "private", "p2p", "7"):
+        return 7
+    raise ValueError(f"unsupported chat_type for emoji API: {chat_type!r}")
+
+
+async def _send_emoji_request(
+    account: InfoflowAccountAPI,
+    *,
+    path: str,
+    kind: str,
+    chat_type: str | int,
+    from_uid: str,
+    base_msg_id: str,
+    msgid2: str,
+    group_id: int | None,
+    emoji_code: str,
+    emoji_desc: str,
+    session: aiohttp.ClientSession | None,
+    timeout: float,
+) -> dict[str, Any]:
+    if not account.app_key or not account.app_secret:
+        return {"ok": False, "error": "Infoflow appKey/appSecret not configured"}
+    if not from_uid or not base_msg_id:
+        return {"ok": False, "error": "fromUid/baseMsgId required"}
+    try:
+        chat_type_int = _resolve_emoji_chat_type(chat_type)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    gid: int | None
+    if chat_type_int == 2:
+        if group_id in (None, ""):
+            return {"ok": False, "error": "groupId required for group reactions"}
+        try:
+            gid = int(group_id)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "groupId must be an integer"}
+    else:
+        gid = None
+
+    msgid2_str = str(msgid2) if msgid2 not in (None, "") else ""
+    if msgid2_str:
+        try:
+            int(msgid2_str)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "msgId2 must be an integer string when provided"}
+
+    try:
+        token = await get_app_access_token(account, session=session, timeout=timeout)
+    except InfoflowAPIError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    url = _join(account.api_host, path)
+    body = _build_emoji_reaction_body(
+        chat_type=chat_type_int,
+        from_uid=from_uid,
+        base_msg_id=base_msg_id,
+        msgid2=msgid2_str,
+        emoji_code=emoji_code,
+        emoji_desc=emoji_desc,
+        group_id=gid,
     )
+    gw_log().info(
+        "[infoflow:%s] chatType=%s chatId=%s baseMsgId=%s msgId2=%s",
+        kind,
+        chat_type_int,
+        gid if gid is not None else "-",
+        base_msg_id,
+        msgid2_str or "-",
+    )
+    headers = _auth_headers(token)
+
+    async with _ensure_session(session) as sess, sess.post(
+        url,
+        data=body.encode("utf-8"),
+        headers=headers,
+        timeout=aiohttp.ClientTimeout(total=timeout),
+    ) as resp:
+        text = await resp.text()
+    return _parse_recall_response(text, kind=kind)
 
 
 async def add_message_reaction(
     account: InfoflowAccountAPI,
     *,
     from_uid: str,
-    group_id: int,
     base_msg_id: str,
-    msgid2: str,
+    msgid2: str = "",
+    chat_type: str | int = "group",
+    group_id: int | None = None,
     emoji_code: str = "d135",
     emoji_desc: str = "(qjp)",
     session: aiohttp.ClientSession | None = None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
-    """Add an emoji reaction to a group message."""
-    if not account.app_key or not account.app_secret:
-        return {"ok": False, "error": "Infoflow appKey/appSecret not configured"}
-    if not from_uid or not base_msg_id or not msgid2:
-        return {"ok": False, "error": "fromUid/baseMsgId/msgId2 required"}
-    try:
-        gid = int(group_id)
-        mid2 = int(msgid2)
-    except (TypeError, ValueError):
-        return {"ok": False, "error": "groupId/msgId2 must be integers"}
-
-    try:
-        token = await get_app_access_token(account, session=session, timeout=timeout)
-    except InfoflowAPIError as exc:
-        return {"ok": False, "error": str(exc)}
-
-    url = _join(account.api_host, INFOFLOW_EMOJI_ADD_PATH)
-    body = _build_emoji_reaction_body(
+    """Add an emoji reaction to a group (``chat_type='group'``) or DM (``'dm'``) message."""
+    return await _send_emoji_request(
+        account,
+        path=INFOFLOW_EMOJI_ADD_PATH,
+        kind="emoji_add",
+        chat_type=chat_type,
         from_uid=from_uid,
-        group_id=gid,
         base_msg_id=base_msg_id,
-        msgid2=str(mid2),
+        msgid2=msgid2,
+        group_id=group_id,
         emoji_code=emoji_code,
         emoji_desc=emoji_desc,
+        session=session,
+        timeout=timeout,
     )
-    gw_log().info("[infoflow:emoji_add] group=%s baseMsgId=%s msgId2=%s", gid, base_msg_id, mid2)
-    headers = _auth_headers(token)
-
-    async with _ensure_session(session) as sess, sess.post(
-        url,
-        data=body.encode("utf-8"),
-        headers=headers,
-        timeout=aiohttp.ClientTimeout(total=timeout),
-    ) as resp:
-        text = await resp.text()
-    return _parse_recall_response(text, kind="emoji_add")
 
 
 async def delete_message_reaction(
     account: InfoflowAccountAPI,
     *,
     from_uid: str,
-    group_id: int,
     base_msg_id: str,
-    msgid2: str,
+    msgid2: str = "",
+    chat_type: str | int = "group",
+    group_id: int | None = None,
     emoji_code: str = "d135",
     emoji_desc: str = "(qjp)",
     session: aiohttp.ClientSession | None = None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
-    """Remove an emoji reaction from a group message."""
-    if not account.app_key or not account.app_secret:
-        return {"ok": False, "error": "Infoflow appKey/appSecret not configured"}
-    if not from_uid or not base_msg_id or not msgid2:
-        return {"ok": False, "error": "fromUid/baseMsgId/msgId2 required"}
-    try:
-        gid = int(group_id)
-        mid2 = int(msgid2)
-    except (TypeError, ValueError):
-        return {"ok": False, "error": "groupId/msgId2 must be integers"}
-
-    try:
-        token = await get_app_access_token(account, session=session, timeout=timeout)
-    except InfoflowAPIError as exc:
-        return {"ok": False, "error": str(exc)}
-
-    url = _join(account.api_host, INFOFLOW_EMOJI_DEL_PATH)
-    body = _build_emoji_reaction_body(
+    """Remove an emoji reaction from a group (``chat_type='group'``) or DM (``'dm'``) message."""
+    return await _send_emoji_request(
+        account,
+        path=INFOFLOW_EMOJI_DEL_PATH,
+        kind="emoji_del",
+        chat_type=chat_type,
         from_uid=from_uid,
-        group_id=gid,
         base_msg_id=base_msg_id,
-        msgid2=str(mid2),
+        msgid2=msgid2,
+        group_id=group_id,
         emoji_code=emoji_code,
         emoji_desc=emoji_desc,
+        session=session,
+        timeout=timeout,
     )
-    gw_log().info("[infoflow:emoji_del] group=%s baseMsgId=%s msgId2=%s", gid, base_msg_id, mid2)
-    headers = _auth_headers(token)
-
-    async with _ensure_session(session) as sess, sess.post(
-        url,
-        data=body.encode("utf-8"),
-        headers=headers,
-        timeout=aiohttp.ClientTimeout(total=timeout),
-    ) as resp:
-        text = await resp.text()
-    return _parse_recall_response(text, kind="emoji_del")
 
 
 def _parse_recall_response(response_text: str, *, kind: str) -> dict[str, Any]:

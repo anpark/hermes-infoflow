@@ -40,11 +40,22 @@ from .crypto import InfoflowCryptoError, decrypt_message, verify_echostr_signatu
 
 # Regex matches IDs with 16 or more digits — anything shorter is safe to
 # leave as a Python int. The capture groups are (field_name, digits).
-_ID_FIELD_RE = re.compile(r'"(messageid|msgid|MsgId|msgkey|msgseqid|fromid|msgid2)"\s*:\s*(\d{16,})')
+_ID_FIELD_RE = re.compile(
+    r'"(messageid|msgid|MsgId|msgkey|msgseqid|fromid|msgid2|MsgId2)"\s*:\s*(\d{16,})'
+)
 
 # Field names we patch through ``patch_precise_ids``. Listed here for
 # documentation; the regex is the authoritative source.
-ID_FIELDS = ("messageid", "msgid", "MsgId", "msgkey", "msgseqid", "fromid", "msgid2")
+ID_FIELDS = (
+    "messageid",
+    "msgid",
+    "MsgId",
+    "msgkey",
+    "msgseqid",
+    "fromid",
+    "msgid2",
+    "MsgId2",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +110,7 @@ class InboundMessage:
     message_id: str | None = None
     group_id: str | None = None       # numeric string, "" when DM
     msgseqid: str | None = None
-    msgid2: str = ""                  # top-level webhook msgid2 (group only; emoji API)
+    msgid2: str = ""                  # top-level webhook msgid2/MsgId2 (group + DM; emoji API)
     timestamp_ms: int | None = None
     raw_msgdata: dict[str, Any] = field(default_factory=dict)
     body_items: list[BodyItem] = field(default_factory=list)
@@ -476,6 +487,14 @@ def build_private_inbound(
     )
     message_id = _stringify(raw_msg_id) if raw_msg_id is not None else None
 
+    # Top-level MsgId2 (camelCase per DM webhook) — used by the emoji reaction API
+    # to disambiguate which message we're reacting to.  Falls back to lowercase
+    # ``msgid2`` (some legacy payloads) so the same DM build still works.
+    raw_msgid2 = msg_data.get("MsgId2")
+    if raw_msgid2 in (None, ""):
+        raw_msgid2 = msg_data.get("msgid2")
+    msgid2_str = _stringify(raw_msgid2) if raw_msgid2 not in (None, "") else ""
+
     raw_create_time = msg_data.get("CreateTime", msg_data.get("createtime"))
     if raw_create_time is not None:
         try:
@@ -539,6 +558,7 @@ def build_private_inbound(
         body_for_agent=body_for_agent,
         sender_name=sender_name,
         message_id=message_id,
+        msgid2=msgid2_str,
         timestamp_ms=timestamp_ms,
         raw_msgdata=msg_data,
         image_urls=image_urls,
