@@ -799,8 +799,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     # This goes into event.text → gateway sends it as user message,
                     # giving it much higher priority than system prompt content.
                     _sender_tag = _build_sender_tag(msg, admin_uid=self._admin_uid)
-                    _msg_tag = f"[Message message_id:{msg.message_id}]" if msg.message_id else "[Message]"
-                    text_for_agent = f"{prompt}\n\n{_sender_tag}\n{_msg_tag}\n{text_for_agent or ''}"
+                    text_for_agent = f"{prompt}\n\n{_sender_tag}\n[Message]\n{text_for_agent or ''}"
                 except Exception as exc:
                     gw_log().warning(
                         "[infoflow] failed to build follow-up context for %s: %s",
@@ -814,8 +813,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             _per_msg = getattr(decision, "per_message_prompt", "")
             if _per_msg:
                 _sender_tag = _build_sender_tag(msg, admin_uid=self._admin_uid)
-                _msg_tag = f"[Message message_id:{msg.message_id}]" if msg.message_id else "[Message]"
-                text_for_agent = f"{_per_msg}\n\n{_sender_tag}\n{_msg_tag}\n{text_for_agent or ''}"
+                text_for_agent = f"{_per_msg}\n\n{_sender_tag}\n[Message]\n{text_for_agent or ''}"
                 gw_log().info(
                     "[iflow:dispatch] mid=%s per_message_prompt_len=%d",
                     msg.message_id or "-", len(_per_msg),
@@ -837,8 +835,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         # double-injection risk — always inject unconditionally.
         if not msg.is_group:
             _dm_tag = _build_sender_tag(msg, admin_uid=self._admin_uid)
-            _msg_tag = f"[Message message_id:{msg.message_id}]" if msg.message_id else "[Message]"
-            text_for_agent = f"{_dm_tag}\n{_msg_tag}\n{text_for_agent or ''}"
+            text_for_agent = f"{_dm_tag}\n[Message]\n{text_for_agent or ''}"
 
         event = MessageEvent(
             text=text_for_agent,
@@ -1313,11 +1310,7 @@ def register(ctx: Any) -> None:
             "`metadata.mention_user_ids='u1,u2'`、"
             "`metadata.mention_agent_ids='17212,33333'`\n"
             "\n"
-            "【消息 ID】每条消息带有 `[Message message_id:xxx]` 标签，"
-            "其中 xxx 是该消息的唯一 ID（系统注入，可信）。"
-            "需要引用回复时将该 ID 传给 `infoflow_reply`。\\n"
-            "\\n"
-            "【消息中的引用标签】\\n"
+            "【消息中的引用标签】\n"
             "当用户回复（reply）某条消息时，你收到的文本格式为：\n"
             "`<引用 message_id:xxx>被引用消息的内容</引用> 用户的实际指令`\n"
             "其中 `message_id:xxx` 是**被引用消息的 ID**——"
