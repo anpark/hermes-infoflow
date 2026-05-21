@@ -28,12 +28,14 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
 from pathlib import Path
+from typing import Any
 
 DEFAULT_PACKAGE = "hermes-infoflow"
 DEFAULT_INDEX_URL = "https://pypi.org/simple"
@@ -134,6 +136,74 @@ def _resolve_pip_version_spec(package: str, version: str) -> str:
     return f"{package}=={version}"
 
 
+def _package_glob_stem(package_name: str) -> str:
+    """Return the normalized sdist stem for a package name or local path."""
+    stem = Path(package_name).name or DEFAULT_PACKAGE
+    return re.sub(r"[-_.]+", "_", stem).lower()
+
+
+def _ensure_plugin_enabled(config_file: Path, plugin_id: str, *, dry_run: bool) -> bool:
+    """Ensure ``plugins.enabled`` contains ``plugin_id``.
+
+    The main package installs PyYAML as a runtime dependency, so pip mode can
+    safely use it after the package install step.  Dry-run still works in a
+    bare tools environment by printing the intended change.
+    """
+    if dry_run:
+        print(f"$ ensure {plugin_id!r} is present in {config_file}:plugins.enabled")
+        return True
+
+    try:
+        import yaml
+    except ImportError as exc:
+        raise SystemExit(
+            "PyYAML is required to edit Hermes config. "
+            "Install hermes-infoflow first or run: pip install pyyaml"
+        ) from exc
+
+    def _load(path: Path) -> dict[str, Any]:
+        if not path.exists() or path.stat().st_size == 0:
+            return {}
+        parsed = yaml.safe_load(path.read_text(encoding="utf-8"))
+        if parsed is None:
+            return {}
+        if not isinstance(parsed, dict):
+            raise SystemExit(f"refusing to edit {path}: top-level YAML is not a mapping")
+        return parsed
+
+    data = _load(config_file)
+    plugins = data.setdefault("plugins", {})
+    if not isinstance(plugins, dict):
+        raise SystemExit("plugins: must be a mapping; refusing to edit")
+    enabled = plugins.get("enabled")
+    if enabled is None:
+        enabled = []
+    if not isinstance(enabled, list):
+        raise SystemExit(
+            f"plugins.enabled must be a list; got {type(enabled).__name__}"
+        )
+
+    current = [str(item) for item in enabled if isinstance(item, (str, int))]
+    if plugin_id in current:
+        print(f"[pip mode] no config change needed ({plugin_id} already enabled)")
+        return False
+
+    plugins["enabled"] = [*current, plugin_id]
+    data["plugins"] = plugins
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    config_file.write_text(
+        yaml.safe_dump(
+            data,
+            sort_keys=False,
+            allow_unicode=True,
+            default_flow_style=False,
+        ),
+        encoding="utf-8",
+    )
+    print(f"[pip mode] enabled {plugin_id} in {config_file}")
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Mode: extract
 # ---------------------------------------------------------------------------
@@ -143,7 +213,7 @@ def _find_sdist(tmp_dir: Path, package_name: str) -> Path:
     """Find the freshly-downloaded sdist tarball in ``tmp_dir``."""
     # pip download names tarballs after PEP 503 normalized form
     # (underscores instead of hyphens), e.g. hermes_infoflow-0.1.0.tar.gz.
-    normalized = package_name.replace("-", "_")
+    normalized = _package_glob_stem(package_name)
     candidates = sorted(tmp_dir.glob(f"{normalized}-*.tar.gz"))
     if candidates:
         return candidates[-1]
@@ -155,7 +225,7 @@ def _find_sdist(tmp_dir: Path, package_name: str) -> Path:
 
 def _extracted_dir(tmp_dir: Path, package_name: str) -> Path:
     """Return the path the sdist's contents were extracted to."""
-    normalized = package_name.replace("-", "_")
+    normalized = _package_glob_stem(package_name)
     matches = sorted(p for p in tmp_dir.iterdir() if p.is_dir() and p.name.startswith(normalized + "-"))
     if matches:
         return matches[-1]
@@ -165,38 +235,74 @@ def _extracted_dir(tmp_dir: Path, package_name: str) -> Path:
     raise SystemExit(f"failed to locate extracted package directory under {tmp_dir}")
 
 
+def _looks_like_local_path(value: str) -> bool:
+    """Return True iff *value* should be interpreted as a filesystem path.
+
+    A bare PyPI name (``hermes-infoflow``) must NEVER be treated as a path,
+    even when the cwd happens to contain a directory of the same name —
+    otherwise running ``hermes-infoflow-tools update`` from a parent of a
+    checkout would silently install from that checkout. Only treat as a
+    path when the value is explicitly written as one: absolute,
+    ``./...``, ``../...``, or ``~/...``.
+    """
+    if not value:
+        return False
+    if value.startswith(("/", "./", "../", "~")):
+        return True
+    return os.path.isabs(value)
+
+
 def _do_extract(args, hermes_home: Path) -> int:
     runner = _Runner(dry_run=args.dry_run)
     plugin_dir = hermes_home / "plugins" / args.channel_id
     config_file = hermes_home / "config.yaml"
+    local_source: Path | None = None
+    if _looks_like_local_path(args.package_name):
+        candidate = Path(args.package_name).expanduser()
+        if candidate.is_dir():
+            local_source = candidate
+    use_local_source = local_source is not None
 
     tmp_root = Path(tempfile.mkdtemp(prefix="hermes-infoflow-tools-"))
     try:
-        # 1) pip download sdist
-        spec = _resolve_pip_version_spec(args.package_name, args.version)
-        runner(
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "download",
-                "--no-deps",
-                "--no-binary=:all:",
-                "-d",
-                str(tmp_root),
-                "-i",
-                args.index_url,
-                spec,
-            ]
-        )
+        # 1) pip download sdist (skipped when --package-name points at a
+        # local directory checkout — handy for dev / private mirrors).
+        if use_local_source:
+            assert local_source is not None  # narrowed above
+            print(f"$ use local source {local_source.resolve()}")
+            if args.version not in ("", "latest"):
+                print(
+                    f"  note: --version {args.version!r} is ignored in local-source mode"
+                )
+        else:
+            spec = _resolve_pip_version_spec(args.package_name, args.version)
+            runner(
+                [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "download",
+                    "--no-deps",
+                    "--no-binary=:all:",
+                    "-d",
+                    str(tmp_root),
+                    "-i",
+                    args.index_url,
+                    spec,
+                ]
+            )
 
         # 2) Extract
-        if args.dry_run:
+        if use_local_source:
+            extracted_label = str(local_source.resolve())
+        elif args.dry_run:
             print(f"$ tar -xzf <sdist tarball under {tmp_root}>")
+            extracted_label = str(tmp_root / f"<extracted {args.package_name}>")
         else:
             tarball = _find_sdist(tmp_root, args.package_name)
             with tarfile.open(tarball, "r:gz") as tar:
                 _safe_extract(tar, tmp_root)
+            extracted_label = str(_extracted_dir(tmp_root, args.package_name))
 
         # 3) rsync into the plugin dir.
         #
@@ -214,11 +320,6 @@ def _do_extract(args, hermes_home: Path) -> int:
         # (``from .adapter import register``) and hermes-agent points the
         # loaded module's ``submodule_search_locations`` at ``plugin_dir``,
         # so the relative imports keep resolving after flattening.
-        if args.dry_run:
-            extracted_label = str(tmp_root / f"<extracted {args.package_name}>")
-        else:
-            extracted_label = str(_extracted_dir(tmp_root, args.package_name))
-
         runner(["mkdir", "-p", str(plugin_dir)])
         # Step 1: package contents → plugin_dir/ (flatten + clean stale files)
         runner(
@@ -327,34 +428,9 @@ def _do_pip(args, hermes_home: Path) -> int:
     )
 
     # The entry-point installer doesn't unpack plugin.yaml anywhere hermes
-    # will see it, so we *only* update plugins.enabled here. The user is
-    # responsible for setting INFOFLOW_* env vars themselves.
-    here = Path(__file__).resolve().parent
-    repo_root = here.parent.parent.parent
-    edit_script = repo_root / "scripts" / "lib" / "edit_hermes_config.py"
-    if not edit_script.exists():
-        # Fall back to whatever hermes plugin dir we may have installed
-        # earlier (dev convenience).
-        edit_script = hermes_home / "plugins" / args.channel_id / "scripts" / "lib" / "edit_hermes_config.py"
-    if not edit_script.exists():
-        print(
-            "[pip mode] note: edit_hermes_config.py not on disk; "
-            f"please add `{args.channel_id}` to plugins.enabled in "
-            f"{config_file} manually.",
-        )
-        return 0
-
-    edit_cmd = [
-        sys.executable,
-        str(edit_script),
-        "--config-file",
-        str(config_file),
-        "--plugin-id",
-        args.channel_id,
-    ]
-    if args.dry_run:
-        edit_cmd.append("--dry-run")
-    runner(edit_cmd)
+    # will see it, so we only update plugins.enabled here. Users still need
+    # to set INFOFLOW_* env vars themselves.
+    _ensure_plugin_enabled(config_file, args.channel_id, dry_run=args.dry_run)
 
     print(
         "[pip mode] plugin installed via entry-point. Reminder: hermes "

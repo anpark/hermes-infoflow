@@ -70,6 +70,10 @@ requires_env:
     password: false
 
 optional_env:
+  - name: INFOFLOW_ADMIN_USER
+    description: "Admin user's uuapName — only this user has full access to sensitive tools"
+    prompt: "Admin user uuapName"
+    password: false
   - name: INFOFLOW_APP_AGENT_ID
     description: "Infoflow agent ID (required for private-chat recall)"
     prompt: "Infoflow appAgentId"

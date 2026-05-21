@@ -21,7 +21,7 @@ the plugin was installed:
 1. ``hermes_infoflow/__init__.py`` is the **canonical source** of public
    exports.  This file must mirror its ``__all__`` and ``__version__``.
 2. When you add a new public symbol to ``hermes_infoflow/__init__.py``,
-   add the matching ``from hermes_infoflow.xxx import yyy`` line here.
+   add the matching ``from .hermes_infoflow.xxx import yyy`` line here.
 3. When you bump ``__version__`` in ``hermes_infoflow/__init__.py``,
    bump it here too.
 4. Never import from sibling ``*.py`` files at the repo root via relative
@@ -29,13 +29,25 @@ the plugin was installed:
    must go through ``hermes_infoflow``.
 """
 
-# Re-export the public API from the canonical sub-package.
-from hermes_infoflow import (  # noqa: F401
-    __version__,
-    __all__,
-    recall_inbound_message_id_hint_scope,
-    register,
-)
+# Re-export the public API from the canonical sub-package. Prefer a relative
+# import so hermes-agent can load this repo as an isolated plugin directory
+# without requiring the plugin root to be on sys.path. The absolute fallback
+# keeps pytest collection from importing this file as a nameless top-level
+# ``__init__`` module and failing before tests run.
+try:
+    from .hermes_infoflow import (  # type: ignore[import-not-found] # noqa: F401
+        __all__,
+        __version__,
+        recall_inbound_message_id_hint_scope,
+        register,
+    )
+except ImportError:
+    from hermes_infoflow import (  # noqa: F401
+        __all__,
+        __version__,
+        recall_inbound_message_id_hint_scope,
+        register,
+    )
 
 # Ensure ``__all__`` on this module matches the sub-package so that
 # ``from hermes_plugins.infoflow import *`` works identically.

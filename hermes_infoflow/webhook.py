@@ -9,15 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any
 
 from .parser import parse_webhook
 from .utils import gw_log
 
 if TYPE_CHECKING:
-    from aiohttp import web as _web_module
-
     from .itypes import IncomingMessage
     from .serverapi import ServerAPI
 

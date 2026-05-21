@@ -81,6 +81,7 @@ class IncomingMessage:
     # Dedup & ordering
     dedupe_key: str = ""
     msgseqid: str = ""  # Infoflow message sequence ID
+    msgid2: str = ""  # Top-level webhook msgid2 (group only; emoji API, not for LLM)
     timestamp: float = 0.0  # Unix timestamp
 
     # Robot discovery (populated when the message reveals the bot's own robotId)
@@ -119,7 +120,7 @@ class SendOptions:
     markdown: bool | None = None  # ``None`` = auto-detect from content
 
     @classmethod
-    def from_metadata(cls, metadata: dict[str, Any] | None) -> "SendOptions":
+    def from_metadata(cls, metadata: dict[str, Any] | None) -> SendOptions:
         """Translate Hermes send metadata into bot-layer send options."""
         options = cls()
         if not metadata:

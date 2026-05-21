@@ -27,6 +27,7 @@ this module is also importable in a hermes-free environment.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
 import logging
 import os
@@ -376,20 +377,16 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
 
     async def disconnect(self) -> None:
         self._running = False
-        try:
+        with contextlib.suppress(Exception):
             await self._webhook_server.stop()
-        except Exception:
-            pass
         await self._close_http_session()
         self._mark_disconnected()
         gw_log().info("[infoflow] Disconnected")
 
     async def _close_http_session(self) -> None:
         if self._http_session is not None:
-            try:
+            with contextlib.suppress(Exception):
                 await self._http_session.close()
-            except Exception:
-                pass
             self._http_session = None
             self._serverapi.http_session = None
 
@@ -492,9 +489,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     bt = (b.type or "").upper()
                     if bt == "AT" and not b.atall:
                         name = b.name or b.userid or b.robotid or "?"
-                        if b.robotid:
-                            _mention_parts.append(f"@{name}")
-                        elif b.userid:
+                        if b.robotid or b.userid:
                             _mention_parts.append(f"@{name}")
             if _mention_parts:
                 text_for_agent = f"（仅@了以下对象，无正文：{' '.join(_mention_parts)}）"
@@ -713,7 +708,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _is_session_valid(session: "aiohttp.ClientSession | None") -> bool:
+    def _is_session_valid(session: aiohttp.ClientSession | None) -> bool:
         """Check whether *session* is usable on the current event loop.
 
         ``aiohttp`` sessions are bound to the loop that created them.
@@ -736,7 +731,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         return session_loop is current_loop
 
     @staticmethod
-    def _effective_session(session: "aiohttp.ClientSession | None") -> "aiohttp.ClientSession | None":
+    def _effective_session(session: aiohttp.ClientSession | None) -> aiohttp.ClientSession | None:
         """Return *session* if valid on the current loop, else ``None``."""
         return session if InfoflowAdapter._is_session_valid(session) else None
 
@@ -771,7 +766,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         content: str,
         reply_to: str | None = None,
         metadata: dict[str, Any] | None = None,
-    ) -> "SendResult":
+    ) -> SendResult:
         """Send a text/markdown message (Hermes interface → bot layer)."""
         session = self._effective_session(self._http_session)
         kind, group_id, dm_user = self._parse_target(chat_id)
@@ -837,7 +832,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         caption: str | None = None,
         reply_to: str | None = None,
         metadata: dict[str, Any] | None = None,
-    ) -> "SendResult":
+    ) -> SendResult:
         """Send an image (Hermes interface → bot layer)."""
         session = self._effective_session(self._http_session)
         kind, group_id, dm_user = self._parse_target(chat_id)
@@ -888,7 +883,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         message_id: str | None = None,
         *,
         count: int = 1,
-    ) -> "SendResult":
+    ) -> SendResult:
         """Recall one or more bot-sent messages (Hermes interface → bot layer)."""
         session = self._effective_session(self._http_session)
         kind, group_id, dm_user = self._parse_target(chat_id)

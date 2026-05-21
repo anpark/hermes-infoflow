@@ -23,6 +23,7 @@ import contextlib
 import logging
 import time
 from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 import aiohttp
@@ -53,9 +54,6 @@ _MEMBERS_CACHE_TTL = 300  # 5 minutes
 # resolve_member_identity — unified member lookup with guarded fetch
 # ---------------------------------------------------------------------------
 
-from enum import Enum
-
-
 class CacheRetrievalPolicy(Enum):
     """Control when ``resolve_member_identity`` hits the network."""
     RETRIEVE_FROM_CACHE_ONLY = "cache_only"
@@ -76,7 +74,7 @@ async def resolve_member_identity(
     imid: str | None = None,
     cache_policy: CacheRetrievalPolicy = CacheRetrievalPolicy.RETRIEVE_FROM_CACHE_THEN_REMOTE,
     session: aiohttp.ClientSession | None = None,
-    serverapi: "ServerApi | None" = None,
+    serverapi: ServerAPI | None = None,
 ) -> dict:
     """Look up a group member by *any* of the provided identity fields.
 
@@ -87,8 +85,6 @@ async def resolve_member_identity(
     Multiple concurrent callers share the same in-flight task.
     A 3-second debounce suppresses redundant fetches after a successful one.
     """
-    import asyncio
-
     if not any(v is not None for v in (bot_name, agent_id, imid)):
         return {}
 
@@ -100,9 +96,7 @@ async def resolve_member_identity(
             return True
         if agent_id is not None and m.agent_id == agent_id:
             return True
-        if imid is not None and str(m.imid) == str(imid):
-            return True
-        return False
+        return imid is not None and str(m.imid) == str(imid)
 
     def _to_dict(m: GroupMember) -> dict:
         return {
@@ -324,6 +318,7 @@ class ServerAPI:
             body_items=list(parser_inbound.body_items),
             dedupe_key=parser_inbound.dedupe_key() or "",
             msgseqid=str(parser_inbound.msgseqid or ""),
+            msgid2=parser_inbound.msgid2 or "",
             timestamp=(parser_inbound.timestamp_ms or 0) / 1000.0,
             discovered_robot_id=parser_inbound.discovered_robot_id or None,
             is_at_only=parser_inbound.is_at_only,
@@ -590,6 +585,80 @@ class ServerAPI:
             if res.get("ok"):
                 return RecallResult(success=True, raw_response=res)
             return RecallResult(success=False, error=res.get("error") or "recall failed", raw_response=res)
+
+    # ------------------------------------------------------------------
+    # Emoji reactions (group messages)
+    # ------------------------------------------------------------------
+
+    async def add_message_reaction(
+        self,
+        *,
+        group_id: str,
+        base_msg_id: str,
+        msgid2: str,
+        from_uid: str,
+        emoji_code: str = "d135",
+        emoji_desc: str = "(qjp)",
+        session: aiohttp.ClientSession | None = None,
+    ) -> RecallResult:
+        """Add an emoji reaction to an inbound group message."""
+        async with self._ensure_session(session) as sess:
+            try:
+                res = await _api.add_message_reaction(
+                    self._api_account,
+                    from_uid=from_uid,
+                    group_id=int(group_id),
+                    base_msg_id=base_msg_id,
+                    msgid2=msgid2,
+                    emoji_code=emoji_code,
+                    emoji_desc=emoji_desc,
+                    session=sess,
+                )
+            except Exception as exc:
+                return RecallResult(success=False, error=str(exc))
+
+            if res.get("ok"):
+                return RecallResult(success=True, raw_response=res)
+            return RecallResult(
+                success=False,
+                error=res.get("error") or "emoji add failed",
+                raw_response=res,
+            )
+
+    async def delete_message_reaction(
+        self,
+        *,
+        group_id: str,
+        base_msg_id: str,
+        msgid2: str,
+        from_uid: str,
+        emoji_code: str = "d135",
+        emoji_desc: str = "(qjp)",
+        session: aiohttp.ClientSession | None = None,
+    ) -> RecallResult:
+        """Remove an emoji reaction from a group message."""
+        async with self._ensure_session(session) as sess:
+            try:
+                res = await _api.delete_message_reaction(
+                    self._api_account,
+                    from_uid=from_uid,
+                    group_id=int(group_id),
+                    base_msg_id=base_msg_id,
+                    msgid2=msgid2,
+                    emoji_code=emoji_code,
+                    emoji_desc=emoji_desc,
+                    session=sess,
+                )
+            except Exception as exc:
+                return RecallResult(success=False, error=str(exc))
+
+            if res.get("ok"):
+                return RecallResult(success=True, raw_response=res)
+            return RecallResult(
+                success=False,
+                error=res.get("error") or "emoji delete failed",
+                raw_response=res,
+            )
 
     # ------------------------------------------------------------------
     # Recall — DM

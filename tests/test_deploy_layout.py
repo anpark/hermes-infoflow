@@ -115,6 +115,27 @@ def test_plugin_yaml_at_root(deployed: Path) -> None:
     )
 
 
+def test_root_and_package_manifests_list_same_env_vars() -> None:
+    """The deployed manifest comes from the repo root, so keep both copies in sync."""
+    yaml = pytest.importorskip("yaml")
+    repo_root = Path(_REPO_ROOT)
+
+    root_manifest = yaml.safe_load((repo_root / "plugin.yaml").read_text(encoding="utf-8"))
+    package_manifest = yaml.safe_load(
+        (repo_root / "hermes_infoflow" / "plugin.yaml").read_text(encoding="utf-8")
+    )
+
+    def _env_names(manifest: dict, key: str) -> list[str]:
+        return [item["name"] for item in manifest.get(key, [])]
+
+    assert _env_names(root_manifest, "requires_env") == _env_names(
+        package_manifest, "requires_env"
+    )
+    assert _env_names(root_manifest, "optional_env") == _env_names(
+        package_manifest, "optional_env"
+    )
+
+
 def test_scripts_synced_for_extract_mode_reruns(deployed: Path) -> None:
     # `hermes-infoflow-tools update --mode extract` falls back to
     # plugin_dir/scripts/lib/deploy-common.sh on re-runs (the sdist
@@ -147,14 +168,10 @@ def test_config_yaml_enabled_plugin(deployed: Path) -> None:
 def test_flat_layout_loads_like_hermes_agent_does(deployed: Path) -> None:
     """Mimic ``hermes_cli/plugins.py::_load_directory_module`` end-to-end.
 
-    Skipped when hermes-agent isn't importable — same gating as
-    test_registration.py — because the package's adapter imports
-    ``gateway.platform_registry``. When it IS importable, this is the
-    most valuable test: it proves the flattened layout produces a
-    module hermes-agent can actually load and call ``register()`` on.
+    This proves the flattened layout produces a module hermes-agent can
+    import and find ``register()`` on. Calling ``register()`` itself still
+    requires hermes-agent runtime symbols.
     """
-    pytest.importorskip("gateway.platform_registry")
-
     init_file = deployed / "__init__.py"
     ns_parent = "hermes_plugins_test_layout"
     module_name = f"{ns_parent}.infoflow"
@@ -188,7 +205,7 @@ def test_flat_layout_loads_like_hermes_agent_does(deployed: Path) -> None:
                 sys.modules.pop(name, None)
 
 
-def test_plugins_install_layout_loads_like_hermes_agent_does(_REPO_ROOT) -> None:
+def test_plugins_install_layout_loads_like_hermes_agent_does() -> None:
     """Mimic ``hermes plugins install`` — repo root IS the plugin dir.
 
     ``hermes plugins install`` does ``git clone --depth 1`` + ``shutil.move``
@@ -200,12 +217,10 @@ def test_plugins_install_layout_loads_like_hermes_agent_does(_REPO_ROOT) -> None
     This test uses the actual repo root as the plugin dir — no flattening,
     no deploy.sh — to prove that path works.
     """
-    pytest.importorskip("gateway.platform_registry")
-
     repo_root = Path(_REPO_ROOT)
     init_file = repo_root / "__init__.py"
     assert init_file.is_file(), (
-        f"root __init__.py missing — hermes plugins install would fail"
+        "root __init__.py missing — hermes plugins install would fail"
     )
 
     ns_parent = "hermes_plugins_test_git_install"
@@ -245,59 +260,30 @@ def test_root_init_py_mirrors_package_exports() -> None:
     and pip installs behave identically.
     """
     repo_root = Path(_REPO_ROOT)
+    import hermes_infoflow
 
-    import ast
+    ns_parent = "hermes_plugins_test_root_exports"
+    module_name = f"{ns_parent}.infoflow"
+    ns_pkg = types.ModuleType(ns_parent)
+    ns_pkg.__path__ = []  # type: ignore[attr-defined]
+    ns_pkg.__package__ = ns_parent
+    sys.modules[ns_parent] = ns_pkg
 
-    root_init = ast.parse((repo_root / "__init__.py").read_text())
-    pkg_init = ast.parse(
-        (repo_root / "hermes_infoflow" / "__init__.py").read_text()
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        repo_root / "__init__.py",
+        submodule_search_locations=[str(repo_root)],
     )
-
-    # Extract __all__ lists
-    def _get_all(tree: ast.AST) -> list[str]:
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Assign):
-                for target in node.targets:
-                    if isinstance(target, ast.Name) and target.id == "__all__":
-                        if isinstance(node.value, ast.List):
-                            return [
-                                elt.value
-                                for elt in node.value.elts
-                                if isinstance(elt, ast.Constant)
-                                and isinstance(elt.value, str)
-                            ]
-        return []
-
-    root_all = _get_all(root_init)
-    pkg_all = _get_all(pkg_init)
-    assert root_all == pkg_all, (
-        f"root __init__.py __all__ ({root_all}) != "
-        f"hermes_infoflow/__init__.py __all__ ({pkg_all})"
-    )
-
-    # Extract __version__
-    def _get_version(tree: ast.AST) -> str | None:
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Assign):
-                for target in node.targets:
-                    if isinstance(target, ast.Name) and target.id == "__version__":
-                        if isinstance(node.value, ast.Constant):
-                            return node.value.value
-        return None
-
-    root_ver = _get_version(root_init)
-    pkg_ver = _get_version(pkg_init)
-    # Root __init__.py imports __version__ from hermes_infoflow rather than
-    # defining it inline, so _get_version returns None for the root.
-    # Verify that the import exists and the sub-package version is set.
-    assert pkg_ver is not None, "hermes_infoflow/__init__.py has no __version__"
-    # Verify root has a `from hermes_infoflow import ... __version__` import.
-    has_version_import = any(
-        isinstance(node, ast.ImportFrom)
-        and node.module == "hermes_infoflow"
-        and any(alias.name == "__version__" for alias in node.names)
-        for node in ast.walk(root_init)
-    )
-    assert has_version_import, (
-        "root __init__.py must import __version__ from hermes_infoflow"
-    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    module.__package__ = module_name
+    module.__path__ = [str(repo_root)]  # type: ignore[attr-defined]
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+        assert module.__all__ == hermes_infoflow.__all__
+        assert module.__version__ == hermes_infoflow.__version__
+    finally:
+        for name in list(sys.modules):
+            if name == ns_parent or name.startswith(ns_parent + "."):
+                sys.modules.pop(name, None)
