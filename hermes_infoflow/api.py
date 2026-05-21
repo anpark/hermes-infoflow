@@ -335,7 +335,7 @@ def _build_private_payload(to_user: str, contents: list[ContentItem]) -> dict[st
 # Pattern for extracting ID fields from raw JSON strings.
 # Infoflow uses 16+ digit integers that exceed JavaScript's Number.MAX_SAFE_INTEGER.
 # Using regex on raw JSON avoids precision loss from json.loads().
-_ID_EXTRACT_RE = re.compile(r'"(%s)"\s*:\s*"?(\d{10,})"?')
+_ID_EXTRACT_RE = re.compile(r'"(%s)"\s*:\s*"?(\d+)"?')
 
 
 def _extract_id(raw_json: str, *fields: str) -> str | None:
