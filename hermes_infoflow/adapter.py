@@ -612,6 +612,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             "sender_name": msg.sender_name,
             "sender_agent_id": getattr(msg, "sender_agent_id", ""),
         }
+        _prefix = ""
         if decision is not None:
             raw_message["policy_action"] = decision.action.value
             raw_message["policy_reason"] = decision.reason
@@ -646,7 +647,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                         _sender_engaged = self._policy.sender_engaged_recently(
                             msg.group_id, _engaged_key,
                         )
-                    prompt = build_follow_up_prompt(
+                    _prefix = build_follow_up_prompt(
                         fromid=msg.sender_imid,
                         sender_name=msg.sender_name or msg.sender_id,
                         is_bot=msg.sender_is_bot,
@@ -661,15 +662,9 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                         msg.message_id or "-", _template, _sender_engaged, msg.is_reply_to_bot,
                     )
                     gw_log().info(
-                        "[iflow:dispatch] mid=%s prompt_len=%d",
-                        msg.message_id or "-", len(prompt),
+                        "[iflow:dispatch] mid=%s prefix_len=%d",
+                        msg.message_id or "-", len(_prefix),
                     )
-                    # Inject follow-up context as prefix of the user message text.
-                    # This goes into event.text → gateway sends it as user message,
-                    # giving it much higher priority than system prompt content.
-                    _sender_tag = _build_sender_tag(msg, admin_uid=self._admin_uid)
-                    _mid_line = f"\n[message_id: {msg.message_id}]" if msg.message_id else ""
-                    text_for_agent = f"{prompt}\n\n{_sender_tag}{_mid_line}\n[Message]\n{text_for_agent or ''}"
                 except Exception as exc:
                     gw_log().warning(
                         "[infoflow] failed to build follow-up context for %s: %s",
@@ -682,9 +677,11 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             # user-message prefix guarantees the LLM evaluates the instruction.
             _per_msg = getattr(decision, "per_message_prompt", "")
             if _per_msg:
-                _sender_tag = _build_sender_tag(msg, admin_uid=self._admin_uid)
-                _mid_line = f"\n[message_id: {msg.message_id}]" if msg.message_id else ""
-                text_for_agent = f"{_per_msg}\n\n{_sender_tag}{_mid_line}\n[Message]\n{text_for_agent or ''}"
+                _prefix = (
+                    f"{_per_msg}"
+                    "\n但当工具/指令有明确行为要求时（如撤回成功后不发确认、静默完成等），"
+                    "以工具行为要求为准。"
+                )
                 gw_log().info(
                     "[iflow:dispatch] mid=%s per_message_prompt_len=%d",
                     msg.message_id or "-", len(_per_msg),
@@ -695,19 +692,16 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             _at_hint = "\n\n[注意] 用户 @ 了你但没有输入正文。如果上下文中没有与你相关的事项或待办任务，请主动询问用户有什么需要帮忙的。"
             text_for_agent = (text_for_agent or "") + _at_hint
 
-        # Log the complete user message sent to the LLM (gateway truncates to 80 chars)
-        gw_log().info(
-            "[iflow:user_message] mid=%s len=%d text=\n%s",
-            msg.message_id or "-", len(text_for_agent or ""), text_for_agent or "",
-        )
+        # Build envelope (Sender tag + [Message] separator) — unified for DM and group.
+        _sender_tag = _build_sender_tag(msg, admin_uid=self._admin_uid)
+        _mid_line = f"\n[message_id: {msg.message_id}]" if msg.message_id else ""
+        _envelope = f"{_sender_tag}{_mid_line}\n[Message]\n"
 
-        # DM: inject Sender tag + [Message] separator (matches group format).
-        # DM never enters follow-up / per_message_prompt branches, so no
-        # double-injection risk — always inject unconditionally.
-        if not msg.is_group:
-            _dm_tag = _build_sender_tag(msg, admin_uid=self._admin_uid)
-            _mid_line = f"\n[message_id: {msg.message_id}]" if msg.message_id else ""
-            text_for_agent = f"{_dm_tag}{_mid_line}\n[Message]\n{text_for_agent or ''}"
+        # Combine: prefix + envelope + text
+        if _prefix:
+            text_for_agent = f"{_prefix}\n\n{_envelope}{text_for_agent or ''}"
+        else:
+            text_for_agent = f"{_envelope}{text_for_agent or ''}"
 
         event = MessageEvent(
             text=text_for_agent,
@@ -784,11 +778,13 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         # Append tool behaviour rules (group + DM universal)
         if self._admin_uid:
             _tool_rules = (
-                "\n\n## 工具行为规范\n"
-                "- 调用 `infoflow_recall_message` 成功后：输出 NO_REPLY，不要回复\"已撤回\"等确认文本\n"
-                "- 调用 `infoflow_recall_message` 失败后：不要在当前会话回复错误信息，"
-                f"改为调用 `send_message` 将错误详情发送到 `infoflow:{self._admin_uid}`（admin 私聊），"
-                "然后输出 NO_REPLY"
+                "\n\n## 工具行为规范（最高优先级，覆盖所有「必须回复」规则）\n"
+                "- 调用 `infoflow_recall_message`：\n"
+                "  - 成功后不输出任何确认文本（如\"已撤回\"），直接静默\n"
+                "  - 失败后在当前会话仅简短回复\"撤回失败，消息可能已过期\"（群聊中保持最小打扰），"
+                f"同时将详细错误通过 `send_message` 发送到 `infoflow:{self._admin_uid}`（admin 私聊）\n"
+                "- **通用豁免**：工具/指令有明确行为要求时（如静默完成、不发确认等），"
+                "以该要求为准，不受「必须回复」规则约束"
             )
             _full_prompt += _tool_rules
 
