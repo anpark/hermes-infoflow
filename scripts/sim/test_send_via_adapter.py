@@ -43,11 +43,11 @@ def _make_platform_config():
 
 
 def _ensure_infoflow_in_platform_enum() -> None:
-    """The vendored hermes-agent ``Platform`` enum doesn't ship the
-    ``infoflow`` value; the plugin assumes a hermes-agent build that
-    has been patched downstream. To keep the sim usable against an
-    unpatched checkout, extend the enum in-place with a synthetic
-    ``INFOFLOW`` member so ``Platform("infoflow")`` resolves.
+    """Backfill ``Platform.INFOFLOW`` for older hermes-agent checkouts.
+
+    Current hermes-agent builds support plugin platform pseudo-members via
+    ``Platform._missing_()`` and this function becomes a no-op. Keeping the
+    fallback lets the sim run against older local checkouts as well.
     """
     from gateway.config import Platform
     if "infoflow" in Platform._value2member_map_:

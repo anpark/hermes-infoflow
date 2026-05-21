@@ -16,24 +16,6 @@ logger = logging.getLogger(__name__)
 _AT_RE = re.compile(r"@([^\s@\n]{1,30})(?=[\s]|$)")
 
 
-def _coerce_csv(value: Any) -> str:
-    if isinstance(value, list):
-        return ",".join(str(x) for x in value if x)
-    return str(value or "")
-
-
-def options_from_metadata(metadata: dict[str, Any] | None) -> SendOptions:
-    """Translate Hermes send metadata into bot-layer send options."""
-    options = SendOptions()
-    if not metadata:
-        return options
-
-    options.at_all = bool(metadata.get("at_all"))
-    options.mention_user_ids = _coerce_csv(metadata.get("mention_user_ids"))
-    options.mention_agent_ids = _coerce_csv(metadata.get("mention_agent_ids"))
-    return options
-
-
 def _at_iter(text: str) -> list[tuple[str, int, int]]:
     """Return list of (full_match, start, end) for each @mention in text."""
     results: list[tuple[str, int, int]] = []
@@ -168,26 +150,50 @@ def _merge_options(
 GetGroupMembers = Callable[..., Awaitable[list[Any]]]
 
 
-def _strip_self_from_agent_csv(csv: str, bot_agent_id: int | None) -> str:
-    """Remove ``bot_agent_id`` from a comma-separated agentId list (if present)."""
-    if not bot_agent_id or not csv:
-        return csv
-    kept: list[str] = []
-    dropped = False
-    for raw in csv.split(","):
+def _normalize_metadata_options(options: SendOptions, bot_agent_id: int | None) -> None:
+    """Deduplicate metadata options and drop invalid/self agent IDs."""
+    seen_users: set[str] = set()
+    users: list[str] = []
+    for raw in options.mention_user_ids.split(","):
         item = raw.strip()
         if not item:
             continue
-        if item.isdigit() and int(item) == bot_agent_id:
-            dropped = True
+        if item in seen_users:
             continue
-        kept.append(item)
-    if dropped:
+        seen_users.add(item)
+        users.append(item)
+    options.mention_user_ids = ",".join(users)
+
+    seen_agents: set[int] = set()
+    agents: list[str] = []
+    invalid_agents: list[str] = []
+    dropped_self = False
+    for raw in options.mention_agent_ids.split(","):
+        item = raw.strip()
+        if not item:
+            continue
+        if not item.isdigit():
+            invalid_agents.append(item)
+            continue
+        agent_id = int(item)
+        if bot_agent_id is not None and agent_id == bot_agent_id:
+            dropped_self = True
+            continue
+        if agent_id in seen_agents:
+            continue
+        seen_agents.add(agent_id)
+        agents.append(str(agent_id))
+    if invalid_agents:
+        logger.warning(
+            "[iflow:send] dropping invalid mention_agent_ids from metadata: %s",
+            invalid_agents,
+        )
+    if dropped_self:
         logger.info(
             "[iflow:send] dropping self @-mention from options (agentId=%s)",
             bot_agent_id,
         )
-    return ",".join(kept)
+    options.mention_agent_ids = ",".join(agents)
 
 
 async def prepare_outbound_message(
@@ -205,11 +211,13 @@ async def prepare_outbound_message(
     @-mention that resolves to this id (via text or metadata) is dropped:
     the original text is preserved, but no ``at-agent`` ContentItem is built
     for self — Infoflow rejects "bot @ self" with a hard error.
+
+    If group member lookup fails, the message is still sent with metadata-only
+    options. This keeps transient directory failures from blocking outbound
+    delivery, at the cost of skipping best-effort text @-mention extraction.
     """
-    options = options_from_metadata(metadata)
-    options.mention_agent_ids = _strip_self_from_agent_csv(
-        options.mention_agent_ids, bot_agent_id,
-    )
+    options = SendOptions.from_metadata(metadata)
+    _normalize_metadata_options(options, bot_agent_id)
     if group_id is None or not text or get_group_members is None:
         return text, options
 

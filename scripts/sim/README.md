@@ -62,6 +62,14 @@ python scripts/sim/test_send_via_standalone.py \
     --mention "@chengbo05" --text "cron @-mention parity check"
 ```
 
+Check self-mention filtering (the text should remain plain text, without an
+`at-agent` payload for the bot itself):
+
+```bash
+python scripts/sim/test_send_via_standalone.py \
+    --mention "@chengbo5.1" --text "self mention filter check"
+```
+
 Verify `@all` resolves via metadata in both entry points:
 
 ```bash

@@ -109,3 +109,38 @@ async def test_self_mention_via_metadata_is_filtered() -> None:
     )
 
     assert options.mention_agent_ids == "6533"
+
+
+async def test_metadata_agent_ids_are_validated_and_deduplicated() -> None:
+    async def get_group_members(group_id: str, **kwargs):
+        return []
+
+    _text, options = await prepare_outbound_message(
+        "hello",
+        group_id="1",
+        metadata={
+            "mention_user_ids": "alice,alice,bob",
+            "mention_agent_ids": "abc,6533,6533,6471,7000",
+        },
+        get_group_members=get_group_members,
+        bot_agent_id=6471,
+    )
+
+    assert options.mention_user_ids == "alice,bob"
+    assert options.mention_agent_ids == "6533,7000"
+
+
+async def test_member_lookup_failure_keeps_metadata_only_options() -> None:
+    async def get_group_members(group_id: str, **kwargs):
+        raise RuntimeError("directory unavailable")
+
+    text, options = await prepare_outbound_message(
+        "@alice @HelperBot ping",
+        group_id="1",
+        metadata={"mention_user_ids": "owner", "mention_agent_ids": "99"},
+        get_group_members=get_group_members,
+    )
+
+    assert text == "@alice @HelperBot ping"
+    assert options.mention_user_ids == "owner"
+    assert options.mention_agent_ids == "99"

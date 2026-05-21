@@ -118,6 +118,23 @@ class SendOptions:
     mention_agent_ids: str = ""  # Comma-separated numeric agentIds (bots)
     markdown: bool | None = None  # ``None`` = auto-detect from content
 
+    @classmethod
+    def from_metadata(cls, metadata: dict[str, Any] | None) -> "SendOptions":
+        """Translate Hermes send metadata into bot-layer send options."""
+        options = cls()
+        if not metadata:
+            return options
+
+        def _coerce_csv(value: Any) -> str:
+            if isinstance(value, list):
+                return ",".join(str(item) for item in value if item)
+            return str(value or "")
+
+        options.at_all = bool(metadata.get("at_all"))
+        options.mention_user_ids = _coerce_csv(metadata.get("mention_user_ids"))
+        options.mention_agent_ids = _coerce_csv(metadata.get("mention_agent_ids"))
+        return options
+
 
 @dataclass
 class SentResult:
