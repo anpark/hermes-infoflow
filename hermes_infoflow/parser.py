@@ -441,7 +441,11 @@ def _try_decrypt_and_parse(
 # ---------------------------------------------------------------------------
 
 
-def build_private_inbound(msg_data: dict[str, Any]) -> InboundMessage | None:
+def build_private_inbound(
+    msg_data: dict[str, Any],
+    *,
+    sent_message_ids: set[str] | None = None,
+) -> InboundMessage | None:
     """Translate a decrypted private-chat ``msgData`` to ``InboundMessage``."""
     from_user = _stringify(
         msg_data.get("FromUserId")
@@ -486,23 +490,58 @@ def build_private_inbound(msg_data: dict[str, Any]) -> InboundMessage | None:
     if msg_type == "image" and pic_url:
         image_urls.append(pic_url)
 
+    # --- Extract reply (引用) targets from the DM-specific Reply field ---
+    reply_targets: list[dict[str, Any]] = []
+    is_reply_to_bot = False
+    reply_raw = msg_data.get("Reply") or msg_data.get("reply")
+    if isinstance(reply_raw, list) and reply_raw:
+        for item in reply_raw:
+            reply_msg_id = _stringify(item.get("ReplyMsgId") or item.get("replyMsgId"))
+            if not reply_msg_id:
+                continue
+            preview = _stringify(
+                item.get("ReplyContent") or item.get("replyContent") or ""
+            )
+            is_bot = False
+            if sent_message_ids is not None:
+                is_bot = reply_msg_id in sent_message_ids
+            reply_targets.append(
+                {
+                    "messageid": reply_msg_id,
+                    "preview": preview,
+                    "isBotMessage": is_bot,
+                }
+            )
+            if is_bot:
+                is_reply_to_bot = True
+
+    # Build body_for_agent with reply tag prefix (same format as group chat)
+    reply_prefix = ""
+    if reply_targets:
+        rt = reply_targets[0]
+        reply_prefix = f"<引用 message_id:{rt['messageid']}>{rt['preview']}</引用>\n"
+
     if not text and not image_urls:
         return None
 
     if not text and image_urls:
         text = "<media:image>"
 
+    body_for_agent = reply_prefix + text
+
     return InboundMessage(
         chat_type="dm",
         from_user=from_user,
         text=text,
-        body_for_agent=text,
+        body_for_agent=body_for_agent,
         sender_name=sender_name,
         message_id=message_id,
         timestamp_ms=timestamp_ms,
         raw_msgdata=msg_data,
         image_urls=image_urls,
         was_mentioned=True,  # private chat is always "directly addressed"
+        reply_targets=reply_targets,
+        is_reply_to_bot=is_reply_to_bot,
     )
 
 
@@ -730,7 +769,7 @@ def parse_webhook(
                     status_code=500,
                     body="decryption failed",
                 )
-            inbound = build_private_inbound(decoded)
+            inbound = build_private_inbound(decoded, sent_message_ids=sent_message_ids)
             if not inbound:
                 return ParsedWebhook(kind="ignored")
             return ParsedWebhook(kind="message", inbound=inbound)
