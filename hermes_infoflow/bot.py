@@ -196,6 +196,7 @@ class Bot:
         sent_store: SentMessageStore,
         dedup_set: set[str],
         message_store: MessageStore,
+        admin_uid: str = "",
     ) -> None:
         self._settings = settings
         self._policy = policy
@@ -203,8 +204,9 @@ class Bot:
         self._sent_store = sent_store
         self._dedup_set = dedup_set
         self._message_store = message_store
+        self._admin_uid = admin_uid.strip().lower()
         self._robot_id: str = str(settings.get("robot_id") or "")
-        gw_log().info("[infoflow] Bot init: robot_id=%s", self._robot_id)
+        gw_log().info("[infoflow] Bot init: robot_id=%s admin_uid=%s", self._robot_id, self._admin_uid)
 
     # -- robot_id management ------------------------------------------------
 
@@ -252,6 +254,52 @@ class Bot:
         """
         _chat = self._chat_label(msg)
         _text_preview = (msg.text or "")[:120]
+
+        # --- Slash command fast path: /new, /stop ---
+        raw_text = (msg.body_for_agent or msg.text or "").strip()
+        if raw_text in ("/new", "/stop"):
+            is_admin_cmd = self._check_slash_command_auth(msg)
+            if is_admin_cmd:
+                gw_log().info(
+                    "[iflow:decision] mid=%s action=DISPATCH trigger=slash_command "
+                    "reason=%s sender=%s",
+                    msg.message_id or "-", raw_text, msg.sender_id,
+                )
+                return ProcessResult(
+                    should_dispatch=True,
+                    decision=PolicyDecision(
+                        should_dispatch=True,
+                        action=Action.DISPATCH,
+                        reason=f"slash_command:{raw_text}",
+                        trigger_reason="slash_command",
+                        command_text=raw_text,
+                    ),
+                )
+
+        # --- Enrich sender info (group messages only) ---
+        if msg.is_group and msg.sender_imid:
+            await self._enrich_sender(msg)
+
+        # --- [iflow:event] — enriched message event fields ---
+        try:
+            gw_log().info(
+                "[iflow:event] mid=%s sender_id=%s sender_name=%s sender_imid=%s "
+                "sender_agent_id=%s is_bot=%s mentioned=%s "
+                "mention_users=%s mention_agents=%s reply_to_bot=%s body=%s",
+                msg.message_id, msg.sender_id, msg.sender_name, msg.sender_imid,
+                getattr(msg, "sender_agent_id", ""), msg.sender_is_bot,
+                msg.bot_was_mentioned,
+                msg.mention_user_ids, msg.mention_agent_ids,
+                msg.is_reply_to_bot, (msg.body_for_agent or "")[:200],
+            )
+            for _i, _b in enumerate(msg.body_items or []):
+                if hasattr(_b, "type"):
+                    gw_log().info(
+                        "[iflow:event] body_item[%d] type=%s name=%s userid=%s robotid=%s",
+                        _i, _b.type, _b.name, _b.userid, _b.robotid,
+                    )
+        except Exception:
+            pass
 
         # Audit log
         gw_log().info(
@@ -337,6 +385,77 @@ class Bot:
             msg.sender_name or msg.sender_id, _text_preview,
         )
         return ProcessResult(should_dispatch=True, decision=decision)
+
+    # -- slash command auth -------------------------------------------------
+
+    _SLASH_COMMANDS = frozenset({"/new", "/stop"})
+
+    def _check_slash_command_auth(self, msg: IncomingMessage) -> bool:
+        """Check if a slash command should be dispatched.
+
+        DM: any sender's /new /stop is allowed.
+        Group: only admin (admin_uid match) + bot was mentioned.
+        """
+        if not msg.is_group:
+            return True
+        if not self._admin_uid:
+            return False
+        sender = (msg.sender_id or "").lower()
+        if msg.sender_is_bot:
+            sender = (getattr(msg, "sender_agent_id", "") or "").lower()
+        return sender == self._admin_uid and msg.bot_was_mentioned
+
+    # -- enrich sender (moved from adapter.py) -----------------------------
+
+    async def _enrich_sender(self, msg: IncomingMessage) -> None:
+        """Populate sender_name / sender_agent_id from group member cache or API.
+
+        Called for ALL group messages in the inbound pipeline (before dispatch
+        decision), so even non-dispatched messages get enriched for logging
+        and potential future use.
+
+        Degradation:
+          - Bot without agent_id  → ``IMID:{imid}`` (agent-level ops may fail)
+          - Human without userId  → ``IMID:{imid}``
+        """
+        from .serverapi import CacheRetrievalPolicy, resolve_member_identity
+
+        if not msg.group_id:
+            return
+
+        sender_info = await resolve_member_identity(
+            msg.group_id,
+            imid=msg.sender_imid,
+            cache_policy=CacheRetrievalPolicy.RETRIEVE_FROM_CACHE_THEN_REMOTE,
+            serverapi=self._serverapi,
+        )
+
+        if sender_info:
+            if sender_info["is_bot"]:
+                if not msg.sender_name or msg.sender_name == msg.sender_imid:
+                    msg.sender_name = sender_info["name"] or msg.sender_name
+                if sender_info["agent_id"]:
+                    msg.sender_agent_id = str(sender_info["agent_id"])
+            else:
+                if sender_info["uid"] and (not msg.sender_id or msg.sender_id == msg.sender_imid):
+                    msg.sender_id = sender_info["uid"]
+                if not msg.sender_name or msg.sender_name == msg.sender_imid:
+                    msg.sender_name = sender_info["name"] or msg.sender_id
+
+        # Degradation: ensure mandatory fields exist
+        _degraded = False
+        if msg.sender_is_bot and not getattr(msg, "sender_agent_id", ""):
+            msg.sender_agent_id = f"IMID:{msg.sender_imid}"
+            _degraded = True
+        if not msg.sender_is_bot and not msg.sender_id:
+            msg.sender_id = f"IMID:{msg.sender_imid}"
+            _degraded = True
+
+        gw_log().info(
+            "[infoflow-enrich] mid=%s sender=%s(%s) name=%s agent_id=%s is_bot=%s degraded=%s",
+            msg.message_id, msg.sender_id, msg.sender_imid, msg.sender_name,
+            getattr(msg, "sender_agent_id", ""), msg.sender_is_bot, _degraded,
+        )
 
     # -- context registration + message store -------------------------------
 

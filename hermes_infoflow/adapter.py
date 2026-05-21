@@ -161,7 +161,7 @@ except ImportError:
 
 from .serverapi import ServerAPI
 from .itypes import IncomingMessage, SendOptions, SentResult, ReplyInfo
-from .webhook import parse_webhook_request
+from .webhook import WebhookServer
 from .iftools import (
     RECALL_TOOL_SCHEMA,
     REPLY_TOOL_SCHEMA,
@@ -244,9 +244,6 @@ def _build_sender_tag(msg: Any, admin_uid: str = "") -> str:
         tag += "(restricted — 仅可回复文本和公开信息，不可执行敏感操作)"
     return tag
 from .bot import Bot, get_recall_inbound_message_id_hint  # noqa: E402
-
-if TYPE_CHECKING:
-    from aiohttp import web as _web_module
 
 logger = logging.getLogger(__name__)
 
@@ -355,6 +352,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             sent_store=self._sent_store,
             dedup_set=self._dedup_set,
             message_store=self._message_store,
+            admin_uid=self._admin_uid,
         )
 
         # Sync persisted robot_id to bot (so own-message echo filter works
@@ -369,12 +367,22 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         if not self._webhook_path.startswith("/"):
             self._webhook_path = "/" + self._webhook_path
 
-        self._http_session: aiohttp.ClientSession | None = None
-        self._runner: Any = None
-        self._site: Any = None
-
         if not hasattr(self, "_background_tasks"):
             self._background_tasks: set[asyncio.Task[Any]] = set()
+
+        # ── HTTP webhook server (delegated to webhook.py) ──────────
+        self._webhook_server = WebhookServer(
+            serverapi=self._serverapi,
+            dedup_set=self._dedup_set,
+            webhook_path=self._webhook_path,
+            host=self._host,
+            port=self._port,
+            body_limit=DEFAULT_BODY_LIMIT_BYTES,
+            on_message=self._on_inbound_message,
+            task_set=self._background_tasks,
+        )
+
+        self._http_session: aiohttp.ClientSession | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -443,16 +451,9 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         self._http_session = aiohttp.ClientSession()
         self._serverapi.http_session = self._http_session
         try:
-            from aiohttp import web
-            app = web.Application(client_max_size=DEFAULT_BODY_LIMIT_BYTES)
-            app.router.add_post(self._webhook_path, self._handle_webhook)
-            app.router.add_get("/health", lambda _req: web.Response(text="ok"))
-            self._runner = web.AppRunner(app)
-            await self._runner.setup()
-            self._site = web.TCPSite(self._runner, self._host, self._port)
-            await self._site.start()
+            await self._webhook_server.start()
         except Exception as exc:
-            await self._close_partial_state()
+            await self._close_http_session()
             self._set_fatal_error(
                 "BIND_FAILED",
                 f"Failed to start webhook server on {self._host}:{self._port}: {exc}",
@@ -471,183 +472,37 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
     async def disconnect(self) -> None:
         self._running = False
         try:
-            if self._site is not None:
-                await self._site.stop()
-        finally:
-            self._site = None
-        try:
-            if self._runner is not None:
-                await self._runner.cleanup()
-        finally:
-            self._runner = None
-        if self._http_session is not None:
-            try:
-                await self._http_session.close()
-            finally:
-                self._http_session = None
-                self._serverapi.http_session = None
+            await self._webhook_server.stop()
+        except Exception:
+            pass
+        await self._close_http_session()
         self._mark_disconnected()
         gw_log().info("[infoflow] Disconnected")
 
-    async def _close_partial_state(self) -> None:
-        try:
-            if self._site is not None:
-                await self._site.stop()
-        except Exception:
-            pass
-        self._site = None
-        if self._runner is not None:
+    async def _close_http_session(self) -> None:
+        if self._http_session is not None:
             try:
-                await self._runner.cleanup()
+                await self._http_session.close()
             except Exception:
                 pass
-            self._runner = None
+            self._http_session = None
+            self._serverapi.http_session = None
 
     # ------------------------------------------------------------------
-    # Webhook handler
+    # Inbound message callback (from webhook server)
     # ------------------------------------------------------------------
 
-    async def _handle_webhook(self, request: "_web_module.Request") -> "_web_module.Response":
-        """Receive an Infoflow webhook hit, dispatch in the background, return 200."""
-        try:
-            raw_bytes = await request.read()
-        except Exception as exc:
-            gw_log().warning("[infoflow] failed to read webhook body: %s", exc)
-            from aiohttp import web
-            return web.Response(status=400, text="bad request")
-        raw_body = raw_bytes.decode("utf-8", errors="replace")
+    async def _on_inbound_message(self, msg: IncomingMessage) -> None:
+        """Callback invoked by WebhookServer for each parsed message.
 
-        content_type = request.headers.get("Content-Type", "")
-        gw_log().info(
-            "[infoflow] webhook received: ct=%s body_len=%d ip=%s",
-            content_type, len(raw_bytes), getattr(request, "remote", None) or "unknown",
-        )
-
-        # Parse via webhook channel → serverapi → bot-layer types
-        wh_result = parse_webhook_request(
-            content_type=content_type,
-            raw_body=raw_body,
-            parser_account=self._serverapi.parser_account,
-            dedup_set=self._dedup_set,
-        )
-
-        from aiohttp import web
-
-        if wh_result.kind != "message":
-            if wh_result.kind == "echostr_ok":
-                gw_log().info("[infoflow] webhook echostr verification OK")
-                return web.Response(status=200, text=wh_result.body, content_type="text/plain")
-            if wh_result.kind == "echostr_bad":
-                gw_log().warning("[infoflow] webhook echostr verification BAD")
-                return web.Response(status=403, text=wh_result.body)
-            if wh_result.kind == "http_error":
-                gw_log().warning("[infoflow] webhook parse error (status=%s): %s", wh_result.status, wh_result.body)
-                return web.Response(status=wh_result.status, text=wh_result.body)
-            # "ignored"
-            return web.Response(status=200, text="OK")
-
-        # Convert parser.InboundMessage → types.IncomingMessage
-        msg = self._serverapi.to_incoming(wh_result.raw_inbound)
-
-        # --- Stage 1: [iflow:raw] — decoded plaintext payload ---
-        try:
-            import json as _json
-            _raw = wh_result.raw_inbound.raw_msgdata if hasattr(wh_result.raw_inbound, "raw_msgdata") else {}
-            gw_log().info(
-                "[iflow:raw] mid=%s payload=%s",
-                msg.message_id, _json.dumps(_raw, ensure_ascii=False, default=str)[:2000],
-            )
-        except Exception:
-            pass
-
-        # --- Enrich sender info from group member cache (ALL group messages) ---
-        # Bot: must have agent_id; Human: must have userId.
-        # Fallback: IMID:{imid} prefix when cache+API both fail.
-        if msg.is_group and msg.sender_imid:
-            await self._enrich_sender(msg)
-
-        # --- Stage 2: [iflow:event] — enriched message event fields ---
-        try:
-            gw_log().info(
-                "[iflow:event] mid=%s sender_id=%s sender_name=%s sender_imid=%s "
-                "sender_agent_id=%s is_bot=%s mentioned=%s "
-                "mention_users=%s mention_agents=%s reply_to_bot=%s body=%s",
-                msg.message_id, msg.sender_id, msg.sender_name, msg.sender_imid,
-                getattr(msg, "sender_agent_id", ""), msg.sender_is_bot,
-                msg.bot_was_mentioned,
-                msg.mention_user_ids, msg.mention_agent_ids,
-                msg.is_reply_to_bot, (msg.body_for_agent or "")[:200],
-            )
-            for _i, _b in enumerate(msg.body_items or []):
-                if hasattr(_b, "type"):
-                    gw_log().info(
-                        "[iflow:event] body_item[%d] type=%s name=%s userid=%s robotid=%s",
-                        _i, _b.type, _b.name, _b.userid, _b.robotid,
-                    )
-        except Exception:
-            pass
-
-        # Delegate to bot for policy/dedup/context
+        Thin orchestration: enrich → policy → dispatch.
+        Business logic lives in bot.py.
+        """
+        # Delegate to bot for enrich + policy + dedup + context
         result = await self._bot.process_inbound(msg)
 
         if result.should_dispatch and result.decision:
             self._bot.spawn_dispatch(msg, result.decision, self, self._background_tasks)
-
-        return web.Response(status=200, text="OK")
-
-    # ------------------------------------------------------------------
-    # _enrich_sender: resolve sender name/agent_id from group members
-    # ------------------------------------------------------------------
-
-    async def _enrich_sender(self, msg: "IncomingMessage") -> None:
-        """Populate sender_name / sender_agent_id from group member cache or API.
-
-        Called for ALL group messages in the webhook handler (before dispatch
-        decision), so even non-dispatched messages get enriched for logging
-        and potential future use.
-
-        Degradation:
-          - Bot without agent_id  → ``IMID:{imid}`` (agent-level ops may fail)
-          - Human without userId  → ``IMID:{imid}``
-        """
-        from .serverapi import CacheRetrievalPolicy, resolve_member_identity
-
-        if not msg.group_id:
-            return
-
-        sender_info = await resolve_member_identity(
-            msg.group_id,
-            imid=msg.sender_imid,
-            cache_policy=CacheRetrievalPolicy.RETRIEVE_FROM_CACHE_THEN_REMOTE,
-            serverapi=self._serverapi,
-        )
-
-        if sender_info:
-            if sender_info["is_bot"]:
-                if not msg.sender_name or msg.sender_name == msg.sender_imid:
-                    msg.sender_name = sender_info["name"] or msg.sender_name
-                if sender_info["agent_id"]:
-                    msg.sender_agent_id = str(sender_info["agent_id"])
-            else:
-                if sender_info["uid"] and (not msg.sender_id or msg.sender_id == msg.sender_imid):
-                    msg.sender_id = sender_info["uid"]
-                if not msg.sender_name or msg.sender_name == msg.sender_imid:
-                    msg.sender_name = sender_info["name"] or msg.sender_id
-
-        # Degradation: ensure mandatory fields exist
-        _degraded = False
-        if msg.sender_is_bot and not getattr(msg, "sender_agent_id", ""):
-            msg.sender_agent_id = f"IMID:{msg.sender_imid}"
-            _degraded = True
-        if not msg.sender_is_bot and not msg.sender_id:
-            msg.sender_id = f"IMID:{msg.sender_imid}"
-            _degraded = True
-
-        gw_log().info(
-            "[infoflow-enrich] mid=%s sender=%s(%s) name=%s agent_id=%s is_bot=%s degraded=%s",
-            msg.message_id, msg.sender_id, msg.sender_imid, msg.sender_name,
-            getattr(msg, "sender_agent_id", ""), msg.sender_is_bot, _degraded,
-        )
 
     # ------------------------------------------------------------------
     # build_message_event: IncomingMessage → Hermes MessageEvent
@@ -702,6 +557,20 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         )
 
         message_type = MessageType.PHOTO if local_media else MessageType.TEXT
+
+        # --- Slash command fast path: use command_text directly ---
+        # Skip all sender-tag / follow-up injection so gateway's
+        # command dispatcher (event.text.startswith("/")) can handle it.
+        if decision is not None and getattr(decision, "command_text", ""):
+            event = MessageEvent(
+                text=decision.command_text,
+                message_type=MessageType.TEXT,
+                source=source,
+                raw_message={},
+                message_id=msg.message_id,
+            )
+            return event
+
         text_for_agent = msg.body_for_agent or msg.text or ""
         # Pure-AT message (no TEXT/MD body): build a description for the LLM
         # so it knows who was @mentioned and can decide whether to respond.

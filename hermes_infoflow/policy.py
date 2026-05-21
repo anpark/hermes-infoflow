@@ -211,6 +211,10 @@ class PolicyDecision:
     # When True, the adapter should asynchronously enrich group_system_prompt
     # with sender context + group member info before dispatching to the LLM.
     needs_sender_context: bool = False
+    # Non-empty for slash commands (e.g. "/new", "/stop").
+    # When set, build_message_event skips sender-tag/follow-up injection
+    # so gateway's command dispatcher can handle it directly.
+    command_text: str = ""
 
     @property
     def is_record(self) -> bool:
