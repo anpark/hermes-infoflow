@@ -119,7 +119,7 @@ def tool_result_json(payload: dict[str, Any]) -> str:
 REPLY_TOOL_SCHEMA = {
     "name": "infoflow_reply",
     "description": (
-        "Reply to or quote a specific Infoflow message with a preview摘要 of the "
+        "Reply to or quote a specific Infoflow message with a preview of the "
         "original message. Unlike send_message, this tool supports replying to a "
         "specific message (the preview shows the original message text). "
         "If `reply_to` is omitted, automatically replies to the current inbound "
