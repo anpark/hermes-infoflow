@@ -125,3 +125,11 @@ optional_env:
     description: "Override the directory holding hermes state (sent-messages.db etc.). Defaults to ~/.hermes/state."
     prompt: "Hermes state directory"
     password: false
+  - name: INFOFLOW_DASHBOARD_ENABLED
+    description: "Enable localhost session dashboard at /webhook/infoflow/dashboard (default true)"
+    prompt: "Dashboard enabled? (true/false)"
+    password: false
+  - name: INFOFLOW_DASHBOARD_EVENT_BUFFER
+    description: "Max events kept per session in dashboard memory (default 2000)"
+    prompt: "Dashboard event buffer size"
+    password: false

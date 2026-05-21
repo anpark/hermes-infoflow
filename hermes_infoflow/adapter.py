@@ -65,6 +65,7 @@ except ImportError:
 
 # ── Plugin modules ────────────────────────────────────────────────────
 
+from .dashboard import get_tracker
 from .iftools import (
     RECALL_TOOL_SCHEMA,
     REPLY_TOOL_SCHEMA,
@@ -276,6 +277,9 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         if not hasattr(self, "_background_tasks"):
             self._background_tasks: set[asyncio.Task[Any]] = set()
 
+        # ── Session dashboard (plugin hooks + infoflow events) ─────
+        self._tracker = get_tracker()
+
         # ── HTTP webhook server (delegated to webhook.py) ──────────
         self._webhook_server = WebhookServer(
             serverapi=self._serverapi,
@@ -286,6 +290,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             body_limit=DEFAULT_BODY_LIMIT_BYTES,
             on_message=self._on_inbound_message,
             task_set=self._background_tasks,
+            tracker=self._tracker,
         )
 
         self._http_session: aiohttp.ClientSession | None = None
@@ -394,12 +399,54 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
     # Inbound message callback (from webhook server)
     # ------------------------------------------------------------------
 
+    def _infoflow_chat_id(self, msg: IncomingMessage) -> str:
+        if msg.is_group and msg.group_id:
+            return f"group:{msg.group_id}"
+        return msg.dm_user_id or msg.sender_id or ""
+
+    def _push_infoflow_event(
+        self,
+        msg: IncomingMessage | None,
+        *,
+        kind: str,
+        extra: dict[str, Any] | None = None,
+        chat_id: str = "",
+    ) -> None:
+        """Record an Infoflow-specific event on the session dashboard."""
+        tracker = getattr(self, "_tracker", None)
+        if tracker is None:
+            return
+        cid = chat_id
+        if msg is not None:
+            cid = cid or self._infoflow_chat_id(msg)
+        payload: dict[str, Any] = {"chat_id": cid}
+        if msg is not None:
+            payload.update({
+                "message_id": msg.message_id,
+                "sender_id": msg.sender_id,
+                "sender_name": msg.sender_name,
+                "group_id": msg.group_id,
+                "is_group": msg.is_group,
+                "preview": (msg.body_for_agent or msg.text or "")[:500],
+            })
+        if extra:
+            payload.update(extra)
+        tracker.push_event(
+            "",
+            kind,
+            payload,
+            platform="infoflow",
+            chat_id=cid,
+        )
+
     async def _on_inbound_message(self, msg: IncomingMessage) -> None:
         """Callback invoked by WebhookServer for each parsed message.
 
         Thin orchestration: enrich → policy → dispatch.
         Business logic lives in bot.py.
         """
+        self._push_infoflow_event(msg, kind="inbound.infoflow")
+
         # Delegate to bot for enrich + policy + dedup + context
         result = await self._bot.process_inbound(msg)
 
@@ -810,6 +857,19 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 _mid, chat_id, len(content), bot_result.success,
             )
 
+        self._push_infoflow_event(
+            None,
+            kind="outbound.infoflow",
+            chat_id=chat_id,
+            extra={
+                "type": "text",
+                "chars": len(content),
+                "success": bot_result.success,
+                "message_id": bot_result.message_id,
+                "error": bot_result.error,
+            },
+        )
+
         if bot_result.success:
             return SendResult(success=True, message_id=bot_result.message_id)
         return SendResult(
@@ -869,6 +929,18 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 _mid, chat_id, bot_result.success,
             )
 
+        self._push_infoflow_event(
+            None,
+            kind="outbound.infoflow",
+            chat_id=chat_id,
+            extra={
+                "type": "image",
+                "success": bot_result.success,
+                "message_id": bot_result.message_id,
+                "error": bot_result.error,
+            },
+        )
+
         if bot_result.success:
             return SendResult(success=True, message_id=bot_result.message_id)
         return SendResult(success=False, error=bot_result.error, retryable=False)
@@ -894,6 +966,19 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             msgseqid="",
             count=count,
             session=session,
+        )
+
+        self._push_infoflow_event(
+            None,
+            kind="outbound.infoflow",
+            chat_id=chat_id,
+            extra={
+                "type": "recall",
+                "success": result.success,
+                "message_id": message_id,
+                "count": count,
+                "error": result.error,
+            },
         )
 
         if result.success:
@@ -1083,6 +1168,18 @@ def register(ctx: Any) -> None:
             )
         except Exception as exc:
             gw_log().warning("[infoflow] failed to register reply tool: %s", exc)
+
+    from .dashboard import make_plugin_hooks
+
+    tracker = get_tracker()
+    for hook_name, cb in make_plugin_hooks(tracker).items():
+        try:
+            ctx.register_hook(hook_name, cb)
+        except Exception as exc:
+            gw_log().warning(
+                "[infoflow] failed to register dashboard hook %s: %s",
+                hook_name, exc,
+            )
 
 
 __all__ = [

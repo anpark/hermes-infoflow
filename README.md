@@ -129,6 +129,8 @@ bash scripts/deploy.sh --dry-run   # 仅打印操作
 | `INFOFLOW_ALLOWED_USERS` | 无 | 逗号分隔的 uuapName allowlist |
 | `INFOFLOW_ALLOW_ALL_USERS` | `false` | 允许所有人（仅开发） |
 | `HERMES_STATE_DIR` | `~/.hermes/state` | sent-messages.db 等状态目录 |
+| `INFOFLOW_DASHBOARD_ENABLED` | `true` | 是否启用 localhost session 仪表盘 |
+| `INFOFLOW_DASHBOARD_EVENT_BUFFER` | `2000` | 每个 session 在内存中保留的最大事件条数 |
 
 设置完后：
 
@@ -137,6 +139,41 @@ hermes config show                  # 验证当前生效配置
 hermes gateway restart              # 重新加载插件
 hermes gateway status               # 期望看到 "infoflow: running"
 ```
+
+---
+
+## Session 仪表盘（Dashboard）
+
+插件在 webhook 同一端口上提供 **仅 localhost** 可访问的 Web UI，用于查看 Hermes gateway 内 agent session 的实时运行情况。
+
+### 访问地址
+
+Gateway 启动且 infoflow 插件连接成功后，在本机浏览器打开：
+
+```
+http://127.0.0.1:8646/webhook/infoflow/dashboard
+```
+
+（端口与路径可通过 `INFOFLOW_PORT`、`INFOFLOW_WEBHOOK_PATH` 调整；路径为 `{WEBHOOK_PATH}/dashboard`。）
+
+- **列表页**：默认只显示 `platform=infoflow` 的 session；URL 加 `?scope=all` 可查看 gateway 内所有平台。
+- **Session 页**：点击某个 session 进入详情（无返回按钮）；通过 SSE 增量刷新事件时间线。
+
+### 安全
+
+- 所有 dashboard 路由仅接受来源 `127.0.0.1` / `::1`，其他 IP 返回 403。
+- **请勿**在 Caddy/Nginx 等反代上把 `/webhook/infoflow/dashboard` 暴露到公网。
+
+### 展示粒度（与 CLI 的差异）
+
+仪表盘通过 hermes-agent **插件 hooks** 收集事件（`pre_llm_call`、`post_llm_call`、`pre_tool_call`、`post_tool_call`、`on_session_*` 等），属于 **turn 级别** 时间线：
+
+- 每次 LLM 请求/回复各一条
+- 每次 tool 调用开始/结束各一条（可展开 args/result）
+
+这与 `hermes` 交互式 CLI / TUI 的 **逐 token 流式** 输出不同。CLI 的 `thinking.delta` / `message.delta` 运行在独立的 TUI 进程内，gateway 进程中的 platform 插件无法在不修改 hermes-agent 的前提下订阅同等粒度的流式事件。
+
+关闭仪表盘：`INFOFLOW_DASHBOARD_ENABLED=false`。
 
 ---
 

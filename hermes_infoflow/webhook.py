@@ -17,6 +17,7 @@ from .parser import parse_webhook
 from .utils import gw_log
 
 if TYPE_CHECKING:
+    from .dashboard import SessionTracker
     from .itypes import IncomingMessage
     from .serverapi import ServerAPI
 
@@ -129,9 +130,11 @@ class WebhookServer:
         body_limit: int,
         on_message: Callable[[IncomingMessage], Awaitable[None]],
         task_set: set[asyncio.Task[Any]] | None = None,
+        tracker: SessionTracker | None = None,
     ) -> None:
         self._serverapi = serverapi
         self._dedup_set = dedup_set
+        self._tracker = tracker
         self._webhook_path = webhook_path
         self._host = host
         self._port = port
@@ -150,6 +153,11 @@ class WebhookServer:
         app = web.Application(client_max_size=self._body_limit)
         app.router.add_post(self._webhook_path, self._handle_request)
         app.router.add_get("/health", _health_handler)
+        if self._tracker is not None:
+            from .dashboard import dashboard_enabled, register_routes
+
+            if dashboard_enabled():
+                register_routes(app, self._tracker, base_path=self._webhook_path)
         self._runner = web.AppRunner(app)
         await self._runner.setup()
         self._site = web.TCPSite(self._runner, self._host, self._port)
