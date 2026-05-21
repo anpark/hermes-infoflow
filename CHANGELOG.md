@@ -8,6 +8,42 @@ versioning (with prerelease suffixes such as `0.1.0b1` for betas).
 
 ## [Unreleased]
 
+## [2026.5.21] - 2026-05-21
+
+### Added
+
+- Group chat processing emoji (`d135` 敲键盘): when the bot is directly
+  @-mentioned or engaged via the follow-up window, it now adds an emoji
+  reaction to the inbound message immediately and removes it once the LLM
+  reply finalizes (sent, `NO_REPLY` suppression, refusal suppression, send
+  error, or 10-minute fallback timeout).
+- Private chat (DM) processing emoji: every inbound DM now shows the same
+  processing indicator. The emoji is removed when the bot sends a reply or
+  finalizes silently.
+- Emoji reaction REST client (`add_message_reaction` /
+  `delete_message_reaction`) supporting both group (`chatType=2`, requires
+  `chatId`) and service-account DM (`chatType=7`, requires `fromUid`,
+  omits `chatId`) payload shapes; `msgId2` is optional per Infoflow doc.
+- Webhook parser now extracts `MsgId2` (DM) and `msgid2` (group) from the
+  top-level payload, threads it through `IncomingMessage`, the SQLite
+  message store (with backward-compatible `ALTER TABLE` migration) and
+  the recall inbound context, while keeping it out of the LLM-facing
+  message body.
+- Documentation: `docs/emoji-api.md` reorganized by group/DM scenarios
+  with the full webhook-payload-to-API field mapping.
+
+### Fixed
+
+- Processing emoji is no longer deleted prematurely. Cleanup is now driven
+  by the actual outbound send paths via a `ContextVar`-propagated promise
+  (plus a 10-minute fallback timer) instead of the dispatch `finally`
+  block — which used to fire as soon as `adapter.handle_message` returned,
+  long before the LLM reply was produced.
+- `message_store` reads of `group_messages` now use explicit column lists
+  instead of `SELECT *`, keeping the row → `GroupMessageRecord` mapping
+  correct after the `msgid2` `ALTER TABLE` migration appends the new
+  column at the end of the physical schema.
+
 ## [0.2.2] - 2026-05-20
 
 ### Fixed

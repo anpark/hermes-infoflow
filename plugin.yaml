@@ -36,7 +36,7 @@ manifest_version: 1
 name: infoflow
 label: Infoflow (如流)
 kind: platform
-version: 0.2.2
+version: 2026.5.21
 description: >
   Baidu Infoflow (如流) channel plugin for Hermes Agent.
   Receives messages via webhook (AES-ECB encrypted) and sends via REST API.

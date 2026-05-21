@@ -47,7 +47,7 @@ hermes 内置命令；`git clone --depth 1` 到 `~/.hermes/plugins/infoflow/`。
 
 <!-- sync:hermes-infoflow-version:latest -->
 ```bash
-pipx run hermes-infoflow-tools update --version 0.2.2
+pipx run hermes-infoflow-tools update --version 2026.5.21
 ```
 <!-- /sync:hermes-infoflow-version:latest -->
 
@@ -271,9 +271,9 @@ pip install hermes-infoflow==<X.Y.ZbN>           # 显式锁定
 
 <!-- sync:hermes-infoflow-version -->
 ```bash
-hatch version 0.2.2
-git tag 0.2.2
-git push origin 0.2.2
+hatch version 2026.5.21
+git tag 2026.5.21
+git push origin 2026.5.21
 ```
 <!-- /sync:hermes-infoflow-version -->
 

@@ -56,4 +56,4 @@ from .bot import recall_inbound_message_id_hint_scope
 
 __all__ = ["recall_inbound_message_id_hint_scope", "register"]
 
-__version__ = "0.2.2"
+__version__ = "2026.5.21"
