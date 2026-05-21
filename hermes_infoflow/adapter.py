@@ -30,108 +30,13 @@ import asyncio
 import contextvars
 import logging
 import os
-import re
 import socket as _socket
-from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import Any
 
 import aiohttp
 
 # ── Context var: propagate inbound mid → send() for tracing ────
 _inbound_mid: contextvars.ContextVar[str] = contextvars.ContextVar("inbound_mid", default="")
-
-# ── @ mention extraction ─────────────────────────────────────────
-# Match @xxx where xxx is 1-30 chars excluding @, space, newline,
-# followed by whitespace or end-of-string.
-# Context check (preceded by whitespace or start-of-string) done in code.
-_AT_RE = re.compile(r"@([^\s@\n]{1,30})(?=[\s]|$)")
-
-
-def _at_iter(text: str) -> list[tuple[str, int, int]]:
-    """Return list of (full_match, start, end) for each @mention in text.
-
-    Only matches @ that are preceded by whitespace or start-of-string.
-    """
-    results: list[tuple[str, int, int]] = []
-    for m in _AT_RE.finditer(text):
-        if m.start() > 0 and text[m.start() - 1] not in " \t\r\n":
-            continue
-        results.append((m.group(0), m.start(), m.end()))
-    return results
-
-
-def _extract_mentions(
-    text: str,
-    members: list[Any] | None,
-) -> tuple[list[str], list[int], bool, list[str], str]:
-    """Extract @ mentions from text and resolve against group members.
-
-    Returns (user_ids, agent_ids, at_all, unmatched, modified_text).
-    - user_ids: list of uuapName strings (humans)
-    - agent_ids: list of agentId ints (bots) — for Infoflow API atagentids
-    - at_all: True if @所有人 or @all found
-    - unmatched: mentions that didn't match any member
-    - modified_text: text with bot-name mentions replaced by @agentId
-    """
-    user_ids: list[str] = []
-    agent_ids: list[int] = []  # agentId (int), not imid
-    at_all = False
-    unmatched: list[str] = []
-
-    # Pre-build lookup sets for O(1) member resolution
-    _human_uids: set[str] | None = None
-    _bot_aids: set[int] | None = None
-    _bot_name_map: dict[str, int] | None = None  # name_lower → agentId
-    seen_users: set[str] = set()
-    seen_agents: set[int] = set()
-    if members:
-        _human_uids = {mb.uid for mb in members if not mb.is_bot}
-        _bot_aids = {mb.agent_id for mb in members if mb.is_bot}
-        _bot_name_map = {
-            mb.name.lower(): mb.agent_id
-            for mb in members
-            if mb.is_bot and mb.name
-        }
-
-    mentions = _at_iter(text)
-    # Track replacements: (start, end, new_text) for bot-name → @agentId
-    replacements: list[tuple[int, int, str]] = []
-    for m, _start, _end in mentions:
-        ml = m[1:].lower()  # strip leading @
-        if ml in ("所有人", "all"):
-            at_all = True
-            continue
-        name_part = m[1:]  # strip leading @, e.g. "chengbo05"
-        if name_part.isdigit():
-            aid = int(name_part)
-            if aid in seen_agents:
-                continue
-            if _bot_aids is not None and aid in _bot_aids:
-                agent_ids.append(aid)
-                seen_agents.add(aid)
-            else:
-                unmatched.append(name_part)
-        else:
-            if name_part in seen_users:
-                continue
-            if _human_uids is not None and name_part in _human_uids:
-                user_ids.append(name_part)
-                seen_users.add(name_part)
-            elif _bot_name_map is not None and ml in _bot_name_map:
-                # Matched a bot by display name → use agentId
-                aid = _bot_name_map[ml]
-                if aid not in seen_agents:
-                    agent_ids.append(aid)
-                    seen_agents.add(aid)
-                replacements.append((_start, _end, f"@{aid}"))
-            else:
-                unmatched.append(name_part)
-
-    # Apply replacements (reverse order to preserve positions)
-    for start, end, new_text in sorted(replacements, reverse=True):
-        text = text[:start] + new_text + text[end:]
-
-    return user_ids, agent_ids, at_all, unmatched, text
 
 # ── Hermes symbols (soft-import for testability) ──────────────────────
 
@@ -143,8 +48,8 @@ try:
         MessageType,
         Platform,
         SendResult,
+        cache_image_from_bytes,
     )
-    from gateway.platforms.base import cache_image_from_bytes  # type: ignore[import-not-found]
 
     HERMES_AVAILABLE = True
 except ImportError:
@@ -159,33 +64,25 @@ except ImportError:
 
 # ── Plugin modules ────────────────────────────────────────────────────
 
-from .serverapi import ServerAPI
-from .itypes import IncomingMessage, SendOptions, SentResult, ReplyInfo
-from .webhook import WebhookServer
 from .iftools import (
     RECALL_TOOL_SCHEMA,
     REPLY_TOOL_SCHEMA,
     make_recall_handler,
     make_reply_handler,
 )
+from .itypes import IncomingMessage, ReplyInfo
+from .message_store import MessageStore
+from .outbound import prepare_outbound_message
 from .policy import (
+    _SENDER_FORMAT_DOC,
     GroupConfigOverride,
     GroupPolicy,
     PolicyDecision,
-    _SENDER_FORMAT_DOC,
     normalize_reply_mode,
 )
-from .message_store import MessageStore
-from .recall import get_inbound_body, get_inbound_sender_imid, get_inbound_sender_id
+from .recall import get_inbound_body, get_inbound_sender_id, get_inbound_sender_imid
 from .sent_store import SentMessageStore
-from .utils import (
-    _ImageLoadError,
-    _allowed_media_roots,
-    _download_inbound_image,
-    _is_safe_outbound_url,
-    _resolve_safe_local_path,
-    gw_log,
-)
+from .serverapi import ServerAPI
 from .settings import (
     DEFAULT_BODY_LIMIT_BYTES,
     DEFAULT_HOST,
@@ -203,6 +100,14 @@ from .settings import (
     _validate_config,
 )
 from .standalone import standalone_send
+from .utils import (
+    _download_inbound_image,
+    _ImageLoadError,
+    _is_safe_outbound_url,
+    _resolve_safe_local_path,
+    gw_log,
+)
+from .webhook import WebhookServer
 
 # ---------------------------------------------------------------------------
 # Sender tag builder — used by both group and DM paths
@@ -243,7 +148,7 @@ def _build_sender_tag(msg: Any, admin_uid: str = "") -> str:
     else:
         tag += "(restricted — 仅可回复文本和公开信息，不可执行敏感操作)"
     return tag
-from .bot import Bot, get_recall_inbound_message_id_hint  # noqa: E402
+from .bot import Bot  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -883,79 +788,14 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     sender_id=get_inbound_sender_id(reply_to),
                 )
 
-        # Build send options from Hermes metadata
-        options = SendOptions()
-        if metadata:
-            options.at_all = bool(metadata.get("at_all"))
-            raw_val = metadata.get("mention_user_ids")
-            if isinstance(raw_val, list):
-                options.mention_user_ids = ",".join(str(x) for x in raw_val if x)
-            else:
-                options.mention_user_ids = str(raw_val or "")
-            raw_val = metadata.get("mention_agent_ids")
-            if isinstance(raw_val, list):
-                options.mention_agent_ids = ",".join(str(x) for x in raw_val if x)
-            else:
-                options.mention_agent_ids = str(raw_val or "")
-
-        # Extract @ mentions from text (group messages only)
-        if group_id is not None and content:
-            try:
-                # Try cached group members first
-                members = await self._serverapi.get_group_members(
-                    str(group_id), session=session,
-                )
-                uids, aids, at_all, unmatched, content = _extract_mentions(content, members)
-
-                # Unmatched → force-refresh group members and retry once
-                if unmatched:
-                    members = await self._serverapi.get_group_members(
-                        str(group_id), force_refresh=True, session=session,
-                    )
-                    # Retry each unmatched mention individually
-                    for m in list(unmatched):
-                        if m.isdigit():
-                            aid = int(m)
-                            if any(mb.is_bot and mb.agent_id == aid for mb in members):
-                                if aid not in aids:
-                                    aids.append(aid)
-                                unmatched.remove(m)
-                        else:
-                            if any(mb.uid == m for mb in members if not mb.is_bot):
-                                if m not in uids:
-                                    uids.append(m)
-                                unmatched.remove(m)
-                    if unmatched:
-                        gw_log().info(
-                            "[iflow:send] @ mentions discarded (no member match): %s",
-                            unmatched,
-                        )
-
-                # Merge into SendOptions (metadata-explicit values take priority)
-                if at_all:
-                    options.at_all = True
-                existing_users = set(
-                    s.strip() for s in options.mention_user_ids.split(",") if s.strip()
-                )
-                for uid in uids:
-                    if uid not in existing_users:
-                        existing_users.add(uid)
-                        options.mention_user_ids = (
-                            options.mention_user_ids + "," + uid
-                            if options.mention_user_ids else uid
-                        )
-                existing_agents = set(
-                    int(s.strip()) for s in options.mention_agent_ids.split(",") if s.strip()
-                )
-                for aid in aids:
-                    if aid not in existing_agents:
-                        existing_agents.add(aid)
-                        options.mention_agent_ids = (
-                            options.mention_agent_ids + "," + str(aid)
-                            if options.mention_agent_ids else str(aid)
-                        )
-            except Exception as exc:
-                gw_log().warning("[iflow:send] @ mention extraction failed: %s", exc)
+        content, options = await prepare_outbound_message(
+            content,
+            group_id=str(group_id) if group_id is not None else None,
+            metadata=metadata,
+            get_group_members=self._serverapi.get_group_members,
+            session=session,
+            bot_agent_id=self._settings.get("app_agent_id"),
+        )
 
         # Delegate to bot
         bot_result = await self._bot.send_message(
@@ -1131,7 +971,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
 # ---------------------------------------------------------------------------
 
 try:
-    from aiohttp import web as _aiohttp_web_module  # noqa: E402
+    from aiohttp import web as _aiohttp_web_module  # noqa: E402,F401
     AIOHTTP_WEB_AVAILABLE = True
 except ImportError:
     AIOHTTP_WEB_AVAILABLE = False

@@ -6,7 +6,6 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from . import api as _api
 from .sent_store import SentMessageStore
 
 logger = logging.getLogger(__name__)
@@ -31,46 +30,42 @@ async def standalone_send(
     """
     # Lazy import to avoid circular dependency — adapter.py imports this module.
     from .adapter import InfoflowAdapter
+    from .outbound import prepare_outbound_message
+    from .serverapi import ServerAPI
     from .settings import _read_account_settings
 
     settings = _read_account_settings(pconfig)
-    account = _api.InfoflowAccountAPI(
-        api_host=settings["api_host"],
-        app_key=settings["app_key"],
-        app_secret=settings["app_secret"],
-        app_agent_id=settings["app_agent_id"],
-    )
-    if not (account.api_host and account.app_key and account.app_secret):
+    if not (settings["api_host"] and settings["app_key"] and settings["app_secret"]):
         return {"error": "Infoflow standalone send: INFOFLOW_API_HOST/APP_KEY/APP_SECRET are required"}
 
+    serverapi = ServerAPI(settings=settings)
     kind, group_id, dm_user = InfoflowAdapter._parse_target(chat_id)
-    # Build content items from message + metadata (supports @-mentions).
-    if kind == "group" and metadata:
-        # Reuse the adapter's _build_contents for metadata handling (@-mentions).
-        # We instantiate a minimal dummy so the staticmethod can be reached
-        # without a full adapter instance.
-        contents = InfoflowAdapter._build_contents(message, metadata)
-    else:
-        contents = [_api.ContentItem("markdown", message)]
+    prepared_message, options = await prepare_outbound_message(
+        message,
+        group_id=str(group_id) if kind == "group" and group_id is not None else None,
+        metadata=metadata,
+        get_group_members=serverapi.get_group_members,
+        bot_agent_id=settings.get("app_agent_id"),
+    )
 
     try:
         if kind == "group":
             if group_id is None:
                 return {"error": "Infoflow standalone send: invalid group target"}
-            res = await _api.send_group_message(
-                account,
-                group_id=group_id,
-                contents=contents,
+            result = await serverapi.send_to_group(
+                str(group_id),
+                prepared_message,
+                options=options,
             )
         else:
-            res = await _api.send_private_message(account, to_user=dm_user, contents=contents)
+            result = await serverapi.send_to_dm(dm_user, prepared_message, options=options)
     except Exception as exc:
         return {"error": f"Infoflow standalone send failed: {exc}"}
 
-    if not res.get("ok"):
-        return {"error": res.get("error") or "send failed"}
-    mid = res.get("messageid") if res.get("messageid") else res.get("msgkey")
-    msgseq = res.get("msgseqid") or ""
+    if not result.success:
+        return {"error": result.error or "send failed"}
+    mid = result.message_id
+    msgseq = result.msgseqid
 
     # Persist for cross-process recall — same DB the adapter would use.
     # Normalize chat_id so the in-process adapter's lookups still match
@@ -85,7 +80,7 @@ async def standalone_send(
                 chat_id=InfoflowAdapter._normalize_chat_id(chat_id),
                 messageid=str(mid),
                 msgseqid=str(msgseq) if msgseq else "",
-                digest=message[:80],
+                digest=prepared_message[:80],
             )
         except Exception:
             logger.debug("standalone_send: sent-store persist failed", exc_info=True)

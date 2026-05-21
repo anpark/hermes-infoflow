@@ -1,0 +1,111 @@
+from __future__ import annotations
+
+from hermes_infoflow.itypes import GroupMember
+from hermes_infoflow.outbound import prepare_outbound_message
+
+
+async def test_prepare_outbound_message_merges_metadata_and_text_mentions() -> None:
+    members = [
+        GroupMember(uid="chengbo05", name="Chengbo", is_bot=False),
+        GroupMember(uid="42", name="HelperBot", agent_id=42, is_bot=True),
+    ]
+
+    async def get_group_members(group_id: str, **kwargs):
+        assert group_id == "4507088"
+        return members
+
+    text, options = await prepare_outbound_message(
+        "@HelperBot @chengbo05 @all hello",
+        group_id="4507088",
+        metadata={"mention_user_ids": "owner", "mention_agent_ids": [99]},
+        get_group_members=get_group_members,
+    )
+
+    assert text == "@42 @chengbo05 @all hello"
+    assert options.at_all is True
+    assert options.mention_user_ids == "owner,chengbo05"
+    assert options.mention_agent_ids == "99,42"
+
+
+async def test_prepare_outbound_message_refreshes_members_for_unmatched_mentions() -> None:
+    calls: list[dict] = []
+
+    async def get_group_members(group_id: str, **kwargs):
+        calls.append(kwargs)
+        if kwargs.get("force_refresh"):
+            return [GroupMember(uid="alice", name="Alice", is_bot=False)]
+        return []
+
+    text, options = await prepare_outbound_message(
+        "@alice ping",
+        group_id="1",
+        metadata=None,
+        get_group_members=get_group_members,
+    )
+
+    assert text == "@alice ping"
+    assert options.mention_user_ids == "alice"
+    assert len(calls) == 2
+    assert calls[1]["force_refresh"] is True
+
+
+async def test_self_mention_by_name_is_dropped_to_plain_text() -> None:
+    """`@<self-bot-name>` should stay as plain text — no rewrite, no agent_ids."""
+    members = [
+        GroupMember(uid="6471", name="chengbo5.1", agent_id=6471, is_bot=True),
+        GroupMember(uid="6533", name="chengbo5.2", agent_id=6533, is_bot=True),
+    ]
+
+    async def get_group_members(group_id: str, **kwargs):
+        return members
+
+    text, options = await prepare_outbound_message(
+        "@chengbo5.1",
+        group_id="1",
+        metadata=None,
+        get_group_members=get_group_members,
+        bot_agent_id=6471,
+    )
+
+    assert text == "@chengbo5.1"  # NOT rewritten to "@6471"
+    assert options.mention_agent_ids == ""
+    assert options.at_all is False
+
+
+async def test_self_mention_by_digit_id_is_dropped() -> None:
+    """`@<self-agent-id>` in text should also be discarded."""
+    members = [
+        GroupMember(uid="6471", name="chengbo5.1", agent_id=6471, is_bot=True),
+        GroupMember(uid="6533", name="chengbo5.2", agent_id=6533, is_bot=True),
+    ]
+
+    async def get_group_members(group_id: str, **kwargs):
+        return members
+
+    text, options = await prepare_outbound_message(
+        "@6471 hi @6533",
+        group_id="1",
+        metadata=None,
+        get_group_members=get_group_members,
+        bot_agent_id=6471,
+    )
+
+    assert text == "@6471 hi @6533"
+    assert options.mention_agent_ids == "6533"
+
+
+async def test_self_mention_via_metadata_is_filtered() -> None:
+    """Explicit ``metadata.mention_agent_ids`` must also drop self."""
+
+    async def get_group_members(group_id: str, **kwargs):
+        return []
+
+    _text, options = await prepare_outbound_message(
+        "hello",
+        group_id="1",
+        metadata={"mention_agent_ids": "6471,6533,6471"},
+        get_group_members=get_group_members,
+        bot_agent_id=6471,
+    )
+
+    assert options.mention_agent_ids == "6533"
