@@ -136,6 +136,10 @@ _send_path_cv: contextvars.ContextVar[str] = contextvars.ContextVar(
     "send_path", default="",
 )
 
+_reaction_promise_cv: contextvars.ContextVar[dict[str, Any] | None] = (
+    contextvars.ContextVar("reaction_promise", default=None)
+)
+
 # Static refusal-regex filter — used in send_message as a zero-latency
 # fallback against GLM occasionally violating the NO_REPLY contract.
 # Matches refusal declarations at the start of a line; only applied on the
@@ -156,6 +160,7 @@ _NO_REPLY_PUNCT = "。，,.！!？?~～ \t\n;；:："
 
 # Emoji reaction shown while LLM is processing (敲键盘).
 _EMOJI_PROCESSING = ("d135", "(qjp)")
+_REACTION_FALLBACK_CLEANUP_SECONDS = 10 * 60
 
 
 def no_reply_sentinel_hits(text: str | None) -> bool:
@@ -209,6 +214,7 @@ class Bot:
         self._message_store = message_store
         self._admin_uid = admin_uid.strip().lower()
         self._robot_id: str = str(settings.get("robot_id") or "")
+        self._reaction_cleanup_tasks: set[asyncio.Task[Any]] = set()
         gw_log().info("[infoflow] Bot init: robot_id=%s admin_uid=%s", self._robot_id, self._admin_uid)
 
     # -- robot_id management ------------------------------------------------
@@ -608,6 +614,43 @@ class Bot:
         except Exception:
             gw_log().exception("[iflow:reaction] del raised")
 
+    async def _delete_reaction_promise(
+        self,
+        promise: dict[str, Any] | None,
+        *,
+        reason: str,
+    ) -> None:
+        """Delete a promised processing reaction at most once."""
+        if not promise or promise.get("deleted"):
+            return
+        handle = promise.get("handle")
+        if not isinstance(handle, dict):
+            return
+        promise["deleted"] = True
+        gw_log().info(
+            "[iflow:reaction] delete reason=%s mid=%s",
+            reason,
+            handle.get("base_msg_id", "-"),
+        )
+        await self._try_delete_reaction(handle)
+
+    async def _cleanup_reaction_after_timeout(self, promise: dict[str, Any]) -> None:
+        try:
+            await asyncio.sleep(_REACTION_FALLBACK_CLEANUP_SECONDS)
+            await self._delete_reaction_promise(promise, reason="timeout")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            gw_log().exception("[iflow:reaction] fallback cleanup failed")
+
+    def _schedule_reaction_fallback_cleanup(self, promise: dict[str, Any]) -> None:
+        task = asyncio.create_task(self._cleanup_reaction_after_timeout(promise))
+        self._reaction_cleanup_tasks.add(task)
+        task.add_done_callback(self._reaction_cleanup_tasks.discard)
+
+    async def _delete_current_reaction_promise(self, *, reason: str) -> None:
+        await self._delete_reaction_promise(_reaction_promise_cv.get(None), reason=reason)
+
     # -- dispatch orchestration ---------------------------------------------
 
     async def dispatch_inbound(
@@ -623,11 +666,14 @@ class Bot:
         _send_path_cv.set(decision.trigger_reason or "")
         hint = msg.message_id or None
 
+        reaction_token = None
+        reaction_promise: dict[str, Any] | None = None
         reaction = self._build_reaction_handle(msg, decision)
         if reaction:
             ok = await self._try_add_reaction(reaction)
-            if not ok:
-                reaction = None
+            if ok:
+                reaction_promise = {"handle": reaction, "deleted": False}
+                reaction_token = _reaction_promise_cv.set(reaction_promise)
 
         try:
             with recall_inbound_message_id_hint_scope(hint):
@@ -638,8 +684,10 @@ class Bot:
         except Exception:
             gw_log().exception("[infoflow] inbound dispatch failed")
         finally:
-            if reaction:
-                await self._try_delete_reaction(reaction)
+            if reaction_promise is not None and not reaction_promise.get("deleted"):
+                self._schedule_reaction_fallback_cleanup(reaction_promise)
+            if reaction_token is not None:
+                _reaction_promise_cv.reset(reaction_token)
             _send_path_cv.set("")
 
     def spawn_dispatch(
@@ -682,6 +730,7 @@ class Bot:
                 "[iflow:send] mid=%s path=%s NO_REPLY sentinel suppressed",
                 _mid_var.get(""), _path,
             )
+            await self._delete_current_reaction_promise(reason="no_reply")
             return SentResult(success=True)
 
         # Static refusal-regex filter (zero-latency Layer-3 fallback).
@@ -696,6 +745,7 @@ class Bot:
                 "[iflow:send] mid=%s path=%s refusal-regex SUPPRESS preview=%r",
                 _mid_var.get(""), _path, (text or "")[:60],
             )
+            await self._delete_current_reaction_promise(reason="refusal_suppressed")
             return SentResult(success=True)
 
         # Truncate into chunks (Hermes convention, 2KB per message ceiling)
@@ -757,6 +807,7 @@ class Bot:
             gw_log().info("[iflow:send] mid=%s step=record_bot_reply group=%s reply_to=%s", _mid_var.get(""), group_id, _reply_key)
 
         if first_error:
+            await self._delete_current_reaction_promise(reason="send_error")
             return SentResult(
                 success=False,
                 message_id=last_message_id,
@@ -765,6 +816,7 @@ class Bot:
                     if succeeded else first_error
                 ),
             )
+        await self._delete_current_reaction_promise(reason="send_complete")
         return SentResult(success=True, message_id=last_message_id)
 
     # ======================================================================
@@ -793,6 +845,7 @@ class Bot:
                 dm_user_id, image_bytes, caption=caption, session=session,
             )
         else:
+            await self._delete_current_reaction_promise(reason="image_no_target")
             return SentResult(success=False, error="no target specified")
 
         if result.success:
@@ -814,6 +867,7 @@ class Bot:
                     reply_to_sender=_reply_key,
                 )
                 gw_log().info("[iflow:send] mid=%s step=record_bot_reply group=%s (image) reply_to=%s", _mid_var.get(""), group_id, _reply_key)
+        await self._delete_current_reaction_promise(reason="image_complete")
         return result
 
     # ======================================================================

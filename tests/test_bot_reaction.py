@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -165,7 +166,31 @@ def test_reaction_from_uid_degraded_human_skipped() -> None:
 
 
 @pytest.mark.asyncio
-async def test_dispatch_adds_and_deletes_reaction() -> None:
+async def test_dispatch_adds_reaction_and_deletes_on_no_reply_send() -> None:
+    bot = _bot()
+    msg = _group_msg()
+    decision = PolicyDecision(
+        should_dispatch=True,
+        action=Action.DISPATCH,
+        trigger_reason="bot-mentioned",
+    )
+    adapter = MagicMock()
+    adapter.build_message_event = AsyncMock(return_value={"event": True})
+
+    async def _handle_message(_event):
+        await bot.send_message(group_id="4507088", text="NO_REPLY")
+
+    adapter.handle_message = AsyncMock(side_effect=_handle_message)
+
+    await bot.dispatch_inbound(msg, decision, adapter)
+
+    bot._serverapi.add_message_reaction.assert_awaited_once()
+    bot._serverapi.delete_message_reaction.assert_awaited_once()
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_does_not_delete_when_handle_message_returns_before_send() -> None:
     bot = _bot()
     msg = _group_msg()
     decision = PolicyDecision(
@@ -176,12 +201,48 @@ async def test_dispatch_adds_and_deletes_reaction() -> None:
     adapter = MagicMock()
     adapter.build_message_event = AsyncMock(return_value={"event": True})
     adapter.handle_message = AsyncMock()
+    bot._schedule_reaction_fallback_cleanup = MagicMock()
 
     await bot.dispatch_inbound(msg, decision, adapter)
 
     bot._serverapi.add_message_reaction.assert_awaited_once()
+    bot._serverapi.delete_message_reaction.assert_not_awaited()
+    bot._schedule_reaction_fallback_cleanup.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_background_send_inherits_reaction_and_deletes_later() -> None:
+    bot = _bot()
+    msg = _group_msg()
+    decision = PolicyDecision(
+        should_dispatch=True,
+        action=Action.DISPATCH,
+        trigger_reason="bot-mentioned",
+    )
+    adapter = MagicMock()
+    adapter.build_message_event = AsyncMock(return_value={"event": True})
+    release = asyncio.Event()
+    background_task: asyncio.Task | None = None
+
+    async def _delayed_send():
+        await release.wait()
+        await bot.send_message(group_id="4507088", text="NO_REPLY")
+
+    async def _handle_message(_event):
+        nonlocal background_task
+        background_task = asyncio.create_task(_delayed_send())
+
+    adapter.handle_message = AsyncMock(side_effect=_handle_message)
+    bot._schedule_reaction_fallback_cleanup = MagicMock()
+
+    await bot.dispatch_inbound(msg, decision, adapter)
+    bot._serverapi.delete_message_reaction.assert_not_awaited()
+
+    release.set()
+    assert background_task is not None
+    await background_task
+
     bot._serverapi.delete_message_reaction.assert_awaited_once()
-    adapter.handle_message.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -207,7 +268,7 @@ async def test_dispatch_add_fail_skips_delete() -> None:
 
 
 @pytest.mark.asyncio
-async def test_dispatch_deletes_reaction_on_handle_error() -> None:
+async def test_dispatch_handle_error_schedules_fallback_cleanup() -> None:
     bot = _bot()
     msg = _group_msg()
     decision = PolicyDecision(
@@ -218,8 +279,10 @@ async def test_dispatch_deletes_reaction_on_handle_error() -> None:
     adapter = MagicMock()
     adapter.build_message_event = AsyncMock(return_value={})
     adapter.handle_message = AsyncMock(side_effect=RuntimeError("boom"))
+    bot._schedule_reaction_fallback_cleanup = MagicMock()
 
     with patch("hermes_infoflow.bot.gw_log"):
         await bot.dispatch_inbound(msg, decision, adapter)
 
-    bot._serverapi.delete_message_reaction.assert_awaited_once()
+    bot._serverapi.delete_message_reaction.assert_not_awaited()
+    bot._schedule_reaction_fallback_cleanup.assert_called_once()
