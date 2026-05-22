@@ -816,14 +816,17 @@ def register_sessiontracker_routes(
         response = web.StreamResponse(status=200, headers=_SSE_RESPONSE_HEADERS)
         await response.prepare(request)
 
-        seq_cursor = cursor
-        for block in collect_terminal_blocks(tracker, sid, cursor=cursor):
-            seq_cursor = max(seq_cursor, int(block.get("seq", 0)))
-            payload = json.dumps(block, ensure_ascii=False, default=str)
-            await response.write(f"data: {payload}\n\n".encode())
-
+        # Subscribe BEFORE backfill so events that arrive between the snapshot
+        # iteration and the queue join are not dropped. We dedupe by seq when
+        # draining the queue so events covered by the backfill are not resent.
         q = tracker.subscribe(sid)
         try:
+            seq_cursor = cursor
+            for block in collect_terminal_blocks(tracker, sid, cursor=cursor):
+                seq_cursor = max(seq_cursor, int(block.get("seq", 0)))
+                payload = json.dumps(block, ensure_ascii=False, default=str)
+                await response.write(f"data: {payload}\n\n".encode())
+
             while True:
                 try:
                     ev = await asyncio.wait_for(q.get(), timeout=25.0)

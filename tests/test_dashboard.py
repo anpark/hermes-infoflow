@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 
 import pytest
 
@@ -660,6 +662,89 @@ def test_lookup_session_id_prefers_active_over_stale_map(tracker: SessionTracker
     meta_new.status = "active"
 
     assert tracker.lookup_session_id("group:9") == "new-active"
+
+
+@pytest.mark.asyncio
+async def test_sse_dedup_when_event_arrives_between_snapshot_and_drain() -> None:
+    """Regression: the api_session_events handler must subscribe BEFORE
+    building the snapshot, otherwise events that arrive in the gap window
+    between snapshot iteration and queue join are silently dropped.
+
+    We simulate the race by pushing a second event after the response has
+    been prepared but before the test client finishes reading. With the
+    pre-subscribe fix the second event must arrive on the SSE stream,
+    and the snapshot events must NOT be re-delivered through the queue.
+    """
+    pytest.importorskip("aiohttp")
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    tr = SessionTracker(buffer_size=50)
+    app = web.Application()
+    register_routes(app, tr, base_path="/webhook/infoflow")
+
+    sid = "sse-race"
+    tr.push_event(sid, "session.start", {"model": "t"}, platform="infoflow")
+    tr.push_event(sid, "display.tool_line", {"line": "first"}, platform="infoflow")
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get(
+            f"/webhook/infoflow/dashboard/api/sessions/{sid}/events?cursor=0"
+        )
+        assert resp.status == 200
+
+        async def _push_late_event_then_close() -> None:
+            await asyncio.sleep(0.05)
+            tr.push_event(sid, "display.tool_line", {"line": "late"}, platform="infoflow")
+            await asyncio.sleep(0.05)
+            tr.push_event(sid, "session.end", {"completed": True}, platform="infoflow")
+            tr.push_event(sid, "session.end", {"completed": True}, platform="infoflow")
+
+        pusher = asyncio.create_task(_push_late_event_then_close())
+
+        snapshot_seen = False
+        late_seen = False
+        snapshot_seq_max = 0
+        live_seqs: list[int] = []
+        try:
+            async for raw in resp.content:
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                if line.startswith("event: snapshot"):
+                    snapshot_seen = True
+                    continue
+                if not line.startswith("data:"):
+                    continue
+                payload = json.loads(line[len("data:"):].strip())
+                if "events" in payload:
+                    for ev in payload["events"]:
+                        snapshot_seq_max = max(snapshot_seq_max, int(ev.get("seq", 0)))
+                    continue
+                seq = int(payload.get("seq", 0))
+                live_seqs.append(seq)
+                if payload.get("kind") == "display.tool_line" and (
+                    payload.get("payload", {}).get("line") == "late"
+                ):
+                    late_seen = True
+                if len(live_seqs) >= 3:
+                    break
+        finally:
+            pusher.cancel()
+            with contextlib.suppress(Exception):
+                await pusher
+            resp.close()
+
+        assert snapshot_seen, "initial snapshot must be sent"
+        assert late_seen, (
+            "event pushed after the snapshot must reach the SSE consumer "
+            "(pre-subscribe fix)"
+        )
+        # No live event should repeat a seq already covered by the snapshot.
+        assert all(s > snapshot_seq_max for s in live_seqs), (
+            f"snapshot covered up to seq {snapshot_seq_max} but live stream "
+            f"replayed seqs {live_seqs}"
+        )
 
 
 @pytest.mark.asyncio

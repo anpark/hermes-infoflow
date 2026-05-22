@@ -1182,17 +1182,23 @@ def register_routes(app: Any, tracker: SessionTracker, *, base_path: str) -> Non
         response = web.StreamResponse(status=200, headers=_SSE_RESPONSE_HEADERS)
         await response.prepare(request)
 
-        detail = tracker.session_detail(sid, cursor=cursor)
-        if detail:
-            snap = json.dumps(
-                {"meta": detail["meta"], "events": detail["events"]},
-                ensure_ascii=False,
-                default=str,
-            )
-            await response.write(f"event: snapshot\ndata: {snap}\n\n".encode())
-
+        # Subscribe BEFORE building the snapshot so events that arrive
+        # between snapshot construction and the queue join are not
+        # dropped. The drain loop dedupes by seq so events covered by the
+        # snapshot are not resent.
         q = tracker.subscribe(sid)
         try:
+            detail = tracker.session_detail(sid, cursor=cursor)
+            if detail:
+                snap = json.dumps(
+                    {"meta": detail["meta"], "events": detail["events"]},
+                    ensure_ascii=False,
+                    default=str,
+                )
+                await response.write(f"event: snapshot\ndata: {snap}\n\n".encode())
+                for ev in detail["events"]:
+                    cursor = max(cursor, int(ev.get("seq", 0)))
+
             while True:
                 try:
                     ev = await asyncio.wait_for(q.get(), timeout=25.0)
