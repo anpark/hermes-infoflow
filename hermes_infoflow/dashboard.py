@@ -442,6 +442,8 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
     """Build hermes-agent plugin hook callbacks for the tracker."""
 
     _stream_state: dict[str, dict[str, Any]] = {}
+    _last_streamed_text: dict[str, str] = {}
+    _tool_progress_ended: dict[str, set[str]] = {}
 
     def _safe(fn: Callable[..., Any]) -> Callable[..., Any]:
         def wrapper(**kwargs: Any) -> None:
@@ -522,9 +524,18 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
     def post_llm_call(**kw: Any) -> None:
         sid = kw.get("session_id") or ""
         plat = _platform_str(kw.get("platform"))
+        model = str(kw.get("model") or "")
         text = kw.get("assistant_response") or ""
+
         active = _stream_state.pop(sid, None)
-        if active and text:
+        already_streamed = _last_streamed_text.pop(sid, "")
+
+        if not text:
+            pass
+        elif active:
+            # A stream segment opened but never received its final boundary
+            # (e.g. provider didn't fire _reset_stream_delivery_tracking).
+            # Seal it now and skip pushing a second display.hermes.
             tracker.push_event(
                 sid,
                 "display.hermes_stream",
@@ -535,16 +546,22 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
                     "final": True,
                 },
                 platform=plat,
-                model=str(kw.get("model") or ""),
+                model=model,
             )
+        elif already_streamed and already_streamed == text:
+            # Stream already finalized exactly this text — no extra UI line.
+            pass
         else:
+            # Non-streaming provider (e.g. some codex paths) or the final
+            # text differs after post-stream transforms — render once.
             tracker.push_event(
                 sid,
                 "display.hermes",
                 {"text": _trunc(text, MAX_TEXT_PREVIEW)},
                 platform=plat,
-                model=str(kw.get("model") or ""),
+                model=model,
             )
+
         tracker.push_event(
             sid,
             "llm.response",
@@ -553,7 +570,7 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
                 "model": kw.get("model"),
             },
             platform=plat,
-            model=str(kw.get("model") or ""),
+            model=model,
         )
 
     @_safe
@@ -583,6 +600,19 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
         tool_name = kw.get("tool_name") or ""
         args = kw.get("args") if isinstance(kw.get("args"), dict) else {}
         duration_ms = kw.get("duration_ms") or 0
+        tool_call_id = str(kw.get("tool_call_id") or "")
+
+        # When a richer on_tool_progress(stage=end) already pushed a
+        # display.tool_progress line for this tool_call_id, do not also push
+        # display.tool_line — they render the same logical event and would
+        # appear twice in the Session Tracker terminal.
+        progress_ended = _tool_progress_ended.get(sid, set())
+        suppress_tool_line = tool_call_id in progress_ended
+        if tool_call_id and progress_ended:
+            progress_ended.discard(tool_call_id)
+            if not progress_ended:
+                _tool_progress_ended.pop(sid, None)
+
         line = ""
         try:
             from agent.display import get_cute_tool_message
@@ -596,7 +626,7 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
                 line = f"{line} [error]"
         except Exception:
             line = f"┊ ⚙️ {tool_name}  {float(duration_ms) / 1000.0:.1f}s"
-        if line:
+        if line and not suppress_tool_line:
             tracker.push_event(
                 sid,
                 "display.tool_line",
@@ -710,11 +740,39 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
         content_type = str(kw.get("content_type") or "text")
         if content_type != "text":
             return
+        final = bool(kw.get("final"))
+        stream_id = str(kw.get("stream_id") or "")
+        plat = _platform_str(kw.get("platform"))
+        model = str(kw.get("model") or "")
+
+        if final:
+            active = _stream_state.pop(sid, None)
+            text = (
+                kw.get("message_so_far")
+                or (active.get("text") if active else "")
+                or kw.get("delta_text")
+                or ""
+            )
+            if not text:
+                return
+            _last_streamed_text[sid] = text
+            tracker.push_event(
+                sid,
+                "display.hermes_stream",
+                {
+                    "text": _trunc(text, MAX_TEXT_PREVIEW),
+                    "stream_id": stream_id or (active or {}).get("stream_id", ""),
+                    "model": kw.get("model"),
+                    "final": True,
+                },
+                platform=plat,
+                model=model,
+            )
+            return
+
         text = kw.get("message_so_far") or kw.get("delta_text") or ""
         if not text:
             return
-        stream_id = str(kw.get("stream_id") or "")
-        plat = _platform_str(kw.get("platform"))
         _stream_state[sid] = {"stream_id": stream_id, "text": text}
         tracker.push_event(
             sid,
@@ -726,7 +784,7 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
                 "final": False,
             },
             platform=plat,
-            model=str(kw.get("model") or ""),
+            model=model,
         )
 
     @_safe
@@ -736,7 +794,10 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
             return
         stage = str(kw.get("stage") or "")
         tool_name = str(kw.get("tool_name") or "tool")
+        tool_call_id = str(kw.get("tool_call_id") or "")
         text = kw.get("text") or ""
+        if stage == "end" and tool_call_id:
+            _tool_progress_ended.setdefault(sid, set()).add(tool_call_id)
         if stage == "start":
             try:
                 from agent.display import get_tool_emoji
@@ -762,7 +823,7 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
                 "line": line_text,
                 "stage": stage,
                 "tool_name": tool_name,
-                "tool_call_id": kw.get("tool_call_id") or "",
+                "tool_call_id": tool_call_id,
                 "duration_ms": kw.get("duration_ms"),
                 "is_error": bool(kw.get("is_error")),
             },
@@ -776,6 +837,11 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
         text = kw.get("message_text") or ""
         if not text:
             return
+        # If the same content was already shown via on_stream_delta, skip the
+        # interim line to avoid rendering the same sentence twice (stream box +
+        # interim line).
+        if kw.get("already_streamed"):
+            return
         plat = _platform_str(kw.get("platform"))
         tracker.push_event(
             sid,
@@ -783,7 +849,7 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
             {
                 "text": _trunc(text, MAX_TEXT_PREVIEW),
                 "reason": kw.get("reason") or "",
-                "already_streamed": bool(kw.get("already_streamed")),
+                "already_streamed": False,
                 "model": kw.get("model"),
             },
             platform=plat,

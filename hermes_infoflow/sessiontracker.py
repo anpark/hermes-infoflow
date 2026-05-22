@@ -578,8 +578,29 @@ function resetRenderState() {
   progressLines.clear();
 }
 
+let streamReconnectTimer = null;
+let streamReconnectBackoffMs = 1000;
+const STREAM_RECONNECT_MAX_MS = 30000;
+
+function scheduleStreamReconnect() {
+  if (streamReconnectTimer) return;
+  const delay = streamReconnectBackoffMs;
+  streamReconnectBackoffMs = Math.min(
+    STREAM_RECONNECT_MAX_MS,
+    Math.max(1000, streamReconnectBackoffMs * 2)
+  );
+  streamReconnectTimer = setTimeout(() => {
+    streamReconnectTimer = null;
+    connectStream();
+  }, delay);
+}
+
 function connectStream() {
   if (!sessionId) return;
+  if (streamReconnectTimer) {
+    clearTimeout(streamReconnectTimer);
+    streamReconnectTimer = null;
+  }
   if (eventSource) {
     eventSource.close();
     eventSource = null;
@@ -588,14 +609,28 @@ function connectStream() {
   const url = apiBase + '/stream?session_id=' + encodeURIComponent(sessionId)
     + '&cursor=' + lineCursor + (streamQs ? '&' + streamQs : '');
   eventSource = new EventSource(url);
+  eventSource.onopen = () => {
+    streamReconnectBackoffMs = 1000;
+  };
   eventSource.onmessage = (msg) => {
     try {
       const block = JSON.parse(msg.data);
-      if (block.seq > lineCursor) lineCursor = block.seq;
+      // Guard against duplicate replays on browser-initiated reconnect:
+      // the EventSource may resend buffered events from before `lineCursor`.
+      if (typeof block.seq === 'number' && block.seq <= lineCursor) return;
+      if (typeof block.seq === 'number') lineCursor = block.seq;
       appendBlock(block);
     } catch (_) {}
   };
-  eventSource.onerror = () => { /* browser will retry */ };
+  eventSource.onerror = () => {
+    // Force the next reconnect to use the most recent lineCursor so we don't
+    // re-receive (and re-render) events the client already processed.
+    if (eventSource) {
+      eventSource.close();
+      eventSource = null;
+    }
+    scheduleStreamReconnect();
+  };
 }
 
 async function loadHistory() {

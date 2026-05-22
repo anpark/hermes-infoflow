@@ -367,6 +367,188 @@ def test_on_interim_assistant_pushes_interim_line(tracker: SessionTracker) -> No
     assert events[0].payload["reason"] == "pre_tool"
 
 
+def test_on_interim_assistant_skips_when_already_streamed(tracker: SessionTracker) -> None:
+    """When the sentence was emitted via on_stream_delta, suppress the interim
+    line so we don't render the same content twice."""
+    hooks = make_plugin_hooks(tracker)
+    hooks["on_interim_assistant"](
+        session_id="sess-ia2",
+        platform="infoflow",
+        model="m",
+        message_text="checking…",
+        already_streamed=True,
+        reason="pre_tool",
+    )
+    events = [e for e in tracker.snapshot("sess-ia2") if e.kind == "display.interim"]
+    assert events == []
+
+
+def test_on_stream_delta_final_marks_stream_box(tracker: SessionTracker) -> None:
+    hooks = make_plugin_hooks(tracker)
+    hooks["on_stream_delta"](
+        session_id="sess-end",
+        platform="infoflow",
+        model="m",
+        delta_text="Hi",
+        content_type="text",
+        message_so_far="Hi",
+        stream_id="stream-end-1",
+        final=False,
+    )
+    hooks["on_stream_delta"](
+        session_id="sess-end",
+        platform="infoflow",
+        model="m",
+        delta_text="",
+        content_type="text",
+        message_so_far="Hi there",
+        stream_id="stream-end-1",
+        final=True,
+    )
+    finals = [
+        e for e in tracker.snapshot("sess-end")
+        if e.kind == "display.hermes_stream" and e.payload.get("final")
+    ]
+    assert len(finals) == 1
+    assert finals[0].payload["text"] == "Hi there"
+    assert finals[0].payload["stream_id"] == "stream-end-1"
+
+
+def test_post_llm_call_skips_display_hermes_when_text_matches_finalized_stream(
+    tracker: SessionTracker,
+) -> None:
+    """If the stream already finalized with the exact same text, post_llm_call
+    must not push an extra display.hermes (it would double-render)."""
+    hooks = make_plugin_hooks(tracker)
+    hooks["on_stream_delta"](
+        session_id="sess-dup",
+        platform="infoflow",
+        model="m",
+        delta_text="Hello",
+        content_type="text",
+        message_so_far="Hello world",
+        stream_id="stream-dup-1",
+        final=False,
+    )
+    hooks["on_stream_delta"](
+        session_id="sess-dup",
+        platform="infoflow",
+        model="m",
+        delta_text="",
+        content_type="text",
+        message_so_far="Hello world",
+        stream_id="stream-dup-1",
+        final=True,
+    )
+    hooks["post_llm_call"](
+        session_id="sess-dup",
+        user_message="hi",
+        assistant_response="Hello world",
+        conversation_history=[],
+        model="m",
+        platform="infoflow",
+    )
+    snap = tracker.snapshot("sess-dup")
+    assert all(e.kind != "display.hermes" for e in snap)
+    finals = [
+        e for e in snap
+        if e.kind == "display.hermes_stream" and e.payload.get("final")
+    ]
+    assert len(finals) == 1
+
+
+def test_post_llm_call_pushes_display_hermes_when_text_diverges(
+    tracker: SessionTracker,
+) -> None:
+    """If post-stream transformations change the final text vs. what was
+    streamed, render the corrected version once."""
+    hooks = make_plugin_hooks(tracker)
+    hooks["on_stream_delta"](
+        session_id="sess-div",
+        platform="infoflow",
+        model="m",
+        delta_text="Hi",
+        content_type="text",
+        message_so_far="Hi raw",
+        stream_id="stream-div-1",
+        final=False,
+    )
+    hooks["on_stream_delta"](
+        session_id="sess-div",
+        platform="infoflow",
+        model="m",
+        delta_text="",
+        content_type="text",
+        message_so_far="Hi raw",
+        stream_id="stream-div-1",
+        final=True,
+    )
+    hooks["post_llm_call"](
+        session_id="sess-div",
+        user_message="hi",
+        assistant_response="Hi polished",
+        conversation_history=[],
+        model="m",
+        platform="infoflow",
+    )
+    snap = tracker.snapshot("sess-div")
+    hermes_events = [e for e in snap if e.kind == "display.hermes"]
+    assert len(hermes_events) == 1
+    assert hermes_events[0].payload["text"] == "Hi polished"
+
+
+def test_post_tool_call_skips_tool_line_when_progress_end_already_fired(
+    tracker: SessionTracker,
+) -> None:
+    """on_tool_progress(stage=end) already rendered the tool completion as
+    a display.tool_progress line. post_tool_call must not duplicate it via
+    display.tool_line for the same tool_call_id."""
+    hooks = make_plugin_hooks(tracker)
+    hooks["on_tool_progress"](
+        session_id="sess-td",
+        task_id="",
+        tool_name="search_files",
+        tool_call_id="tc-dup",
+        stage="end",
+        text="",
+        duration_ms=500.0,
+        is_error=False,
+    )
+    hooks["post_tool_call"](
+        tool_name="search_files",
+        args={"query": "foo"},
+        result="ok",
+        task_id="",
+        session_id="sess-td",
+        tool_call_id="tc-dup",
+        duration_ms=500,
+    )
+    kinds = [e.kind for e in tracker.snapshot("sess-td")]
+    assert "display.tool_progress" in kinds
+    assert "display.tool_line" not in kinds
+    assert "tool.end" in kinds
+
+
+def test_post_tool_call_still_renders_tool_line_when_no_progress_hook(
+    tracker: SessionTracker,
+) -> None:
+    """If on_tool_progress never fired (e.g. older hermes-agent without the
+    hook), post_tool_call must still emit display.tool_line."""
+    hooks = make_plugin_hooks(tracker)
+    hooks["post_tool_call"](
+        tool_name="search_files",
+        args={"query": "bar"},
+        result="ok",
+        task_id="",
+        session_id="sess-tline",
+        tool_call_id="tc-only",
+        duration_ms=300,
+    )
+    kinds = [e.kind for e in tracker.snapshot("sess-tline")]
+    assert "display.tool_line" in kinds
+    assert "tool.end" in kinds
+
+
 def test_lookup_session_id_prefers_active_over_stale_map(tracker: SessionTracker) -> None:
     tracker.bind_chat("group:9", "old-ended")
     tracker.push_event(
