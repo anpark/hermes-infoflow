@@ -163,6 +163,51 @@ def test_pre_gateway_dispatch_peek_without_create(tracker: SessionTracker) -> No
     assert kinds == ["inbound", "display.user"]
 
 
+def test_pre_gateway_dispatch_display_user_filters_injected_prompt(
+    tracker: SessionTracker,
+) -> None:
+    from types import SimpleNamespace
+
+    class _Platform:
+        value = "infoflow"
+
+    source = SimpleNamespace(
+        platform=_Platform(),
+        chat_id="alice",
+        chat_type="dm",
+        user_id="alice",
+        user_name="Alice",
+    )
+    full_text = (
+        "Infoflow injected prompt\n\n"
+        "[Sender: alice | human]\n"
+        "[message_id: mid-1]\n"
+        "[Message]\n"
+        "  真实用户消息\n第二行  "
+    )
+    event = SimpleNamespace(source=source, text=full_text)
+    entry = SimpleNamespace(session_id="gw-sess-1", session_key="agent:main:infoflow:dm:alice")
+
+    session_store = SimpleNamespace(_entries={"agent:main:infoflow:dm:alice": entry})
+    session_store._ensure_loaded = lambda: None  # type: ignore[method-assign]
+    gateway = SimpleNamespace(
+        _session_key_for_source=lambda src: "agent:main:infoflow:dm:alice",
+    )
+
+    hooks = make_plugin_hooks(tracker)
+    hooks["pre_gateway_dispatch"](
+        event=event,
+        gateway=gateway,
+        session_store=session_store,
+    )
+
+    events = tracker.snapshot("gw-sess-1")
+    inbound = next(e for e in events if e.kind == "inbound")
+    display = next(e for e in events if e.kind == "display.user")
+    assert inbound.payload["text"] == full_text
+    assert display.payload["text"] == "  真实用户消息\n第二行  "
+
+
 def test_pre_llm_call_binds_from_meta_chat_id(tracker: SessionTracker) -> None:
     tracker.push_event("", "inbound", {"x": 1}, platform="infoflow", chat_id="carol")
     tracker.bind_chat("carol", "sess-carol")

@@ -14,6 +14,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import time
 from collections import deque
 from collections.abc import Callable
@@ -399,6 +400,24 @@ def _trunc(value: Any, limit: int = MAX_TEXT_PREVIEW) -> Any:
     return s
 
 
+_MESSAGE_LINE_RE = re.compile(r"(?m)^\[Message\][ \t]*\r?$")
+
+
+def _sessiontracker_user_display_text(value: Any) -> str:
+    """Return only the user-visible message body for Session Tracker."""
+    text = "" if value is None else str(value)
+    match = _MESSAGE_LINE_RE.search(text)
+    if match is None:
+        return text
+
+    body = text[match.end():]
+    if body.startswith("\r\n"):
+        body = body[2:]
+    elif body.startswith(("\n", "\r")):
+        body = body[1:]
+    return body
+
+
 def _platform_str(platform: Any) -> str:
     if platform is None:
         return ""
@@ -727,11 +746,12 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
             chat_id=chat_id,
         )
         if text:
+            display_text = _sessiontracker_user_display_text(text)
             tracker.push_event(
                 target_sid,
                 "display.user",
                 {
-                    "text": _trunc(text, MAX_TEXT_PREVIEW),
+                    "text": _trunc(display_text, MAX_TEXT_PREVIEW),
                     "user_id": user_id,
                     "user_name": getattr(source, "user_name", None),
                     "chat_id": chat_id,
