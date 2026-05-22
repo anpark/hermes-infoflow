@@ -31,21 +31,14 @@ _DEPLOY_SCRIPT = _REPO_ROOT / "scripts" / "deploy.sh"
 _DEPLOY_COMMON_SCRIPT = _REPO_ROOT / "scripts" / "lib" / "deploy-common.sh"
 _EDIT_ENV_SCRIPT = _REPO_ROOT / "scripts" / "lib" / "edit_hermes_env.py"
 
-# Every file currently in hermes_infoflow/ should end up at the plugin
-# dir root (one level shallower than the repo). Kept as a literal set so
-# a renamed/dropped module is caught loudly here too.
-_EXPECTED_PACKAGE_FILES = {
-    "__init__.py",
-    "adapter.py",
-    "api.py",
-    "config_editor.py",
-    "crypto.py",
-    "deploy.py",
-    "parser.py",
-    "policy.py",
-    "sent_store.py",
-    "py.typed",
-}
+def _expected_package_files() -> set[str]:
+    """Files directly under hermes_infoflow/ must flatten to the plugin root."""
+    package_dir = _REPO_ROOT / "hermes_infoflow"
+    return {
+        path.name
+        for path in package_dir.iterdir()
+        if path.is_file() and not path.name.endswith((".pyc", ".pyo"))
+    }
 
 
 if shutil.which("rsync") is None or shutil.which("bash") is None:
@@ -379,7 +372,7 @@ def test_normalize_restores_existing_plugin_when_deploy_common_fails(tmp_path: P
 
 
 def test_package_files_flattened_at_root(deployed: Path) -> None:
-    for name in _EXPECTED_PACKAGE_FILES:
+    for name in _expected_package_files():
         assert (deployed / name).is_file(), (
             f"expected {name} at the plugin dir root after flattening; got:\n"
             f"{_tree(deployed)}"

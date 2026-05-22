@@ -44,10 +44,13 @@ description: >
 author: chengbo05 <chengbo05@baidu.com>
 
 # ``requires_env`` / ``optional_env`` are surfaced by hermes_cli/config.py's
-# platform-plugin env var injector in the `hermes config` setup wizard —
-# ONLY when this plugin is loaded as a directory plugin (paths A / B-extract / D).
-# Entry-point installs (paths B-pip / C) do not read plugin.yaml, so users on
-# those paths must export INFOFLOW_* manually. See README for details.
+# platform-plugin env var injector in the `hermes config` setup wizard only
+# when Hermes loads this as a directory plugin. All complete install commands
+# documented in README normalize/deploy to ``~/.hermes/plugins/infoflow`` and
+# therefore use this manifest. A raw ``pip install hermes-infoflow`` without
+# ``hermes-infoflow-deploy`` remains entry-point-only and does not read
+# ``plugin.yaml``; it is kept for discovery compatibility, not as a complete
+# install path.
 requires_env:
   - name: INFOFLOW_CHECK_TOKEN
     description: "Infoflow check token (used for echostr signature verification)"
