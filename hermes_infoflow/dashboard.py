@@ -262,25 +262,51 @@ class SessionTracker:
         self.bind_chat(chat_id, session_id)
         return chat_id
 
+    def meta_matches_canonical(self, meta: SessionMeta, canonical_chat_id: str) -> bool:
+        """Whether tracker meta belongs to a DM uuap or group target."""
+        canonical = normalize_chat_id(canonical_chat_id)
+        if not canonical:
+            return False
+        if normalize_chat_id(meta.chat_id) == canonical:
+            return True
+        if meta.user_id and normalize_chat_id(meta.user_id) == canonical:
+            return True
+        return False
+
+    def _session_payload_matches(self, session_id: str, canonical: str) -> bool:
+        for ev in self.snapshot(session_id, cursor=0):
+            cid = normalize_chat_id((ev.payload or {}).get("chat_id") or "")
+            if cid == canonical:
+                return True
+        return False
+
     def lookup_session_id(self, canonical_chat_id: str) -> str | None:
         """Resolve the best tracker session for a canonical chat target.
 
         Hermes reuses the same ``session_key`` but may rotate ``session_id``
-        after idle reset or ``/new``. Prefer the newest session whose
-        ``meta.chat_id`` matches (not a stale ``_chat_to_session`` entry).
+        after idle reset or ``/new``. Rank by visible terminal lines, then
+        active status, then recency — not a stale ended empty session.
         """
+        from .sessiontracker import count_terminal_lines
+
         canonical = normalize_chat_id(canonical_chat_id)
         if not canonical:
             return None
 
         best_sid: str | None = None
-        best_rank = (-1, 0.0)  # (active=1/ended=0, last_event_at)
+        best_rank = (-1, -1, 0.0)  # (terminal_lines, active, last_event_at)
         for sid, meta in self._meta.items():
             if sid.startswith("pending:"):
                 continue
-            if normalize_chat_id(meta.chat_id) != canonical:
-                continue
-            rank = (1 if meta.status == "active" else 0, meta.last_event_at)
+            if not self.meta_matches_canonical(meta, canonical):
+                if not self._session_payload_matches(sid, canonical):
+                    continue
+            n_lines = count_terminal_lines(self, sid)
+            rank = (
+                n_lines,
+                1 if meta.status == "active" else 0,
+                meta.last_event_at,
+            )
             if rank > best_rank:
                 best_rank = rank
                 best_sid = sid

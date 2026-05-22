@@ -45,6 +45,12 @@ def test_normalize_chat_id() -> None:
     assert normalize_chat_id("alice") == "alice"
 
 
+def test_format_terminal_line_llm_response_fallback() -> None:
+    ev = SessionEvent(1, 0.0, "llm.response", {"assistant_response": "Hello back"})
+    block = format_terminal_line(ev)
+    assert block == {"line_kind": "hermes", "text": "Hello back"}
+
+
 def test_format_terminal_line_display_kinds() -> None:
     tool_ev = SessionEvent(1, 0.0, "display.tool_line", {"line": "┊ 💻 $ ls"})
     assert format_terminal_line(tool_ev) == {"line_kind": "tool", "text": "┊ 💻 $ ls"}

@@ -21,6 +21,8 @@ TERMINAL_EVENT_KINDS = frozenset({
     "display.status",
     "display.interim",
     "outbound.infoflow",
+    "llm.response",
+    "tool.end",
     "session.start",
     "session.end",
 })
@@ -50,6 +52,11 @@ def format_terminal_line(event: SessionEvent) -> dict[str, Any] | None:
         preview = payload.get("preview") or payload.get("chars")
         return {"line_kind": "tool", "text": f"┊ {preview}" if preview else "┊ …"}
 
+    if kind == "llm.response":
+        text = payload.get("assistant_response") or ""
+        if text:
+            return {"line_kind": "hermes", "text": str(text)}
+
     if kind == "tool.end" and not payload.get("_skip_fallback"):
         name = payload.get("tool_name") or "tool"
         dur = payload.get("duration_ms")
@@ -57,6 +64,17 @@ def format_terminal_line(event: SessionEvent) -> dict[str, Any] | None:
         return {"line_kind": "tool", "text": f"┊ ⚙️ {name}{dur_s}"}
 
     return None
+
+
+def count_terminal_lines(tracker: SessionTracker, session_id: str) -> int:
+    """Count events that render as terminal lines (for session pick ranking)."""
+    n = 0
+    for ev in tracker.snapshot(session_id, cursor=0):
+        if ev.kind not in TERMINAL_EVENT_KINDS:
+            continue
+        if event_to_terminal_dict(ev) is not None:
+            n += 1
+    return n
 
 
 def event_to_terminal_dict(event: SessionEvent) -> dict[str, Any] | None:
@@ -103,12 +121,14 @@ async def resolve_target(
     session_id = tracker.lookup_session_id(canonical)
     status = "waiting"
     meta = None
+    terminal_lines = 0
     if session_id:
         if session_id.startswith("pending:"):
             status = "waiting"
         else:
             meta = tracker.get_meta(session_id)
             status = (meta.status if meta is not None else None) or "active"
+            terminal_lines = count_terminal_lines(tracker, session_id)
 
     return {
         "label": label,
@@ -117,6 +137,7 @@ async def resolve_target(
         "status": status,
         "chat_type": chat_type,
         "user_id": (meta.user_id if meta else "") or "",
+        "terminal_lines": terminal_lines,
     }
 
 
@@ -133,8 +154,12 @@ def session_matches_target(
     if tracker._chat_to_session.get(canonical_chat_id) == session_id:  # noqa: SLF001
         return True
     meta = tracker.get_meta(session_id)
-    if meta is not None and normalize_chat_id(meta.chat_id) == canonical_chat_id:
+    if meta is not None and tracker.meta_matches_canonical(meta, canonical_chat_id):
         return True
+    for ev in tracker.snapshot(session_id, cursor=0):
+        cid = normalize_chat_id((ev.payload or {}).get("chat_id") or "")
+        if cid == normalize_chat_id(canonical_chat_id):
+            return True
     return False
 
 
@@ -247,6 +272,8 @@ let autoFollow = true;
 let sessionId = '';
 let lineCursor = 0;
 let eventSource = null;
+let pollTimer = null;
+let gotTerminalLines = false;
 const SCROLL_THRESHOLD = 48;
 
 function nearBottom() {
@@ -280,6 +307,7 @@ function esc(s) {
 }
 
 function appendBlock(block) {
+  gotTerminalLines = true;
   if (emptyHint) emptyHint.remove();
   if (block.line_kind === 'hermes') {
     const box = document.createElement('div');
@@ -334,6 +362,56 @@ function connectStream() {
   eventSource.onerror = () => { /* browser will retry */ };
 }
 
+function updateMetaLine(info) {
+  const who = info.user_id ? (' | user: ' + info.user_id) : '';
+  const lines = info.terminal_lines != null ? (' | lines: ' + info.terminal_lines) : '';
+  document.getElementById('meta-line').textContent =
+    (info.canonical_chat_id || '') + who + ' | session: ' +
+    (info.session_id || '(pending)') + ' | ' + (info.status || 'waiting') + lines;
+}
+
+function updateEmptyHint(info) {
+  if (gotTerminalLines) return;
+  const el = document.getElementById('empty-hint');
+  if (!el) return;
+  if (info.status === 'ended' && (info.terminal_lines || 0) === 0) {
+    el.textContent = 'Session ended with no captured activity. Send a new message in 如流 to start a fresh turn.';
+  } else if (!info.session_id) {
+    el.textContent = 'Waiting for session activity…';
+  } else if ((info.terminal_lines || 0) === 0) {
+    el.textContent = 'Connected — waiting for agent output…';
+  }
+}
+
+function applyResolve(info) {
+  const prev = sessionId;
+  document.getElementById('title').textContent = info.label || 'Session Tracker';
+  updateMetaLine(info);
+  updateEmptyHint(info);
+  if (!info.session_id) {
+    sessionId = '';
+    return;
+  }
+  if (info.session_id !== prev) {
+    sessionId = info.session_id;
+    lineCursor = 0;
+    gotTerminalLines = false;
+    connectStream();
+  } else if (!eventSource) {
+    sessionId = info.session_id;
+    connectStream();
+  }
+}
+
+function startResolvePoll(qs) {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(async () => {
+    const r = await fetch(apiBase + '/resolve?' + qs);
+    if (!r.ok) return;
+    applyResolve(await r.json());
+  }, 2000);
+}
+
 async function init() {
   const qs = params.toString();
   const r = await fetch(apiBase + '/resolve?' + qs);
@@ -341,30 +419,8 @@ async function init() {
     document.getElementById('meta-line').textContent = 'Error: ' + (await r.text());
     return;
   }
-  const info = await r.json();
-  document.getElementById('title').textContent = info.label || 'Session Tracker';
-  sessionId = info.session_id || '';
-  const status = info.status || 'waiting';
-  const who = info.user_id ? (' | user: ' + info.user_id) : '';
-  document.getElementById('meta-line').textContent =
-    (info.canonical_chat_id || '') + who + ' | session: ' + (sessionId || '(pending)') + ' | ' + status;
-  if (sessionId) {
-    connectStream();
-  } else {
-    const poll = setInterval(async () => {
-      const r2 = await fetch(apiBase + '/resolve?' + qs);
-      if (!r2.ok) return;
-      const j = await r2.json();
-      if (j.session_id) {
-        sessionId = j.session_id;
-        clearInterval(poll);
-        connectStream();
-        const who2 = j.user_id ? (' | user: ' + j.user_id) : '';
-        document.getElementById('meta-line').textContent =
-          (j.canonical_chat_id || '') + who2 + ' | session: ' + sessionId + ' | ' + (j.status || '');
-      }
-    }, 2000);
-  }
+  applyResolve(await r.json());
+  startResolvePoll(qs);
 }
 init();
 </script>
@@ -513,6 +569,7 @@ def register_sessiontracker_routes(
 
 __all__ = [
     "TERMINAL_EVENT_KINDS",
+    "count_terminal_lines",
     "format_terminal_line",
     "event_to_terminal_dict",
     "resolve_target",
