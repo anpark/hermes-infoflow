@@ -26,6 +26,7 @@ DEFAULT_INFOFLOW_PORT=26521
 CANONICAL_PLUGIN_ID="infoflow"
 ENTRYPOINT_PACKAGE="hermes-infoflow"
 ENTRYPOINT_POLICY="${HERMES_INFOFLOW_ENTRYPOINT_POLICY:-uninstall}"
+GATEWAY_RESTART_POLICY="${HERMES_INFOFLOW_GATEWAY_RESTART:-auto}"
 
 validate_port() {
   local value="$1"
@@ -114,6 +115,108 @@ HERMES_DEPLOY_AUTO_PIP="${HERMES_DEPLOY_AUTO_PIP:-1}"
 CANDIDATE_PYTHONS=()
 HERMES_LINKED_PYTHONS=()
 
+is_macos() {
+  [[ "$(uname -s 2>/dev/null || true)" == "Darwin" ]]
+}
+
+plist_extract_raw() {
+  local plist="$1"
+  local keypath="$2"
+  command -v plutil >/dev/null 2>&1 || return 1
+  plutil -extract "$keypath" raw -o - "$plist" 2>/dev/null
+}
+
+gateway_launchd_plist_candidates() {
+  local plist
+  if [[ -n "${HERMES_INFOFLOW_GATEWAY_LAUNCHD_PLIST:-}" ]]; then
+    [[ -f "$HERMES_INFOFLOW_GATEWAY_LAUNCHD_PLIST" ]] && printf '%s\n' "$HERMES_INFOFLOW_GATEWAY_LAUNCHD_PLIST"
+    return 0
+  fi
+
+  for plist in "${HOME}/Library/LaunchAgents"/ai.hermes.gateway*.plist; do
+    [[ -f "$plist" ]] || continue
+    printf '%s\n' "$plist"
+  done
+}
+
+launchd_label_from_plist() {
+  local plist="$1"
+  local label=""
+  label="$(plist_extract_raw "$plist" Label || true)"
+  if [[ -z "$label" ]]; then
+    label="$(basename "$plist" .plist)"
+  fi
+  printf '%s\n' "$label"
+}
+
+collect_launchd_gateway_labels() {
+  local label plist existing duplicate
+  local labels=()
+  local seen=()
+
+  if [[ -n "${HERMES_INFOFLOW_GATEWAY_LAUNCHD_LABEL:-}" ]]; then
+    labels+=("$HERMES_INFOFLOW_GATEWAY_LAUNCHD_LABEL")
+  fi
+
+  while IFS= read -r plist; do
+    [[ -n "$plist" ]] || continue
+    label="$(launchd_label_from_plist "$plist")"
+    [[ -n "$label" ]] && labels+=("$label")
+  done < <(gateway_launchd_plist_candidates)
+
+  if [[ ${#labels[@]} -gt 0 ]]; then
+    for label in "${labels[@]}"; do
+      duplicate=0
+      if [[ ${#seen[@]} -gt 0 ]]; then
+        for existing in "${seen[@]}"; do
+          if [[ "$existing" == "$label" ]]; then
+            duplicate=1
+            break
+          fi
+        done
+      fi
+      if [[ "$duplicate" == "0" ]]; then
+        seen+=("$label")
+        printf '%s\n' "$label"
+      fi
+    done
+  fi
+}
+
+detect_launchd_gateway_python() {
+  local arg0 arg1 plist
+  while IFS= read -r plist; do
+    [[ -n "$plist" ]] || continue
+    arg0="$(plist_extract_raw "$plist" ProgramArguments.0 || true)"
+    arg1="$(plist_extract_raw "$plist" ProgramArguments.1 || true)"
+    if [[ -n "$arg0" && -x "$arg0" && "$(basename "$arg0")" == python* ]]; then
+      printf '%s\n' "$arg0"
+      return 0
+    fi
+    if [[ -n "$arg0" && "$(basename "$arg0" 2>/dev/null || true)" == "env" ]] \
+      && [[ "$arg1" == python* ]] \
+      && command -v "$arg1" >/dev/null 2>&1; then
+      command -v "$arg1"
+      return 0
+    fi
+  done < <(gateway_launchd_plist_candidates)
+  return 1
+}
+
+_add_hermes_linked_python() {
+  local py="$1"
+  local existing
+  [[ -z "$py" ]] && return 0
+  if [[ ${#HERMES_LINKED_PYTHONS[@]} -gt 0 ]]; then
+    for existing in "${HERMES_LINKED_PYTHONS[@]}"; do
+      if [[ "$existing" == "$py" ]]; then
+        return 0
+      fi
+    done
+  fi
+  HERMES_LINKED_PYTHONS+=("$py")
+}
+
 _add_candidate() {
   local py="$1"
   local hermes_linked="${2:-0}"
@@ -129,13 +232,16 @@ _add_candidate() {
   if [[ ${#CANDIDATE_PYTHONS[@]} -gt 0 ]]; then
     for existing in "${CANDIDATE_PYTHONS[@]}"; do
       if [[ "$existing" == "$py" ]]; then
+        if [[ "$hermes_linked" == "1" ]]; then
+          _add_hermes_linked_python "$py"
+        fi
         return 0
       fi
     done
   fi
   CANDIDATE_PYTHONS+=("$py")
   if [[ "$hermes_linked" == "1" ]]; then
-    HERMES_LINKED_PYTHONS+=("$py")
+    _add_hermes_linked_python "$py"
   fi
 }
 
@@ -165,7 +271,9 @@ detect_hermes_python() {
   shebang="$(head -n 1 "$hermes_bin" 2>/dev/null || true)"
   if [[ "$shebang" =~ ^#![[:space:]]*([^[:space:]]+) ]]; then
     interp="${BASH_REMATCH[1]}"
-    if [[ "$interp" != */env ]] && [[ -x "$interp" ]]; then
+    if [[ "$interp" != */env ]] \
+      && [[ -x "$interp" ]] \
+      && [[ "$(basename "$interp")" == python* ]]; then
       printf '%s\n' "$interp"
       return 0
     fi
@@ -176,6 +284,7 @@ detect_hermes_python() {
   for guess in \
     "${HOME}/.local/pipx/venvs/hermes-agent/bin/python" \
     "${HOME}/.local/share/pipx/venvs/hermes-agent/bin/python" \
+    "${HOME}/.hermes/hermes-agent/venv/bin/python" \
     "${HOME}/.hermes/venv/bin/python" \
     "${HOME}/.hermes/.venv/bin/python"
   do
@@ -191,17 +300,19 @@ collect_candidate_pythons() {
   CANDIDATE_PYTHONS=()
   HERMES_LINKED_PYTHONS=()
 
-  if [[ -n "${PYTHON:-}" ]]; then
-    _add_candidate "$PYTHON" 1
-    return 0
-  fi
-
   local hermes_py
+  if hermes_py="$(detect_launchd_gateway_python)"; then
+    _add_candidate "$hermes_py" 1
+  fi
   if hermes_py="$(detect_hermes_python)"; then
     _add_candidate "$hermes_py" 1
   fi
   if hermes_py="$(detect_pipx_hermes_python)"; then
     _add_candidate "$hermes_py" 1
+  fi
+
+  if [[ -n "${PYTHON:-}" ]]; then
+    _add_candidate "$PYTHON" 0
   fi
 
   if [[ -n "${VIRTUAL_ENV:-}" ]]; then
@@ -229,6 +340,9 @@ collect_hermes_runtime_pythons() {
   local runtimes=()
   local seen_runtimes=()
 
+  if py="$(detect_launchd_gateway_python 2>/dev/null)"; then
+    runtimes+=("$py")
+  fi
   if py="$(detect_hermes_python 2>/dev/null)"; then
     runtimes+=("$py")
   fi
@@ -236,20 +350,24 @@ collect_hermes_runtime_pythons() {
     runtimes+=("$py")
   fi
 
-  for py in "${runtimes[@]}"; do
-    [[ -n "$py" ]] || continue
-    duplicate=0
-    for existing in "${seen_runtimes[@]}"; do
-      if [[ "$existing" == "$py" ]]; then
-        duplicate=1
-        break
+  if [[ ${#runtimes[@]} -gt 0 ]]; then
+    for py in "${runtimes[@]}"; do
+      [[ -n "$py" ]] || continue
+      duplicate=0
+      if [[ ${#seen_runtimes[@]} -gt 0 ]]; then
+        for existing in "${seen_runtimes[@]}"; do
+          if [[ "$existing" == "$py" ]]; then
+            duplicate=1
+            break
+          fi
+        done
+      fi
+      if [[ "$duplicate" == "0" ]]; then
+        seen_runtimes+=("$py")
+        printf '%s\n' "$py"
       fi
     done
-    if [[ "$duplicate" == "0" ]]; then
-      seen_runtimes+=("$py")
-      printf '%s\n' "$py"
-    fi
-  done
+  fi
 }
 
 python_infoflow_entrypoint_version() {
@@ -327,7 +445,9 @@ pipx_has_hermes_agent() {
 warn_if_deploy_python_differs_from_hermes() {
   local py="$1"
   local ref="" ref_label=""
-  if ref="$(detect_pipx_hermes_python 2>/dev/null)"; then
+  if ref="$(detect_launchd_gateway_python 2>/dev/null)"; then
+    ref_label="launchd gateway"
+  elif ref="$(detect_pipx_hermes_python 2>/dev/null)"; then
     ref_label="pipx hermes-agent"
   elif ref="$(detect_hermes_python 2>/dev/null)"; then
     ref_label="hermes CLI"
@@ -349,8 +469,20 @@ warn_if_deploy_python_differs_from_hermes() {
   echo "      PYTHON=\$(pipx environment hermes-agent -P python) bash scripts/deploy.sh" >&2
 }
 
+print_no_pip_guidance() {
+  local target="$1"
+  echo "  - $target has no working pip; cannot auto-install." >&2
+  echo "    If this is the Hermes gateway venv, repair pip first, then install deps:" >&2
+  echo "      $target -m ensurepip --upgrade" >&2
+  echo "      $target -m pip install ${PLUGIN_PIP_PACKAGES[*]}" >&2
+  echo "    If ensurepip is unavailable, reinstall or repair the Hermes agent environment." >&2
+}
+
 auto_install_plugin_deps() {
   local target="$1"
+  local pipx_py=""
+  local target_real="$target"
+  local pipx_real=""
   local pip_args=()
 
   if [[ "$HERMES_DEPLOY_AUTO_PIP" == "0" ]]; then
@@ -359,24 +491,31 @@ auto_install_plugin_deps() {
 
   echo "==> Auto-installing plugin dependencies (cryptography, aiohttp, pyyaml)"
 
-  # Best case: deps belong in hermes-agent's pipx venv (same runtime as gateway).
-  if pipx_has_hermes_agent; then
+  # Best case: target deps belong in hermes-agent's pipx venv.
+  if pipx_has_hermes_agent && pipx_py="$(detect_pipx_hermes_python)"; then
+    pipx_real="$pipx_py"
+    if command -v realpath >/dev/null 2>&1; then
+      target_real="$(realpath "$target" 2>/dev/null || echo "$target")"
+      pipx_real="$(realpath "$pipx_py" 2>/dev/null || echo "$pipx_py")"
+    fi
+  else
+    pipx_py=""
+  fi
+
+  if [[ -n "$pipx_py" && "$target_real" == "$pipx_real" ]]; then
     echo "$ pipx inject hermes-agent ${PLUGIN_PIP_PACKAGES[*]}"
     if [[ "$DRY_RUN" == "true" ]]; then
       return 0
     fi
     if pipx inject hermes-agent "${PLUGIN_PIP_PACKAGES[@]}"; then
-      local pipx_py
-      if pipx_py="$(detect_pipx_hermes_python)"; then
-        python_deps_ok "$pipx_py" && return 0
-      fi
+      python_deps_ok "$target" && return 0
     else
       echo "  - pipx inject hermes-agent failed" >&2
     fi
   fi
 
   if ! python_has_pip "$target"; then
-    echo "  - $target has no working pip; cannot auto-install." >&2
+    print_no_pip_guidance "$target"
     return 1
   fi
 
@@ -416,6 +555,27 @@ pick_install_target() {
   fi
 }
 
+select_dependency_ready_python() {
+  local candidate
+  if [[ ${#HERMES_LINKED_PYTHONS[@]} -gt 0 ]]; then
+    for candidate in "${HERMES_LINKED_PYTHONS[@]}"; do
+      if python_deps_ok "$candidate"; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+    done
+    return 1
+  fi
+
+  for candidate in "${CANDIDATE_PYTHONS[@]}"; do
+    if python_deps_ok "$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 collect_candidate_pythons
 
 PY=""
@@ -425,28 +585,16 @@ if [[ "$DRY_RUN" == "true" ]]; then
   echo "  hermes-linked interpreters: ${HERMES_LINKED_PYTHONS[*]:-<none>}"
   echo "$ $PY -c <dep-check>"
 else
-  if [[ ${#CANDIDATE_PYTHONS[@]} -gt 0 ]]; then
-    for candidate in "${CANDIDATE_PYTHONS[@]}"; do
-      if python_deps_ok "$candidate"; then
-        PY="$candidate"
-        echo "  using interpreter: $PY"
-        break
-      fi
-    done
+  if [[ ${#CANDIDATE_PYTHONS[@]} -gt 0 ]] && PY="$(select_dependency_ready_python)"; then
+    echo "  using interpreter: $PY"
   fi
 
   if [[ -z "$PY" ]]; then
     install_target="$(pick_install_target)"
     if [[ -n "$install_target" ]] && auto_install_plugin_deps "$install_target"; then
       collect_candidate_pythons
-      if [[ ${#CANDIDATE_PYTHONS[@]} -gt 0 ]]; then
-        for candidate in "${CANDIDATE_PYTHONS[@]}"; do
-          if python_deps_ok "$candidate"; then
-            PY="$candidate"
-            echo "  using interpreter after auto-install: $PY"
-            break
-          fi
-        done
+      if [[ ${#CANDIDATE_PYTHONS[@]} -gt 0 ]] && PY="$(select_dependency_ready_python)"; then
+        echo "  using interpreter after auto-install: $PY"
       fi
     fi
   fi
@@ -475,7 +623,12 @@ else
     echo "         PYTHON=\$(pipx environment hermes-agent -P python) bash scripts/deploy.sh" >&2
     echo "    3) install manually:" >&2
     if [[ -n "${install_target:-}" ]]; then
-      echo "         ${install_target} -m pip install cryptography aiohttp pyyaml" >&2
+      if python_has_pip "$install_target"; then
+        echo "         ${install_target} -m pip install cryptography aiohttp pyyaml" >&2
+      else
+        echo "         ${install_target} -m ensurepip --upgrade" >&2
+        echo "         ${install_target} -m pip install cryptography aiohttp pyyaml" >&2
+      fi
     else
       echo "         python3 -m pip install --user cryptography aiohttp pyyaml" >&2
     fi
@@ -529,40 +682,216 @@ if [[ "$DRY_RUN" == "true" ]]; then
 fi
 run_cmd "$PY" "$EDIT_ENV_SCRIPT" "${ENV_ARGS[@]}"
 
+gateway_status_indicates_running() {
+  local text="$1"
+  if printf '%s\n' "$text" | grep -Eiq "not[[:space:]-]+running|stopped|inactive"; then
+    return 1
+  fi
+  printf '%s\n' "$text" | grep -Eiq \
+    "Runtime:[[:space:]]*running|status:[[:space:]]*running|state[[:space:]]*=[[:space:]]*running|Gateway .*running"
+}
+
+launchd_target_for_label() {
+  local label="$1"
+  printf 'gui/%s/%s\n' "$(id -u)" "$label"
+}
+
+launchd_gateway_loaded() {
+  local label="$1"
+  local target
+  target="$(launchd_target_for_label "$label")"
+  launchctl print "$target" >/dev/null 2>&1
+}
+
+launchd_gateway_running() {
+  local label="$1"
+  local output rc target
+  target="$(launchd_target_for_label "$label")"
+  set +e
+  output="$(launchctl print "$target" 2>/dev/null)"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 0 ]] || return 1
+  printf '%s\n' "$output" | grep -Eq "state = running|pid = [1-9][0-9]*"
+}
+
+wait_for_launchd_gateway_running() {
+  local label="$1"
+  local attempt
+  for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    if launchd_gateway_running "$label"; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+hermes_gateway_running_via_cli() {
+  local output rc
+  command -v hermes >/dev/null 2>&1 || return 1
+  set +e
+  output="$(hermes gateway status 2>&1)"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 0 ]] || return 1
+  gateway_status_indicates_running "$output"
+}
+
+wait_for_gateway_running() {
+  local attempt label
+  for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    if is_macos && command -v launchctl >/dev/null 2>&1; then
+      while IFS= read -r label; do
+        [[ -n "$label" ]] || continue
+        if launchd_gateway_running "$label"; then
+          return 0
+        fi
+      done < <(collect_launchd_gateway_labels)
+    fi
+    if hermes_gateway_running_via_cli; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+restart_running_launchd_gateway() {
+  local label target found=0 loaded=0
+  if ! is_macos || ! command -v launchctl >/dev/null 2>&1; then
+    return 2
+  fi
+
+  while IFS= read -r label; do
+    [[ -n "$label" ]] || continue
+    found=1
+    target="$(launchd_target_for_label "$label")"
+    if launchd_gateway_running "$label"; then
+      echo "==> Gateway is running under launchd ($label); restarting to load the updated plugin"
+      echo "$ launchctl kickstart -k $target"
+      if ! launchctl kickstart -k "$target"; then
+        echo "✗ launchctl kickstart failed for $target" >&2
+        return 1
+      fi
+      if wait_for_launchd_gateway_running "$label"; then
+        echo "✓ gateway is running ($label)"
+        return 0
+      fi
+      echo "✗ gateway did not return to running; inspect 'launchctl print $target'" >&2
+      return 1
+    fi
+    if launchd_gateway_loaded "$label"; then
+      loaded=1
+      echo "  - launchd gateway $label is loaded but not running; skipping restart."
+    fi
+  done < <(collect_launchd_gateway_labels)
+
+  if [[ "$found" == "0" ]]; then
+    echo "  - no launchd gateway plist/label found."
+  elif [[ "$loaded" == "0" ]]; then
+    echo "  - no running launchd gateway found."
+  fi
+  return 2
+}
+
+restart_gateway_with_hermes_cli() {
+  local status rc
+  if ! command -v hermes >/dev/null 2>&1; then
+    echo "  - hermes CLI not on PATH; skipping gateway restart."
+    echo "  - Start the gateway manually once you're ready: hermes gateway"
+    return 2
+  fi
+
+  set +e
+  status="$(hermes gateway status 2>&1)"
+  rc=$?
+  set -e
+
+  if ! gateway_status_indicates_running "$status"; then
+    if [[ "$rc" -ne 0 ]]; then
+      echo "  - 'hermes gateway status' failed; not using it as proof that gateway is stopped." >&2
+      printf '%s\n' "$status" | sed -n '1,3p' >&2
+    else
+      echo "  - Hermes gateway is not running; skipping restart."
+    fi
+    return 2
+  fi
+
+  echo "==> Gateway is running; restarting via hermes CLI"
+  if ! hermes gateway restart; then
+    echo "✗ gateway restart failed; check 'hermes gateway status'" >&2
+    return 1
+  fi
+  if wait_for_gateway_running; then
+    echo "✓ gateway is running"
+    return 0
+  fi
+  echo "✗ gateway did not return to running; inspect 'hermes gateway status'" >&2
+  return 1
+}
+
 echo "==> Checking hermes gateway status"
-if ! command -v hermes >/dev/null 2>&1; then
-  echo "  - hermes CLI not on PATH; skipping gateway restart."
-  echo "  - Start the gateway manually once you're ready: hermes gateway"
-  exit 0
-fi
+case "$GATEWAY_RESTART_POLICY" in
+  auto|launchctl|hermes|skip) ;;
+  *)
+    echo "✗ HERMES_INFOFLOW_GATEWAY_RESTART must be auto, launchctl, hermes, or skip (got: $GATEWAY_RESTART_POLICY)" >&2
+    exit 1
+    ;;
+esac
 
 # We only restart the gateway when it's already running. Starting it fresh
 # is the user's choice — they may want to verify config before starting.
 if [[ "$DRY_RUN" == "true" ]]; then
-  echo "$ hermes gateway status (dry-run, skipping)"
+  echo "  gateway restart policy: $GATEWAY_RESTART_POLICY"
+  echo "$ launchctl print gui/\$(id -u)/<label> || hermes gateway status (dry-run, skipping)"
   echo "==> Done (dry-run)"
   exit 0
 fi
 
-set +e
-STATUS_OUTPUT="$(hermes gateway status 2>/dev/null || true)"
-set -e
-
-if echo "$STATUS_OUTPUT" | grep -q -E "Runtime: running|status: running|running"; then
-  echo "==> Gateway is running; restarting to load the updated plugin"
-  hermes gateway restart || {
-    echo "✗ gateway restart failed; check 'hermes gateway status'" >&2
-    exit 1
-  }
-  sleep 2
-  if hermes gateway status 2>/dev/null | grep -q -E "Runtime: running|status: running|running"; then
-    echo "✓ gateway is running"
-  else
-    echo "✗ gateway did not return to running; inspect 'hermes gateway status'" >&2
-    exit 1
-  fi
-else
-  echo "==> Gateway is not running; skipping restart (start manually with 'hermes gateway')"
-fi
+case "$GATEWAY_RESTART_POLICY" in
+  skip)
+    echo "==> Skipping gateway restart (HERMES_INFOFLOW_GATEWAY_RESTART=skip)"
+    ;;
+  launchctl)
+    if restart_running_launchd_gateway; then
+      :
+    else
+      restart_rc=$?
+      echo "✗ no running launchd-managed gateway was restarted." >&2
+      exit 1
+    fi
+    ;;
+  hermes)
+    if restart_gateway_with_hermes_cli; then
+      :
+    else
+      restart_rc=$?
+      if [[ "$restart_rc" == "1" ]]; then
+        exit 1
+      fi
+      echo "==> Gateway is not running; skipping restart (start manually with 'hermes gateway')"
+    fi
+    ;;
+  auto)
+    if restart_running_launchd_gateway; then
+      :
+    else
+      restart_rc=$?
+      if [[ "$restart_rc" == "1" ]]; then
+        exit 1
+      fi
+      if restart_gateway_with_hermes_cli; then
+        :
+      else
+        restart_rc=$?
+        if [[ "$restart_rc" == "1" ]]; then
+          exit 1
+        fi
+        echo "==> Gateway is not running; skipping restart (start manually with 'hermes gateway')"
+      fi
+    fi
+    ;;
+esac
 
 echo "==> Done"

@@ -93,6 +93,71 @@ def _run_deploy(
     )
 
 
+def _write_executable(path: Path, text: str) -> None:
+    path.write_text(text, encoding="utf-8")
+    path.chmod(0o755)
+
+
+def _seed_launchd_gateway_plist(home: Path) -> None:
+    launch_agents = home / "Library" / "LaunchAgents"
+    launch_agents.mkdir(parents=True, exist_ok=True)
+    (launch_agents / "ai.hermes.gateway.plist").write_text(
+        """<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>ai.hermes.gateway</string>
+  <key>ProgramArguments</key><array><string>/ignored/python</string></array>
+</dict></plist>
+""",
+        encoding="utf-8",
+    )
+
+
+def _install_fake_launchd_tools(fakebin: Path) -> tuple[Path, Path]:
+    fakebin.mkdir(parents=True, exist_ok=True)
+    launchctl_log = fakebin.parent / "launchctl.log"
+    hermes_log = fakebin.parent / "hermes.log"
+    _write_executable(
+        fakebin / "uname",
+        "#!/bin/sh\nprintf 'Darwin\\n'\n",
+    )
+    _write_executable(
+        fakebin / "id",
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"-u\" ]; then printf '501\\n'; exit 0; fi\n"
+        "exec /usr/bin/id \"$@\"\n",
+    )
+    _write_executable(
+        fakebin / "plutil",
+        "#!/bin/sh\n"
+        "case \"$2\" in\n"
+        "  Label) printf 'ai.hermes.gateway\\n' ;;\n"
+        "  ProgramArguments.0) printf '%s\\n' \"$FAKE_HERMES_PYTHON\" ;;\n"
+        "  *) exit 1 ;;\n"
+        "esac\n",
+    )
+    _write_executable(
+        fakebin / "launchctl",
+        "#!/bin/sh\n"
+        "case \"$1\" in\n"
+        "  print) printf 'state = running\\npid = 123\\n' ;;\n"
+        "  kickstart) printf '%s\\n' \"$*\" >> \"$FAKE_LAUNCHCTL_LOG\" ;;\n"
+        "  *) exit 1 ;;\n"
+        "esac\n",
+    )
+    _write_executable(
+        fakebin / "hermes",
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$*\" >> \"$FAKE_HERMES_LOG\"\n"
+        "if [ \"$1\" = \"gateway\" ] && [ \"$2\" = \"status\" ]; then\n"
+        "  printf 'PermissionError: Operation not permitted: ps\\n' >&2\n"
+        "  exit 1\n"
+        "fi\n"
+        "if [ \"$1\" = \"gateway\" ] && [ \"$2\" = \"restart\" ]; then exit 9; fi\n"
+        "exit 0\n",
+    )
+    return launchctl_log, hermes_log
+
+
 def _read_env_port(env_file: Path) -> str | None:
     spec = importlib.util.spec_from_file_location("edit_hermes_env", _EDIT_ENV_SCRIPT)
     assert spec is not None and spec.loader is not None
@@ -398,6 +463,90 @@ def test_deploy_port_flag_overrides_env(tmp_path: Path) -> None:
     )
     assert result.returncode == 0, result.stderr
     assert _read_env_port(home / ".hermes" / ".env") == "3333"
+
+
+def test_deploy_without_launchd_or_hermes_cli_has_clean_stderr(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+
+    result = _run_deploy(home)
+
+    assert result.returncode == 0, result.stderr
+    assert "unbound variable" not in result.stderr
+    assert "no launchd gateway plist/label found" in result.stdout
+    assert "hermes CLI not on PATH" in result.stdout
+
+
+def test_deploy_auto_restart_uses_launchctl_when_cli_status_fails(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    fakebin = tmp_path / "fakebin"
+    _seed_launchd_gateway_plist(home)
+    launchctl_log, hermes_log = _install_fake_launchd_tools(fakebin)
+
+    env = _deploy_env(home)
+    env["PATH"] = f"{fakebin}:/usr/bin:/bin"
+    env["FAKE_HERMES_PYTHON"] = sys.executable
+    env["FAKE_LAUNCHCTL_LOG"] = str(launchctl_log)
+    env["FAKE_HERMES_LOG"] = str(hermes_log)
+    env["HERMES_INFOFLOW_ENTRYPOINT_POLICY"] = "keep"
+
+    result = subprocess.run(
+        ["bash", str(_DEPLOY_SCRIPT)],
+        cwd=str(_REPO_ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "launchctl kickstart -k gui/501/ai.hermes.gateway" in result.stdout
+    assert launchctl_log.read_text(encoding="utf-8") == (
+        "kickstart -k gui/501/ai.hermes.gateway\n"
+    )
+    assert not hermes_log.exists()
+
+
+def test_deploy_common_prefers_launchd_gateway_python_over_python_env(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    fakebin = tmp_path / "fakebin"
+    plugin_dir = home / ".hermes" / "plugins" / "infoflow"
+    _seed_launchd_gateway_plist(home)
+    _install_fake_launchd_tools(fakebin)
+    (fakebin / "hermes").unlink()
+
+    env = _deploy_env(home)
+    env["PATH"] = f"{fakebin}:/usr/bin:/bin"
+    env["PYTHON"] = "/bin/sh"
+    env["FAKE_HERMES_PYTHON"] = sys.executable
+    env["FAKE_LAUNCHCTL_LOG"] = str(tmp_path / "launchctl.log")
+    env["FAKE_HERMES_LOG"] = str(tmp_path / "hermes.log")
+    env["HERMES_INFOFLOW_ENTRYPOINT_POLICY"] = "keep"
+
+    result = subprocess.run(
+        [
+            "bash",
+            str(_DEPLOY_COMMON_SCRIPT),
+            "--plugin-dir",
+            str(plugin_dir),
+            "--config-file",
+            str(home / ".hermes" / "config.yaml"),
+            "--dry-run",
+        ],
+        cwd=str(_REPO_ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"candidate interpreters: {sys.executable}" in result.stdout
+    assert f"hermes-linked interpreters: {sys.executable}" in result.stdout
+    assert "hermes-linked interpreters: /bin/sh" not in result.stdout
 
 
 def test_deploy_dry_run_rejects_invalid_port(tmp_path: Path) -> None:

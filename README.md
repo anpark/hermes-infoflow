@@ -35,21 +35,22 @@ Baidu Infoflow（如流）Channel 插件 for [Hermes Agent](https://github.com/n
 
 | # | 方式 | 是否支持包版本 | 完整命令 |
 |---|------|----------------|----------|
-| 1 | Hermes CLI + 内置 normalize 脚本 | 否（Git 最新提交） | `hermes plugins install --force --enable chbo297/hermes-infoflow` → `bash ~/.hermes/plugins/infoflow/scripts/normalize.sh --port 9000` → `hermes gateway restart` |
-| 2 | Hermes CLI + tools normalize | 否（Git 最新提交） | `hermes plugins install --force --enable chbo297/hermes-infoflow` → `pipx run hermes-infoflow-tools normalize --port 9000` → `hermes gateway restart` |
-| 3 | `hermes-infoflow-tools update --mode extract` | 是，`--version` | `pipx run hermes-infoflow-tools update --version <version> --mode extract --port 9000` → `hermes gateway restart` |
-| 4 | `hermes-infoflow-tools update --mode pip`（兼容别名） | 是，`--version` | `pipx run hermes-infoflow-tools update --version <version> --mode pip --port 9000` → `hermes gateway restart` |
-| 5 | `pip install hermes-infoflow` + deploy | 是，pip 版本规格 | `python -m pip install --upgrade 'hermes-infoflow==<version>'` → `hermes-infoflow-deploy --port 9000` → `hermes gateway restart` |
-| 6 | 本地开发 `scripts/deploy.sh` | 否（当前 checkout） | `git clone https://github.com/chbo297/hermes-infoflow` → `cd hermes-infoflow` → `bash scripts/deploy.sh --port 9000` → `hermes gateway restart` |
+| 1 | Hermes CLI + 内置 normalize 脚本 | 否（Git 最新提交） | `hermes plugins install --force --enable chbo297/hermes-infoflow` → `bash ~/.hermes/plugins/infoflow/scripts/normalize.sh --port 9000` |
+| 2 | Hermes CLI + tools normalize | 否（Git 最新提交） | `hermes plugins install --force --enable chbo297/hermes-infoflow` → `pipx run hermes-infoflow-tools normalize --port 9000` |
+| 3 | `hermes-infoflow-tools update --mode extract` | 是，`--version` | `pipx run hermes-infoflow-tools update --version <version> --mode extract --port 9000` |
+| 4 | `hermes-infoflow-tools update --mode pip`（兼容别名） | 是，`--version` | `pipx run hermes-infoflow-tools update --version <version> --mode pip --port 9000` |
+| 5 | `pip install hermes-infoflow` + deploy | 是，pip 版本规格 | `python -m pip install --upgrade 'hermes-infoflow==<version>'` → `hermes-infoflow-deploy --port 9000` |
+| 6 | 本地开发 `scripts/deploy.sh` | 否（当前 checkout） | `git clone https://github.com/chbo297/hermes-infoflow` → `cd hermes-infoflow` → `bash scripts/deploy.sh --port 9000` |
 
 需要固定版本时，优先使用 #3 / #4 / #5。`hermes plugins install` 走 Git clone，当前 Hermes CLI 不提供 PyPI 风格的 `--version`；本地开发方式则由你 checkout 的分支 / tag / commit 决定。
+
+上述归一化 / deploy 命令会自动重启已经在运行的 gateway。默认策略 `HERMES_INFOFLOW_GATEWAY_RESTART=auto`：macOS 下若发现 `~/Library/LaunchAgents/ai.hermes.gateway*.plist` 或显式设置 `HERMES_INFOFLOW_GATEWAY_LAUNCHD_LABEL`，优先用 `launchctl print gui/$(id -u)/<label>` 判断运行状态并用 `launchctl kickstart -k` 重启；否则回退到 `hermes gateway restart`。可改为 `launchctl` / `hermes` / `skip` 强制指定或跳过。
 
 ### A. `hermes plugins install`（最像 OpenClaw 体验）
 
 ```bash
 hermes plugins install --force --enable chbo297/hermes-infoflow
 bash ~/.hermes/plugins/infoflow/scripts/normalize.sh --port 9000
-hermes gateway restart
 ```
 
 hermes 内置命令；`git clone --depth 1` 到 `~/.hermes/plugins/infoflow/`。随后执行 `scripts/normalize.sh` 会把 Git 克隆布局收敛成与 B / C / D 相同的扁平化目录，并补齐 `.env` / `config.yaml`。若目录已存在，Hermes CLI 需要 `--force` 才会重装覆盖；也可以直接用 B / C / D 覆盖。当前 Hermes CLI 没有 `--branch` / `--tag` 参数；需要固定分支、tag 或 commit 时，先手动 `git clone --branch <ref>` / `git checkout <commit>`，再执行本地开发方式里的 `bash scripts/deploy.sh`。
@@ -59,7 +60,6 @@ hermes 内置命令；`git clone --depth 1` 到 `~/.hermes/plugins/infoflow/`。
 ```bash
 hermes plugins install --force --enable chbo297/hermes-infoflow
 pipx run hermes-infoflow-tools normalize --port 9000
-hermes gateway restart
 ```
 
 ### B. `hermes-infoflow-tools`（对齐 `npx ... update`）
@@ -74,7 +74,6 @@ hermes gateway restart
 pipx run --spec hermes-infoflow-tools==2026.5.21 hermes-infoflow-tools update --version 2026.5.21 --mode extract --port 9000
 # 二选一：pip 兼容别名
 pipx run --spec hermes-infoflow-tools==2026.5.21 hermes-infoflow-tools update --version 2026.5.21 --mode pip --port 9000
-hermes gateway restart
 ```
 <!-- /sync:hermes-infoflow-version:latest -->
 
@@ -86,7 +85,6 @@ Beta 版（PEP 440 prerelease；精确指定版本即可安装）：
 pipx run --spec hermes-infoflow-tools==0.2.2b1 hermes-infoflow-tools update --version 0.2.2b1 --mode extract --port 9000
 # 二选一：pip 兼容别名
 pipx run --spec hermes-infoflow-tools==0.2.2b1 hermes-infoflow-tools update --version 0.2.2b1 --mode pip --port 9000
-hermes gateway restart
 ```
 <!-- /sync:hermes-infoflow-version:beta -->
 
@@ -127,7 +125,6 @@ pipx run hermes-infoflow-tools normalize --port 9000
 ```bash
 python -m pip install --upgrade 'hermes-infoflow==2026.5.21'
 hermes-infoflow-deploy --port 9000
-hermes gateway restart
 ```
 <!-- /sync:hermes-infoflow-version:latest -->
 
@@ -137,7 +134,6 @@ Beta 版：
 ```bash
 python -m pip install --upgrade 'hermes-infoflow==0.2.2b1'
 hermes-infoflow-deploy --port 9000
-hermes gateway restart
 ```
 <!-- /sync:hermes-infoflow-version:beta -->
 
@@ -174,12 +170,12 @@ HERMES_INFOFLOW_ENTRYPOINT_POLICY=keep hermes-infoflow-deploy --port 9000
 ```bash
 git clone https://github.com/chbo297/hermes-infoflow
 cd hermes-infoflow
-bash scripts/deploy.sh             # 同步到 ~/.hermes/plugins/infoflow/、重启 gateway
+bash scripts/deploy.sh             # 同步到 ~/.hermes/plugins/infoflow/，并重启已运行的 gateway
 bash scripts/deploy.sh --dry-run   # 仅打印操作
 bash scripts/deploy.sh --port 9000 # 指定 webhook 端口并写入 ~/.hermes/.env
 ```
 
-`deploy.sh` 会同步插件并自动选择 Python：优先 `hermes` / `pipx` 的 `hermes-agent` venv，再尝试 `python3`。若缺少 `cryptography` / `aiohttp` / `pyyaml`，默认会尝试 `pipx inject hermes-agent …` 或对当前解释器 `pip install`（可用 `HERMES_DEPLOY_AUTO_PIP=0` 关闭）。若检测到的解释器与 gateway 实际用的 pipx venv 不一致，脚本会打印 warning。历史上的 hermes-agent fork 同步已改为显式 opt-in：只有设置 `HERMES_INFOFLOW_SYNC_AGENT_FORK=1` 时才会执行。
+`deploy.sh` 会同步插件并自动选择 Python：优先 launchd plist 里的 gateway Python，其次 `hermes` / `pipx` 的 `hermes-agent` venv，再尝试 `PYTHON` / `python3`。若缺少 `cryptography` / `aiohttp` / `pyyaml`，默认会尝试 `pipx inject hermes-agent …` 或对目标解释器 `pip install`（可用 `HERMES_DEPLOY_AUTO_PIP=0` 关闭）。若目标 venv 没有 pip，脚本会提示先用 `ensurepip` 或修复 Hermes agent 环境。历史上的 hermes-agent fork 同步已改为显式 opt-in：只有设置 `HERMES_INFOFLOW_SYNC_AGENT_FORK=1` 时才会执行。
 
 部署时还会维护 `~/.hermes/.env` 中的 `INFOFLOW_PORT`：传 `--port` 则写入指定端口；未传时若 `.env` 已有 `INFOFLOW_PORT` 则保留，否则写入默认 `26521`（便于查看当前监听端口）。同时会补齐 `~/.hermes/config.yaml` 里的 `platform_toolsets.infoflow`，让 Infoflow 会话拥有与 CLI 会话一致的基础工具权限，并包含 `hermes-infoflow` 工具集。
 
