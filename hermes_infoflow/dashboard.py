@@ -592,12 +592,6 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
     def pre_tool_call(**kw: Any) -> None:
         sid = kw.get("session_id") or ""
         tool_name = kw.get("tool_name") or ""
-        if tool_name == "terminal":
-            tracker.push_event(
-                sid,
-                "display.tool_line",
-                {"line": "┊ 💻 preparing terminal…"},
-            )
         tracker.push_event(
             sid,
             "tool.start",
@@ -830,9 +824,31 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
             line_text = preview
         elif stage == "end":
             dur_ms = kw.get("duration_ms")
-            dur_s = f" {float(dur_ms) / 1000.0:.1f}s" if dur_ms else ""
-            err_tag = " [error]" if kw.get("is_error") else ""
-            line_text = f"┊ ✓ {tool_name}{dur_s}{err_tag}"
+            duration_s = float(dur_ms) / 1000.0 if dur_ms else 0.0
+            args = kw.get("args") if isinstance(kw.get("args"), dict) else {}
+            try:
+                from agent.display import get_cute_tool_message
+
+                line_text = get_cute_tool_message(
+                    tool_name,
+                    args,
+                    duration_s,
+                    result=kw.get("result"),
+                )
+            except Exception:
+                dur_s = f" {duration_s:.1f}s" if dur_ms else ""
+                err_tag = " [error]" if kw.get("is_error") else ""
+                line_text = f"┊ ✓ {tool_name}{dur_s}{err_tag}"
+            # get_cute_tool_message infers failure from `result`. The agent
+            # also passes an explicit is_error flag (set e.g. by guardrails
+            # or for multimodal results that bypass the string heuristic);
+            # surface it as " [error]" when the formatter did not already
+            # append a failure marker.
+            if kw.get("is_error") and not any(
+                marker in line_text
+                for marker in (" [exit ", " [error]", " [full]")
+            ):
+                line_text = f"{line_text} [error]"
         else:
             line_text = text or f"┊ … {tool_name}"
         tracker.push_event(

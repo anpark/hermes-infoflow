@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import sys
+import types
 
 import pytest
 
@@ -351,6 +353,93 @@ def test_on_tool_progress_pushes_lines(tracker: SessionTracker) -> None:
     assert events[0].payload["stage"] == "start"
     assert events[1].payload["stage"] == "end"
     assert "1.2s" in events[1].payload["line"]
+
+
+def test_on_tool_progress_end_uses_cli_cute_message(
+    tracker: SessionTracker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_mod = types.ModuleType("agent")
+    display_mod = types.ModuleType("agent.display")
+
+    def fake_cute(tool_name: str, args: dict, duration: float, result: object = None) -> str:
+        return f"┊ cute {tool_name} {args.get('query')} {duration:.1f}s {result}"
+
+    display_mod.get_cute_tool_message = fake_cute  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "agent", agent_mod)
+    monkeypatch.setitem(sys.modules, "agent.display", display_mod)
+
+    hooks = make_plugin_hooks(tracker)
+    hooks["on_tool_progress"](
+        session_id="sess-cute",
+        task_id="",
+        tool_name="search_files",
+        tool_call_id="tc-cute",
+        stage="end",
+        text="",
+        args={"query": "todo"},
+        result="ok",
+        duration_ms=1200.0,
+        is_error=False,
+    )
+    events = [
+        e for e in tracker.snapshot("sess-cute")
+        if e.kind == "display.tool_progress"
+    ]
+    assert len(events) == 1
+    assert events[0].payload["line"] == "┊ cute search_files todo 1.2s ok"
+
+
+def test_on_tool_progress_end_force_error_tag_when_formatter_missed_it(
+    tracker: SessionTracker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If hermes-agent flags is_error=True but the cute formatter did not
+    produce a failure marker (e.g. multimodal dict result bypassing the
+    string heuristic), the dashboard must still surface " [error]"."""
+    agent_mod = types.ModuleType("agent")
+    display_mod = types.ModuleType("agent.display")
+
+    def fake_cute(tool_name: str, args: dict, duration: float, result: object = None) -> str:
+        return f"┊ cute {tool_name} {duration:.1f}s"
+
+    display_mod.get_cute_tool_message = fake_cute  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "agent", agent_mod)
+    monkeypatch.setitem(sys.modules, "agent.display", display_mod)
+
+    hooks = make_plugin_hooks(tracker)
+    hooks["on_tool_progress"](
+        session_id="sess-err",
+        task_id="",
+        tool_name="vision_analyze",
+        tool_call_id="tc-err",
+        stage="end",
+        text="",
+        args={"question": "?"},
+        result={"image": "..."},  # multimodal dict, formatter cannot detect
+        duration_ms=500.0,
+        is_error=True,
+    )
+    events = [
+        e for e in tracker.snapshot("sess-err")
+        if e.kind == "display.tool_progress"
+    ]
+    assert events[-1].payload["line"].endswith(" [error]")
+
+
+def test_pre_tool_call_terminal_no_longer_pushes_preparing_line(
+    tracker: SessionTracker,
+) -> None:
+    hooks = make_plugin_hooks(tracker)
+    hooks["pre_tool_call"](
+        session_id="sess-prep",
+        tool_name="terminal",
+        args={"command": "ls"},
+        tool_call_id="tc-prep",
+        task_id="",
+    )
+    kinds = [e.kind for e in tracker.snapshot("sess-prep")]
+    assert kinds == ["tool.start"]
 
 
 def test_on_interim_assistant_pushes_interim_line(tracker: SessionTracker) -> None:
