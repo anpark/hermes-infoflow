@@ -23,6 +23,9 @@ CONFIG_FILE="${HOME}/.hermes/config.yaml"
 PORT=""
 DRY_RUN="false"
 DEFAULT_INFOFLOW_PORT=26521
+CANONICAL_PLUGIN_ID="infoflow"
+ENTRYPOINT_PACKAGE="hermes-infoflow"
+ENTRYPOINT_POLICY="${HERMES_INFOFLOW_ENTRYPOINT_POLICY:-uninstall}"
 
 validate_port() {
   local value="$1"
@@ -58,6 +61,12 @@ fi
 
 if [[ -z "$PLUGIN_DIR" ]]; then
   echo "Missing --plugin-dir" >&2
+  exit 1
+fi
+
+if [[ "$PLUGIN_ID" != "$CANONICAL_PLUGIN_ID" ]]; then
+  echo "✗ hermes-infoflow only supports plugin id '$CANONICAL_PLUGIN_ID'." >&2
+  echo "  Got --plugin-id '$PLUGIN_ID', which would create a second Hermes plugin key." >&2
   exit 1
 fi
 
@@ -213,6 +222,101 @@ python_deps_ok() {
 python_has_pip() {
   local py="$1"
   "$py" -m pip --version >/dev/null 2>&1
+}
+
+collect_hermes_runtime_pythons() {
+  local py existing duplicate
+  local runtimes=()
+  local seen_runtimes=()
+
+  if py="$(detect_hermes_python 2>/dev/null)"; then
+    runtimes+=("$py")
+  fi
+  if py="$(detect_pipx_hermes_python 2>/dev/null)"; then
+    runtimes+=("$py")
+  fi
+
+  for py in "${runtimes[@]}"; do
+    [[ -n "$py" ]] || continue
+    duplicate=0
+    for existing in "${seen_runtimes[@]}"; do
+      if [[ "$existing" == "$py" ]]; then
+        duplicate=1
+        break
+      fi
+    done
+    if [[ "$duplicate" == "0" ]]; then
+      seen_runtimes+=("$py")
+      printf '%s\n' "$py"
+    fi
+  done
+}
+
+python_infoflow_entrypoint_version() {
+  local py="$1"
+  "$py" - <<'PY'
+import importlib.metadata as md
+
+try:
+    dist = md.distribution("hermes-infoflow")
+except md.PackageNotFoundError:
+    raise SystemExit(1)
+
+for ep in dist.entry_points:
+    if ep.group == "hermes_agent.plugins" and ep.name == "infoflow":
+        print(dist.version)
+        raise SystemExit(0)
+
+raise SystemExit(1)
+PY
+}
+
+cleanup_shadowing_entrypoint_installs() {
+  local py version found=0
+
+  case "$ENTRYPOINT_POLICY" in
+    uninstall|warn|keep) ;;
+    *)
+      echo "✗ HERMES_INFOFLOW_ENTRYPOINT_POLICY must be uninstall, warn, or keep (got: $ENTRYPOINT_POLICY)" >&2
+      exit 1
+      ;;
+  esac
+
+  echo "==> Checking for pip entry-point installs that could shadow the directory plugin"
+  if [[ "$ENTRYPOINT_POLICY" == "keep" ]]; then
+    echo "  - keeping entry-point installs (HERMES_INFOFLOW_ENTRYPOINT_POLICY=keep)"
+    return 0
+  fi
+
+  while IFS= read -r py; do
+    [[ -n "$py" ]] || continue
+    if version="$(python_infoflow_entrypoint_version "$py" 2>/dev/null)"; then
+      found=1
+      if [[ "$ENTRYPOINT_POLICY" == "warn" ]]; then
+        echo "  ⚠ $ENTRYPOINT_PACKAGE $version is installed in $py and may shadow $PLUGIN_DIR" >&2
+        echo "    Re-run with HERMES_INFOFLOW_ENTRYPOINT_POLICY=uninstall to remove it automatically." >&2
+        continue
+      fi
+      if ! python_has_pip "$py"; then
+        echo "  ⚠ $ENTRYPOINT_PACKAGE $version is installed in $py but pip is unavailable; cannot uninstall." >&2
+        echo "    Remove it manually or set HERMES_INFOFLOW_ENTRYPOINT_POLICY=keep if intentional." >&2
+        exit 1
+      fi
+      echo "  - removing $ENTRYPOINT_PACKAGE $version from Hermes runtime: $py"
+      echo "$ $py -m pip uninstall -y $ENTRYPOINT_PACKAGE"
+      if [[ "$DRY_RUN" == "true" ]]; then
+        continue
+      fi
+      if ! "$py" -m pip uninstall -y "$ENTRYPOINT_PACKAGE"; then
+        echo "✗ failed to uninstall $ENTRYPOINT_PACKAGE from $py" >&2
+        exit 1
+      fi
+    fi
+  done < <(collect_hermes_runtime_pythons)
+
+  if [[ "$found" == "0" ]]; then
+    echo "  - no Hermes-runtime $ENTRYPOINT_PACKAGE entry point detected"
+  fi
 }
 
 pipx_has_hermes_agent() {
@@ -382,6 +486,8 @@ else
     warn_if_deploy_python_differs_from_hermes "$PY"
   fi
 fi
+
+cleanup_shadowing_entrypoint_installs
 
 echo "==> Enabling plugin in $CONFIG_FILE"
 # Prefer the repo copy (script lives alongside this file) so dry-run on a

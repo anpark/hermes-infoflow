@@ -1,4 +1,4 @@
-"""Upsert keys in ``~/.hermes/.env`` (bundled for ``hermes-infoflow-tools`` pip mode).
+"""Upsert keys in ``~/.hermes/.env`` (bundled for ``hermes-infoflow-tools``).
 
 Logic mirrors ``scripts/lib/edit_hermes_env.py`` in the main repo.
 """

@@ -11,10 +11,10 @@ entry point).  This file simply re-exports the public API from that
 sub-package so hermes-agent can ``register(ctx)`` regardless of how
 the plugin was installed:
 
-    A. ``hermes plugins install``  →  git clone → root ``__init__.py``
-    B. ``hermes-infoflow-tools``   →  extract / pip → ``hermes_infoflow/``
-    C. ``pip install``             →  entry-point → ``hermes_infoflow/``
-    D. ``scripts/deploy.sh``       →  rsync flatten → root ``__init__.py``
+    A. ``hermes plugins install`` + normalize → flattened directory plugin
+    B. ``hermes-infoflow-tools``              → flattened directory plugin
+    C. ``pip install`` + ``hermes-infoflow-deploy`` → flattened directory plugin
+    D. ``scripts/deploy.sh``                  → flattened directory plugin
 
 **Maintenance rules (read before editing):**
 

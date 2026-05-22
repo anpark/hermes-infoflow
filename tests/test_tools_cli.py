@@ -8,8 +8,6 @@ from contextlib import redirect_stdout
 import pytest
 from hermes_infoflow_tools import cli
 
-from hermes_infoflow import config_editor
-
 
 def _run_dry(args: list[str]) -> str:
     out = io.StringIO()
@@ -24,8 +22,7 @@ def test_dry_run_extract_mode_prints_pipeline(monkeypatch, tmp_path) -> None:
     output = _run_dry(["update", "--version", "0.1.0", "--mode", "extract", "--dry-run"])
     # The four major steps must all show up.
     assert "pip download" in output
-    assert "rsync" in output
-    assert "deploy-common.sh" in output
+    assert "deploy.py" in output
     assert "--dry-run" in output
 
 
@@ -53,6 +50,13 @@ def test_invalid_port_rejected_before_dry_run_pipeline(monkeypatch, tmp_path) ->
     assert exc.value.code == 2
 
 
+def test_noncanonical_channel_id_rejected(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["update", "--channel-id", "infoflow-dev", "--dry-run"])
+    assert exc.value.code == 2
+
+
 def test_dry_run_extract_mode_accepts_local_source(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     source = tmp_path / "hermes-infoflow"
@@ -66,99 +70,59 @@ def test_dry_run_extract_mode_accepts_local_source(monkeypatch, tmp_path) -> Non
 
     assert "use local source" in output
     assert "pip download" not in output
-    assert "rsync" in output
+    assert "deploy.py" in output
 
 
-def test_dry_run_pip_mode_prints_pip_install(monkeypatch, tmp_path) -> None:
+def test_dry_run_pip_mode_aliases_directory_deploy(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     output = _run_dry(["update", "--version", "0.1.0", "--mode", "pip", "--dry-run"])
-    assert "pip install" in output
+    assert "pip mode" in output
+    assert "deprecated" in output
+    assert "pip download" in output
     assert "hermes-infoflow==0.1.0" in output
-    assert "plugins.enabled" in output
-    assert "platform_toolsets.infoflow" in output
-    assert "pip mode" in output  # the reminder note about plugin.yaml
+    assert "deploy.py" in output
+    assert "pip install" not in output
 
 
-def test_pip_mode_enables_plugin_in_config(monkeypatch, tmp_path) -> None:
-    yaml = pytest.importorskip("yaml")
-    hermes_home = tmp_path / ".hermes"
-    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-    monkeypatch.setattr(cli._Runner, "__call__", lambda self, cmd, *, cwd=None: None)
-
-    rc = cli.main(["update", "--version", "0.1.0", "--mode", "pip"])
-
-    assert rc == 0
-    config_text = (hermes_home / "config.yaml").read_text(encoding="utf-8")
-    assert "plugins:" in config_text
-    assert "enabled:" in config_text
-    assert "- infoflow" in config_text
-    config = yaml.safe_load(config_text)
-    assert config["platform_toolsets"]["infoflow"] == list(
-        config_editor.DEFAULT_INFOFLOW_PLATFORM_TOOLSETS
-    )
-
-
-def test_pip_mode_merges_platform_toolsets(monkeypatch, tmp_path) -> None:
-    yaml = pytest.importorskip("yaml")
-    hermes_home = tmp_path / ".hermes"
-    hermes_home.mkdir(parents=True)
-    (hermes_home / "config.yaml").write_text(
-        "plugins:\n"
-        "  enabled:\n"
-        "  - infoflow\n"
-        "platform_toolsets:\n"
-        "  cli:\n"
-        "  - terminal\n"
-        "  - web\n"
-        "  infoflow:\n"
-        "  - custom-mcp\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-    monkeypatch.setattr(cli._Runner, "__call__", lambda self, cmd, *, cwd=None: None)
-
-    rc = cli.main(["update", "--version", "0.1.0", "--mode", "pip"])
-
-    assert rc == 0
-    config = yaml.safe_load((hermes_home / "config.yaml").read_text(encoding="utf-8"))
-    infoflow_toolsets = config["platform_toolsets"]["infoflow"]
-    assert infoflow_toolsets[0] == "custom-mcp"
-    assert "terminal" in infoflow_toolsets
-    assert "web" in infoflow_toolsets
-    assert "hermes-infoflow" in infoflow_toolsets
-
-
-def test_dry_run_pip_mode_forwards_port_to_env(monkeypatch, tmp_path) -> None:
+def test_dry_run_pip_mode_forwards_port_to_deploy_common(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     output = _run_dry(
         ["update", "--version", "0.1.0", "--mode", "pip", "--port", "3333", "--dry-run"]
     )
-    assert "INFOFLOW_PORT=3333" in output
+    assert "--port 3333" in output
 
 
-def test_pip_mode_sets_port_in_env(monkeypatch, tmp_path) -> None:
+def test_dry_run_normalize_defaults_to_infoflow_plugin_dir(monkeypatch, tmp_path) -> None:
     hermes_home = tmp_path / ".hermes"
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-    monkeypatch.setattr(cli._Runner, "__call__", lambda self, cmd, *, cwd=None: None)
 
-    rc = cli.main(["update", "--version", "0.1.0", "--mode", "pip", "--port", "4444"])
+    output = _run_dry(["normalize", "--dry-run"])
 
-    assert rc == 0
-    env_text = (hermes_home / ".env").read_text(encoding="utf-8")
-    assert "INFOFLOW_PORT=4444" in env_text
+    assert "-m hermes_infoflow.deploy" in output
+    assert f"--source {hermes_home / 'plugins' / 'infoflow'}" in output
+    assert "--hermes-home" in output
+    assert "--config-file" in output
 
 
-def test_pip_mode_preserves_existing_port(monkeypatch, tmp_path) -> None:
-    hermes_home = tmp_path / ".hermes"
-    hermes_home.mkdir(parents=True)
-    (hermes_home / ".env").write_text("INFOFLOW_PORT=7777\n", encoding="utf-8")
-    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-    monkeypatch.setattr(cli._Runner, "__call__", lambda self, cmd, *, cwd=None: None)
+def test_dry_run_normalize_uses_source_deploy_script(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    source = tmp_path / "infoflow"
+    deploy_script = source / "hermes_infoflow" / "deploy.py"
+    deploy_script.parent.mkdir(parents=True)
+    deploy_script.write_text("# deploy\n", encoding="utf-8")
 
-    rc = cli.main(["update", "--version", "0.1.0", "--mode", "pip"])
+    output = _run_dry(["normalize", "--source", str(source), "--port", "4444", "--dry-run"])
 
-    assert rc == 0
-    assert (hermes_home / ".env").read_text(encoding="utf-8") == "INFOFLOW_PORT=7777\n"
+    assert str(deploy_script) in output
+    assert f"--source {source}" in output
+    assert "--port 4444" in output
+
+
+def test_normalize_rejects_noncanonical_channel_id(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["normalize", "--channel-id", "infoflow-dev", "--dry-run"])
+    assert exc.value.code == 2
 
 
 def test_resolve_pip_version_spec_latest_drops_version() -> None:

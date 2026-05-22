@@ -9,7 +9,13 @@
 #   bash scripts/deploy.sh [--dry-run] [--port PORT]
 set -euo pipefail
 
-PLUGIN_ID="${HERMES_INFOFLOW_PLUGIN_ID:-infoflow}"
+CANONICAL_PLUGIN_ID="infoflow"
+if [[ -n "${HERMES_INFOFLOW_PLUGIN_ID:-}" && "${HERMES_INFOFLOW_PLUGIN_ID}" != "$CANONICAL_PLUGIN_ID" ]]; then
+  echo "✗ hermes-infoflow only supports plugin id '$CANONICAL_PLUGIN_ID'." >&2
+  echo "  HERMES_INFOFLOW_PLUGIN_ID=${HERMES_INFOFLOW_PLUGIN_ID} would create a second Hermes plugin key." >&2
+  exit 1
+fi
+PLUGIN_ID="$CANONICAL_PLUGIN_ID"
 PLUGIN_DIR="${HOME}/.hermes/plugins/${PLUGIN_ID}"
 CONFIG_FILE="${HERMES_CONFIG_FILE:-${HOME}/.hermes/config.yaml}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -60,7 +66,7 @@ run_cmd() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TEMPORARY: align ~/.hermes/hermes-agent with chbo297 fork branch.
+# OPTIONAL TEMPORARY: align ~/.hermes/hermes-agent with chbo297 fork branch.
 #
 # Upstream hermes-agent currently has a bug that breaks a few plugin
 # capabilities (notably send_message target routing for the infoflow
@@ -70,6 +76,10 @@ run_cmd() {
 # upstream, this block ensures the locally-checked-out hermes-agent at
 # ~/.hermes/hermes-agent matches the latest commit of that fork branch
 # so the gateway picks up the patched runtime when it restarts.
+#
+# Enable with HERMES_INFOFLOW_SYNC_AGENT_FORK=1 only when you explicitly need
+# the forked hermes-agent runtime. This keeps scripts/deploy.sh behavior aligned
+# with hermes-infoflow-tools update by default.
 #
 # This block must be REMOVED once the fix is merged into upstream
 # hermes-agent main (and this plugin starts pinning a release that
@@ -122,7 +132,11 @@ align_hermes_agent_with_fork_branch() {
   echo "          $HERMES_AGENT_DIR/venv/bin/pip install -e $HERMES_AGENT_DIR"
 }
 
-align_hermes_agent_with_fork_branch
+if [[ "${HERMES_INFOFLOW_SYNC_AGENT_FORK:-0}" == "1" ]]; then
+  align_hermes_agent_with_fork_branch
+else
+  echo "==> Skipping hermes-agent fork-branch sync (set HERMES_INFOFLOW_SYNC_AGENT_FORK=1 to enable)"
+fi
 # ─── end TEMPORARY block ────────────────────────────────────────────────────
 
 echo "==> Syncing plugin files to $PLUGIN_DIR"

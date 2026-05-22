@@ -40,6 +40,7 @@ _EXPECTED_PACKAGE_FILES = {
     "api.py",
     "config_editor.py",
     "crypto.py",
+    "deploy.py",
     "parser.py",
     "policy.py",
     "sent_store.py",
@@ -68,6 +69,7 @@ def _run_deploy(
     *,
     pre_config_lines: str | None = None,
     pre_env_lines: str | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     home.mkdir(parents=True, exist_ok=True)
     if pre_config_lines is not None:
@@ -79,10 +81,13 @@ def _run_deploy(
         hermes_dir.mkdir(parents=True, exist_ok=True)
         (hermes_dir / ".env").write_text(pre_env_lines, encoding="utf-8")
     cmd = ["bash", str(_DEPLOY_SCRIPT), *(extra_args or [])]
+    env = _deploy_env(home)
+    if extra_env:
+        env.update(extra_env)
     return subprocess.run(
         cmd,
         cwd=str(_REPO_ROOT),
-        env=_deploy_env(home),
+        env=env,
         capture_output=True,
         text=True,
     )
@@ -123,6 +128,189 @@ def test_init_py_at_plugin_root(deployed: Path) -> None:
         "hermes-agent's directory loader requires __init__.py at the plugin "
         f"dir root. Deployed layout was:\n{_tree(deployed)}"
     )
+
+
+def test_deploy_rerun_deletes_stale_root_files(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    result = _run_deploy(home)
+    assert result.returncode == 0, result.stderr
+    plugin_dir = home / ".hermes" / "plugins" / "infoflow"
+    stale = plugin_dir / "stale_from_other_deploy.py"
+    stale.write_text("# stale\n", encoding="utf-8")
+
+    result = _run_deploy(home)
+
+    assert result.returncode == 0, result.stderr
+    assert not stale.exists()
+
+
+def test_tools_extract_overwrites_deploy_layout(tmp_path: Path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    result = _run_deploy(home)
+    assert result.returncode == 0, result.stderr
+    plugin_dir = home / ".hermes" / "plugins" / "infoflow"
+    stale = plugin_dir / "stale_from_deploy_sh.py"
+    stale.write_text("# stale\n", encoding="utf-8")
+
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("HERMES_HOME", str(home / ".hermes"))
+    monkeypatch.setenv("PYTHON", sys.executable)
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+    from hermes_infoflow_tools import cli
+
+    rc = cli.main(
+        [
+            "update",
+            "--package-name",
+            str(_REPO_ROOT),
+            "--mode",
+            "extract",
+        ]
+    )
+
+    assert rc == 0
+    assert not stale.exists()
+    assert (plugin_dir / "__init__.py").is_file()
+    assert (plugin_dir / "adapter.py").is_file()
+    assert not (plugin_dir / "hermes_infoflow").exists()
+
+
+def _seed_plugins_install_layout(plugin_dir: Path) -> None:
+    """Create the layout produced by ``hermes plugins install`` without git."""
+    plugin_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(_REPO_ROOT / "__init__.py", plugin_dir / "__init__.py")
+    shutil.copy2(_REPO_ROOT / "plugin.yaml", plugin_dir / "plugin.yaml")
+    shutil.copytree(
+        _REPO_ROOT / "hermes_infoflow",
+        plugin_dir / "hermes_infoflow",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    shutil.copytree(
+        _REPO_ROOT / "scripts",
+        plugin_dir / "scripts",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    (plugin_dir / ".git").mkdir()
+    (plugin_dir / "stale_from_git_install.txt").write_text("stale\n", encoding="utf-8")
+
+
+def test_normalize_overwrites_plugins_install_layout(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    plugin_dir = home / ".hermes" / "plugins" / "infoflow"
+    _seed_plugins_install_layout(plugin_dir)
+
+    env = _deploy_env(home)
+    env["HERMES_INFOFLOW_ENTRYPOINT_POLICY"] = "keep"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_REPO_ROOT / "hermes_infoflow" / "deploy.py"),
+            "--source",
+            str(plugin_dir),
+            "--port",
+            "4445",
+        ],
+        cwd=str(_REPO_ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (plugin_dir / "__init__.py").is_file()
+    assert (plugin_dir / "adapter.py").is_file()
+    assert (plugin_dir / "deploy.py").is_file()
+    assert (plugin_dir / "plugin.yaml").is_file()
+    assert (plugin_dir / "scripts" / "lib" / "deploy-common.sh").is_file()
+    assert not (plugin_dir / "hermes_infoflow").exists()
+    assert not (plugin_dir / ".git").exists()
+    assert not (plugin_dir / "stale_from_git_install.txt").exists()
+    assert _read_env_port(home / ".hermes" / ".env") == "4445"
+
+
+def test_pip_style_deploy_command_from_package_source(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    env = _deploy_env(home)
+    env["HERMES_INFOFLOW_ENTRYPOINT_POLICY"] = "keep"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_REPO_ROOT / "hermes_infoflow" / "deploy.py"),
+            "--port",
+            "4446",
+        ],
+        cwd=str(_REPO_ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    plugin_dir = home / ".hermes" / "plugins" / "infoflow"
+    assert (plugin_dir / "adapter.py").is_file()
+    assert (plugin_dir / "deploy.py").is_file()
+    assert not (plugin_dir / "hermes_infoflow").exists()
+    assert _read_env_port(home / ".hermes" / ".env") == "4446"
+
+
+def test_pip_style_deploy_dry_run_works_without_existing_plugin_dir(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    env = _deploy_env(home)
+    env["HERMES_INFOFLOW_ENTRYPOINT_POLICY"] = "keep"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_REPO_ROOT / "hermes_infoflow" / "deploy.py"),
+            "--port",
+            "4448",
+            "--dry-run",
+        ],
+        cwd=str(_REPO_ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "replace" in result.stdout
+    assert "deploy-common.sh" in result.stdout
+    assert not (home / ".hermes" / "plugins" / "infoflow").exists()
+    assert not (home / ".hermes" / "config.yaml").exists()
+    assert not (home / ".hermes" / ".env").exists()
+
+
+def test_normalize_restores_existing_plugin_when_deploy_common_fails(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    plugin_dir = home / ".hermes" / "plugins" / "infoflow"
+    plugin_dir.mkdir(parents=True)
+    old_marker = plugin_dir / "old-layout-marker.txt"
+    old_marker.write_text("keep me\n", encoding="utf-8")
+
+    env = _deploy_env(home)
+    env["HERMES_INFOFLOW_ENTRYPOINT_POLICY"] = "invalid"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_REPO_ROOT / "hermes_infoflow" / "deploy.py"),
+            "--source",
+            str(_REPO_ROOT),
+            "--port",
+            "4447",
+        ],
+        cwd=str(_REPO_ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "HERMES_INFOFLOW_ENTRYPOINT_POLICY" in result.stderr
+    assert old_marker.read_text(encoding="utf-8") == "keep me\n"
+    assert not (plugin_dir / "adapter.py").exists()
+    assert not list(plugin_dir.parent.glob(".infoflow.normalize-backup-*"))
 
 
 def test_package_files_flattened_at_root(deployed: Path) -> None:
@@ -217,6 +405,16 @@ def test_deploy_dry_run_rejects_invalid_port(tmp_path: Path) -> None:
     result = _run_deploy(home, ["--port", "99999", "--dry-run"])
     assert result.returncode != 0
     assert "--port must be an integer 1-65535" in result.stderr
+
+
+def test_deploy_rejects_noncanonical_plugin_id(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    result = _run_deploy(
+        home,
+        extra_env={"HERMES_INFOFLOW_PLUGIN_ID": "infoflow-dev"},
+    )
+    assert result.returncode != 0
+    assert "only supports plugin id 'infoflow'" in result.stderr
 
 
 def test_deploy_common_dry_run_rejects_invalid_port(tmp_path: Path) -> None:

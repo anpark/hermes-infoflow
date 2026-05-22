@@ -46,6 +46,10 @@ dependencies = [
 [project.entry-points."hermes_agent.plugins"]
 infoflow = "hermes_infoflow"
 
+[project.scripts]
+hermes-infoflow-deploy = "hermes_infoflow.deploy:main"
+hermes-infoflow-normalize = "hermes_infoflow.deploy:main"
+
 [project.urls]
 Homepage = "https://github.com/chbo297/hermes-infoflow"
 Issues   = "https://github.com/chbo297/hermes-infoflow/issues"
@@ -59,14 +63,18 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["hermes_infoflow"]
-# Ship plugin.yaml inside the wheel so directory-style installs that unpack
-# the sdist (B-extract path) get a usable manifest at the package root.
+# Ship metadata used by pip-style deploys. The package also carries
+# hermes_infoflow/plugin.yaml; scripts are force-included below so
+# hermes-infoflow-deploy can run the same deploy-common.sh as other paths.
 include = [
     "plugin.yaml",
     "README.md",
     "CHANGELOG.md",
     "LICENSE",
 ]
+
+[tool.hatch.build.targets.wheel.force-include]
+"scripts" = "hermes_infoflow/_deploy_scripts"
 
 [tool.hatch.build.targets.sdist]
 include = [
@@ -75,6 +83,7 @@ include = [
     "README.md",
     "CHANGELOG.md",
     "LICENSE",
+    "after-install.md",
     "scripts",
 ]
 exclude = [
@@ -98,6 +107,9 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 # Late imports after optional hermes-agent / gateway shims (see adapter module docstring).
 "hermes_infoflow/adapter.py" = ["E402"]
+# deploy.py must clean sys.path before stdlib imports when executed directly
+# from a flattened plugin dir that also contains types.py.
+"hermes_infoflow/deploy.py" = ["E402"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

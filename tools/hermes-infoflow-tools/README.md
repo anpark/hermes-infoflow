@@ -4,13 +4,35 @@ CLI helper to install/update the `hermes-infoflow` plugin into a Hermes Agent
 home directory.
 
 ```bash
-# default: pip download + tar + rsync into ~/.hermes/plugins/infoflow/
-pipx run hermes-infoflow-tools update --version 2026.5.21
-pipx run hermes-infoflow-tools update --version 2026.5.21 --port 9000
+# default: pip download + tar + normalize into ~/.hermes/plugins/infoflow/
+pipx run hermes-infoflow-tools update --version <version>
+pipx run hermes-infoflow-tools update --version <version> --port 9000
+```
 
-# or, install into site-packages and load via entry-point
-pipx run hermes-infoflow-tools update --version 2026.5.21 --mode pip
-pipx run hermes-infoflow-tools update --version 2026.5.21 --mode pip --port 9000
+Pin both the installer package and the plugin package to a stable version:
+
+<!-- sync:hermes-infoflow-version:latest -->
+```bash
+pipx run --spec hermes-infoflow-tools==2026.5.21 hermes-infoflow-tools update --version 2026.5.21 --mode extract --port 9000
+```
+<!-- /sync:hermes-infoflow-version:latest -->
+
+Beta / prerelease: use the exact PEP 440 version:
+
+<!-- sync:hermes-infoflow-version:beta -->
+```bash
+pipx run --spec hermes-infoflow-tools==0.2.2b1 hermes-infoflow-tools update --version 0.2.2b1 --mode extract --port 9000
+```
+<!-- /sync:hermes-infoflow-version:beta -->
+
+```bash
+# compatibility alias; still deploys directory-style to ~/.hermes/plugins/infoflow/
+pipx run hermes-infoflow-tools update --version <version> --mode pip
+pipx run hermes-infoflow-tools update --version <version> --mode pip --port 9000
+
+# normalize a prior `hermes plugins install` clone into the same layout
+pipx run hermes-infoflow-tools normalize
+pipx run hermes-infoflow-tools normalize --port 9000
 ```
 
 See the main repo README for the full installation matrix and trade-offs

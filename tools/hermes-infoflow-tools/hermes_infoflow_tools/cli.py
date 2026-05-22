@@ -2,26 +2,29 @@
 
 Mirrors openclaw-infoflow/tools/infoflow-openclaw-tools/bin/cli.mjs in
 purpose and CLI shape, but is implemented in pure Python (stdlib + the
-system's ``pip`` / ``tar`` / ``rsync`` / ``bash``).
+system's ``pip`` / ``tar`` / ``bash``).
 
 Two installation modes:
 
 * ``--mode extract`` (default) — Download the ``hermes-infoflow`` sdist
-  from PyPI, untar it, and rsync the contents to
+  from PyPI, untar it, and normalize the contents into
   ``~/.hermes/plugins/infoflow/``. This matches the OpenClaw experience
   (per-user directory plugin, easy to inspect / patch / remove).
 
-* ``--mode pip`` — ``pip install --upgrade hermes-infoflow==<ver>`` into
-  the active Python environment. The plugin is then discovered via the
-  ``hermes_agent.plugins`` entry-point. Note that, in this mode, hermes
-  does NOT read ``plugin.yaml`` so ``hermes config`` won't list the
-  ``INFOFLOW_*`` env vars in its setup wizard. Users must export them
-  manually or run ``hermes config set INFOFLOW_*``.
+* ``--mode pip`` — Backward-compatible alias for the same directory-style
+  deployment. Older releases installed an entry-point package into the active
+  Python environment, which could shadow ``~/.hermes/plugins/infoflow``. This
+  tool now keeps the Hermes plugin source of truth in the directory plugin.
 
-Both modes finish by calling ``edit_hermes_config.py`` to ensure
-``plugins.enabled`` contains ``infoflow``, and (in extract mode) by
-running ``scripts/lib/deploy-common.sh`` to optionally restart the
-gateway.
+Both update modes finish by running ``scripts/lib/deploy-common.sh`` to ensure
+``plugins.enabled`` contains ``infoflow``, seed ``INFOFLOW_PORT``, remove
+shadowing entry-point installs from the Hermes runtime when found, and
+optionally restart the gateway.
+
+The ``normalize`` subcommand is for installs created by ``hermes plugins
+install``: it runs the package's ``hermes_infoflow/deploy.py`` in-place so the
+Git-cloned layout is flattened into the same directory-style deployment as
+``update`` and ``scripts/deploy.sh``.
 """
 
 from __future__ import annotations
@@ -35,13 +38,9 @@ import sys
 import tarfile
 import tempfile
 from pathlib import Path
-from typing import Any
 
 from .env_editor import (
     DEFAULT_INFOFLOW_PORT,
-    ensure_key,
-    read_key,
-    upsert_key,
     validate_port_value,
 )
 
@@ -61,6 +60,15 @@ def _parse_port_arg(value: str) -> int:
     except SystemExit as exc:
         raise argparse.ArgumentTypeError(str(exc)) from None
     return int(value)
+
+
+def _parse_channel_id_arg(value: str) -> str:
+    if value != DEFAULT_CHANNEL_ID:
+        raise argparse.ArgumentTypeError(
+            "hermes-infoflow only supports plugin id "
+            f"{DEFAULT_CHANNEL_ID!r}; got {value!r}"
+        )
+    return value
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -98,10 +106,11 @@ def _build_parser() -> argparse.ArgumentParser:
     upd.add_argument(
         "--channel-id",
         default=DEFAULT_CHANNEL_ID,
+        type=_parse_channel_id_arg,
         help=(
             "Plugin id / directory name under ~/.hermes/plugins/. "
-            "Must match the plugin's `register(name=...)` value; "
-            "do NOT change unless you know what you're doing."
+            "Only 'infoflow' is supported so all deployment paths overwrite "
+            "the same Hermes plugin."
         ),
     )
     upd.add_argument(
@@ -111,8 +120,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "extract = unpack sdist into ~/.hermes/plugins/<id>/ (default; "
             "mirrors OpenClaw experience). "
-            "pip = pip install into site-packages (Pythonic; loads via "
-            "entry-point, but setup wizard won't see plugin.yaml)."
+            "pip = deprecated alias for extract; it still deploys directory-style "
+            "so it can safely overwrite deploy.sh installs."
         ),
     )
     upd.add_argument(
@@ -127,6 +136,42 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     upd.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print commands without executing them.",
+    )
+
+    norm = sub.add_parser(
+        "normalize",
+        help=(
+            "Normalize an existing hermes-infoflow plugin directory into the "
+            "canonical ~/.hermes/plugins/infoflow layout."
+        ),
+    )
+    norm.add_argument(
+        "--source",
+        help=(
+            "Source plugin/check-out directory. Defaults to "
+            "$HERMES_HOME/plugins/infoflow."
+        ),
+    )
+    norm.add_argument(
+        "--channel-id",
+        default=DEFAULT_CHANNEL_ID,
+        type=_parse_channel_id_arg,
+        help="Only 'infoflow' is supported.",
+    )
+    norm.add_argument(
+        "--port",
+        type=_parse_port_arg,
+        metavar="PORT",
+        default=None,
+        help=(
+            "Webhook listen port (1-65535). Written to ~/.hermes/.env as "
+            "INFOFLOW_PORT."
+        ),
+    )
+    norm.add_argument(
         "--dry-run",
         action="store_true",
         help="Print commands without executing them.",
@@ -156,46 +201,6 @@ class _Runner:
             sys.exit(result.returncode)
 
 
-def _configure_infoflow_port(
-    hermes_home: Path,
-    port: int | None,
-    *,
-    dry_run: bool,
-) -> None:
-    """Seed or override ``INFOFLOW_PORT`` in ``$HERMES_HOME/.env``."""
-    env_file = hermes_home / ".env"
-    print(f"==> Configuring INFOFLOW_PORT in {env_file}")
-    if port is not None:
-        validate_port_value(str(port))
-        if dry_run:
-            print(
-                f"[edit_hermes_env] (dry-run) would set INFOFLOW_PORT={port} in {env_file}"
-            )
-            return
-        changed = upsert_key(env_file, "INFOFLOW_PORT", str(port))
-    else:
-        if dry_run:
-            existing = read_key(env_file, "INFOFLOW_PORT")
-            if existing is not None:
-                print(
-                    f"[edit_hermes_env] (dry-run) would leave "
-                    f"INFOFLOW_PORT={existing} in {env_file}"
-                )
-            else:
-                print(
-                    f"[edit_hermes_env] (dry-run) would ensure "
-                    f"INFOFLOW_PORT={DEFAULT_INFOFLOW_PORT} in {env_file}"
-                )
-            return
-        changed = ensure_key(env_file, "INFOFLOW_PORT", str(DEFAULT_INFOFLOW_PORT))
-
-    if changed:
-        current = read_key(env_file, "INFOFLOW_PORT")
-        print(f"[edit_hermes_env] updated {env_file} (INFOFLOW_PORT={current})")
-    else:
-        print(f"[edit_hermes_env] no change needed ({env_file}: INFOFLOW_PORT already set)")
-
-
 def _resolve_pip_version_spec(package: str, version: str) -> str:
     """Return ``package==version`` (or just ``package`` for ``latest``)."""
     if version in ("", "latest"):
@@ -207,71 +212,6 @@ def _package_glob_stem(package_name: str) -> str:
     """Return the normalized sdist stem for a package name or local path."""
     stem = Path(package_name).name or DEFAULT_PACKAGE
     return re.sub(r"[-_.]+", "_", stem).lower()
-
-
-def _ensure_plugin_enabled(config_file: Path, plugin_id: str, *, dry_run: bool) -> bool:
-    """Ensure ``plugins.enabled`` contains ``plugin_id``.
-
-    The main package installs PyYAML as a runtime dependency, so pip mode can
-    safely use it after the package install step.  Dry-run still works in a
-    bare tools environment by printing the intended change.
-    """
-    if dry_run:
-        print(f"$ ensure {plugin_id!r} is present in {config_file}:plugins.enabled")
-        print(
-            f"$ ensure {config_file}:platform_toolsets.{plugin_id} "
-            "includes CLI tool permissions"
-        )
-        return True
-
-    try:
-        import yaml
-    except ImportError as exc:
-        raise SystemExit(
-            "PyYAML is required to edit Hermes config. "
-            "Install hermes-infoflow first or run: pip install pyyaml"
-        ) from exc
-
-    def _load(path: Path) -> dict[str, Any]:
-        if not path.exists() or path.stat().st_size == 0:
-            return {}
-        parsed = yaml.safe_load(path.read_text(encoding="utf-8"))
-        if parsed is None:
-            return {}
-        if not isinstance(parsed, dict):
-            raise SystemExit(f"refusing to edit {path}: top-level YAML is not a mapping")
-        return parsed
-
-    data = _load(config_file)
-    changed = _load_config_editor().apply(data, plugin_id)
-    if not changed:
-        print(f"[pip mode] no config change needed ({plugin_id} already enabled)")
-        return False
-
-    config_file.parent.mkdir(parents=True, exist_ok=True)
-    config_file.write_text(
-        yaml.safe_dump(
-            data,
-            sort_keys=False,
-            allow_unicode=True,
-            default_flow_style=False,
-        ),
-        encoding="utf-8",
-    )
-    print(f"[pip mode] enabled {plugin_id} in {config_file}")
-    return True
-
-
-def _load_config_editor():
-    try:
-        from hermes_infoflow import config_editor
-    except Exception as exc:
-        raise SystemExit(
-            "hermes-infoflow must be installed before editing Hermes config. "
-            "The preceding pip install step should have provided "
-            "hermes_infoflow.config_editor."
-        ) from exc
-    return config_editor
 
 
 # ---------------------------------------------------------------------------
@@ -324,7 +264,6 @@ def _looks_like_local_path(value: str) -> bool:
 
 def _do_extract(args, hermes_home: Path) -> int:
     runner = _Runner(dry_run=args.dry_run)
-    plugin_dir = hermes_home / "plugins" / args.channel_id
     config_file = hermes_home / "config.yaml"
     local_source: Path | None = None
     if _looks_like_local_path(args.package_name):
@@ -374,92 +313,90 @@ def _do_extract(args, hermes_home: Path) -> int:
                 _safe_extract(tar, tmp_root)
             extracted_label = str(_extracted_dir(tmp_root, args.package_name))
 
-        # 3) rsync into the plugin dir.
-        #
-        # hermes-agent's directory-plugin loader requires ``__init__.py``
-        # to live directly at ``plugin_dir`` (see
-        # hermes_cli/plugins.py::_load_directory_module). The sdist
-        # tarball keeps the source nested inside ``hermes_infoflow/`` for
-        # PyPI / entry-point installs, so we flatten the layout here:
-        #
-        #   1. ``<extracted>/hermes_infoflow/*``  →  ``plugin_dir/*``
-        #   2. ``<extracted>/plugin.yaml``        →  ``plugin_dir/plugin.yaml``
-        #   3. ``<extracted>/scripts/``           →  ``plugin_dir/scripts/``
-        #
-        # Internal imports inside the package are all relative
-        # (``from .adapter import register``) and hermes-agent points the
-        # loaded module's ``submodule_search_locations`` at ``plugin_dir``,
-        # so the relative imports keep resolving after flattening.
-        runner(["mkdir", "-p", str(plugin_dir)])
-        # Step 1: package contents → plugin_dir/ (flatten + clean stale files)
-        runner(
-            [
-                "rsync",
-                "-av",
-                "--delete",
-                "--exclude",
-                "__pycache__",
-                "--exclude",
-                "*.pyc",
-                f"{extracted_label}/hermes_infoflow/",
-                f"{plugin_dir}/",
-            ]
-        )
-        # Step 2: plugin.yaml on top (manifest lives at sdist root, not in the
-        # package dir).
-        runner(
-            [
-                "rsync",
-                "-av",
-                f"{extracted_label}/plugin.yaml",
-                f"{plugin_dir}/plugin.yaml",
-            ]
-        )
-        # Step 3: scripts/ on top so deploy-common.sh stays available for
-        # subsequent re-runs of `hermes-infoflow-tools update`.
-        runner(
-            [
-                "rsync",
-                "-av",
-                "--delete",
-                "--exclude",
-                "__pycache__",
-                "--exclude",
-                "*.pyc",
-                f"{extracted_label}/scripts/",
-                f"{plugin_dir}/scripts/",
-            ]
-        )
+        # 3) Hand off to the main package normalizer. Keep layout rules in
+        # exactly one place so tools/deploy.sh/pip-style installs do not drift.
+        if use_local_source or not args.dry_run:
+            deploy_script = _find_deploy_script(Path(extracted_label))
+        else:
+            deploy_script = None
+        if deploy_script is None:
+            if args.dry_run:
+                deploy_script = Path(extracted_label) / "hermes_infoflow" / "deploy.py"
+            else:
+                raise SystemExit(
+                    f"Cannot find hermes-infoflow deploy.py under {extracted_label}"
+                )
 
-        # 4) Hand off to deploy-common.sh for config + gateway restart.
-        # Prefer the freshly-installed copy; fall back to the in-repo copy
-        # if this is a dev checkout (extract mode targeting the same repo).
-        common_script = plugin_dir / "scripts" / "lib" / "deploy-common.sh"
-        if not common_script.exists():
-            here = Path(__file__).resolve().parent
-            repo_root = here.parent.parent.parent  # tools/hermes-infoflow-tools/hermes_infoflow_tools/cli.py → repo root
-            candidate = repo_root / "scripts" / "lib" / "deploy-common.sh"
-            if candidate.exists():
-                common_script = candidate
-        common_args = [
-            "bash",
-            str(common_script),
-            "--plugin-dir",
-            str(plugin_dir),
-            "--plugin-id",
-            args.channel_id,
+        deploy_args = [
+            sys.executable,
+            str(deploy_script),
+            "--source",
+            extracted_label,
+            "--hermes-home",
+            str(hermes_home),
             "--config-file",
             str(config_file),
         ]
         if args.port is not None:
-            common_args.extend(["--port", str(args.port)])
+            deploy_args.extend(["--port", str(args.port)])
         if args.dry_run:
-            common_args.append("--dry-run")
-        runner(common_args)
+            deploy_args.append("--dry-run")
+        runner(deploy_args)
         return 0
     finally:
         if not args.dry_run:
             shutil.rmtree(tmp_root, ignore_errors=True)
+
+
+def _find_deploy_script(source: Path) -> Path | None:
+    candidates = [
+        source / "hermes_infoflow" / "deploy.py",
+        source / "deploy.py",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _do_normalize(args, hermes_home: Path) -> int:
+    runner = _Runner(dry_run=args.dry_run)
+    source = Path(args.source).expanduser() if args.source else hermes_home / "plugins" / args.channel_id
+    config_file = Path(
+        os.environ.get("HERMES_CONFIG_FILE", str(hermes_home / "config.yaml"))
+    )
+
+    deploy_script = _find_deploy_script(source)
+    if deploy_script is None and not args.dry_run:
+        raise SystemExit(
+            f"Cannot find hermes-infoflow deploy.py under {source}. "
+            "Install with `hermes-infoflow-tools update` or point --source at "
+            "a current hermes-infoflow checkout/plugin directory."
+        )
+
+    if deploy_script is not None:
+        cmd = [sys.executable, str(deploy_script)]
+    else:
+        # Dry-run fallback: show the module form a pip install would use.
+        cmd = [sys.executable, "-m", "hermes_infoflow.deploy"]
+
+    cmd.extend(
+        [
+            "--source",
+            str(source),
+            "--hermes-home",
+            str(hermes_home),
+            "--config-file",
+            str(config_file),
+        ]
+    )
+    if args.port is not None:
+        cmd.extend(["--port", str(args.port)])
+    if args.dry_run:
+        cmd.append("--dry-run")
+
+    runner(cmd)
+    return 0
 
 
 def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
@@ -477,44 +414,6 @@ def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Mode: pip
-# ---------------------------------------------------------------------------
-
-
-def _do_pip(args, hermes_home: Path) -> int:
-    runner = _Runner(dry_run=args.dry_run)
-    spec = _resolve_pip_version_spec(args.package_name, args.version)
-    config_file = hermes_home / "config.yaml"
-
-    runner(
-        [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "--upgrade",
-            "-i",
-            args.index_url,
-            spec,
-        ]
-    )
-
-    # The entry-point installer doesn't unpack plugin.yaml anywhere hermes
-    # will see it, so we only update plugins.enabled here. Users still need
-    # to set INFOFLOW_* env vars themselves.
-    _ensure_plugin_enabled(config_file, args.channel_id, dry_run=args.dry_run)
-    _configure_infoflow_port(hermes_home, args.port, dry_run=args.dry_run)
-
-    print(
-        "[pip mode] plugin installed via entry-point. Reminder: hermes "
-        "does NOT read plugin.yaml in this mode, so the setup wizard "
-        "will not list INFOFLOW_* env vars. Export them manually or "
-        "run `hermes config set INFOFLOW_*` before starting the gateway.",
-    )
-    return 0
-
-
-# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -523,16 +422,20 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
-    if args.command != "update":  # pragma: no cover - argparse already guards
-        parser.print_help()
-        return 1
-
     hermes_home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
 
-    if args.mode == "extract":
-        return _do_extract(args, hermes_home)
-    if args.mode == "pip":
-        return _do_pip(args, hermes_home)
+    if args.command == "update":
+        if args.mode == "extract":
+            return _do_extract(args, hermes_home)
+        if args.mode == "pip":
+            print(
+                "[pip mode] deprecated: deploying directory-style to "
+                f"{hermes_home / 'plugins' / args.channel_id} so it can safely "
+                "overwrite deploy.sh/extract installs."
+            )
+            return _do_extract(args, hermes_home)
+    if args.command == "normalize":
+        return _do_normalize(args, hermes_home)
     return 1  # pragma: no cover
 
 

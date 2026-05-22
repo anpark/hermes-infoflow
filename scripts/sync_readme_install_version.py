@@ -37,6 +37,12 @@ from pathlib import Path
 DEFAULT_PACKAGE = "hermes-infoflow"
 DEFAULT_PYPROJECT = Path(__file__).resolve().parent.parent / "pyproject.toml"
 DEFAULT_README = Path(__file__).resolve().parent.parent / "README.md"
+DEFAULT_TOOLS_README = (
+    Path(__file__).resolve().parent.parent
+    / "tools"
+    / "hermes-infoflow-tools"
+    / "README.md"
+)
 
 MARKER_TEMPLATE = (
     r"<!--\s*sync:{key}\s*-->(.*?)<!--\s*/sync:{key}\s*-->"
@@ -138,7 +144,14 @@ def _patch_marker(content: str, key: str, version: str | None) -> tuple[str, boo
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--package", default=DEFAULT_PACKAGE)
-    parser.add_argument("--readme", default=str(DEFAULT_README))
+    parser.add_argument(
+        "--readme",
+        action="append",
+        help=(
+            "README file to update. May be passed multiple times. "
+            "Defaults to the root README and tools README."
+        ),
+    )
     parser.add_argument("--pyproject", default=str(DEFAULT_PYPROJECT))
     parser.add_argument(
         "--dry-run",
@@ -147,28 +160,47 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    readme = Path(args.readme)
+    readmes = [Path(p) for p in args.readme] if args.readme else [
+        DEFAULT_README,
+        DEFAULT_TOOLS_README,
+    ]
     pyproject = Path(args.pyproject)
-    if not readme.exists():
-        print(f"[sync] no README at {readme}", file=sys.stderr)
+    missing = [p for p in readmes if not p.exists()]
+    if missing:
+        for readme in missing:
+            print(f"[sync] no README at {readme}", file=sys.stderr)
         return 1
 
     current = _read_current_version(pyproject)
     streams = _resolve_streams(args.package)
     streams["hermes-infoflow-version"] = current  # the "current" stream
 
-    content = readme.read_text(encoding="utf-8")
-    new_content = content
-    touched = False
-    for key in ("hermes-infoflow-version", "hermes-infoflow-version:latest", "hermes-infoflow-version:beta"):
-        version_key = "hermes-infoflow-version" if key == "hermes-infoflow-version" else key.split(":")[-1]
-        version = streams.get(version_key)
-        new_content, changed = _patch_marker(new_content, key, version)
-        if changed:
-            print(f"[sync] updated marker {key} -> {version}")
-            touched = True
+    touched_any = False
+    outputs: list[tuple[Path, str]] = []
+    for readme in readmes:
+        content = readme.read_text(encoding="utf-8")
+        new_content = content
+        touched = False
+        for key in (
+            "hermes-infoflow-version",
+            "hermes-infoflow-version:latest",
+            "hermes-infoflow-version:beta",
+        ):
+            version_key = (
+                "hermes-infoflow-version"
+                if key == "hermes-infoflow-version"
+                else key.split(":")[-1]
+            )
+            version = streams.get(version_key)
+            new_content, changed = _patch_marker(new_content, key, version)
+            if changed:
+                print(f"[sync] updated {readme} marker {key} -> {version}")
+                touched = True
+        if touched:
+            touched_any = True
+            outputs.append((readme, new_content))
 
-    if not touched:
+    if not touched_any:
         print("[sync] no changes")
         return 0
 
@@ -176,8 +208,9 @@ def main(argv: list[str] | None = None) -> int:
         print("[sync] (dry-run) not writing changes")
         return 0
 
-    readme.write_text(new_content, encoding="utf-8")
-    print(f"[sync] wrote {readme}")
+    for readme, new_content in outputs:
+        readme.write_text(new_content, encoding="utf-8")
+        print(f"[sync] wrote {readme}")
     return 0
 
 

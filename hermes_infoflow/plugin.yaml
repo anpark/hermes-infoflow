@@ -10,9 +10,11 @@
 #
 # Layout note: hermes-agent's directory loader requires ``__init__.py`` at the
 # plugin dir root (``hermes_cli/plugins.py::_load_directory_module``). The repo
-# keeps the source nested in ``hermes_infoflow/`` so the same code also serves
-# the entry-point install. ``scripts/deploy.sh`` flattens the layout at deploy
-# time — see ``tests/test_deploy_layout.py`` for the contract. There is NO
+# keeps the source nested in ``hermes_infoflow/`` so the same code can be copied
+# from source checkouts, ``hermes plugins install`` clones, sdist extracts, and
+# pip-installed wheels. Every supported path runs the normalizer/deployer and
+# converges on the single canonical directory ``~/.hermes/plugins/infoflow`` —
+# see ``tests/test_deploy_layout.py`` for the contract. There is NO
 # ``entry_module`` field hermes-agent reads; pointing at a nested package via
 # the manifest would not help.
 manifest_version: 1
@@ -27,9 +29,10 @@ author: chengbo05 <chengbo05@baidu.com>
 
 # ``requires_env`` / ``optional_env`` are surfaced by hermes_cli/config.py's
 # platform-plugin env var injector in the `hermes config` setup wizard —
-# ONLY when this plugin is loaded as a directory plugin (paths A / B-extract / D).
-# Entry-point installs (paths B-pip / C) do not read plugin.yaml, so users on
-# those paths must export INFOFLOW_* manually. See README for details.
+# ONLY when this plugin is loaded as a directory plugin. Raw entry-point-only
+# installs do not read plugin.yaml; run ``hermes-infoflow-deploy`` or
+# ``hermes-infoflow-tools update`` so Hermes uses the canonical directory
+# plugin. See README for details.
 requires_env:
   - name: INFOFLOW_CHECK_TOKEN
     description: "Infoflow check token (used for echostr signature verification)"

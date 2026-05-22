@@ -11,17 +11,18 @@
 # Layout note: hermes-agent's directory loader requires ``__init__.py`` at the
 # plugin dir root (``hermes_cli/plugins.py::_load_directory_module``).  This
 # repo ships a root-level ``__init__.py`` that re-exports the public API from
-# the ``hermes_infoflow/`` sub-package.  This makes all four install paths work
-# without flattening:
+# the ``hermes_infoflow/`` sub-package.  Supported installs converge on the
+# same plugin id and directory:
 #
-#   A. ``hermes plugins install`` — git clone + move; root ``__init__.py``
-#      imports from ``hermes_infoflow`` via the submodule search path that
-#      the directory loader sets on the loaded module.
-#   B. ``hermes-infoflow-tools --mode extract`` — unpacks sdist then rsyncs
-#      ``hermes_infoflow/*`` to the plugin dir root (overwrites root
-#      ``__init__.py`` with the flattened copy).
-#   C. ``pip install`` — entry-point loads ``hermes_infoflow`` directly;
-#      root ``__init__.py`` is never touched.
+#   A. ``hermes plugins install`` + ``scripts/normalize.sh`` — git clone,
+#      then flatten into the same canonical directory layout as B/D.
+#   B. ``hermes-infoflow-tools --mode extract`` — unpacks sdist then runs the
+#      same normalizer to flatten ``hermes_infoflow/*`` into the plugin dir root
+#      (overwrites root ``__init__.py`` with the flattened copy).
+#      ``--mode pip`` is a backwards-compatible alias for this directory-style
+#      deploy, not an entry-point install.
+#   C. ``pip install hermes-infoflow`` + ``hermes-infoflow-deploy`` — copy
+#      the installed package into the same canonical directory layout.
 #   D. ``scripts/deploy.sh`` — rsync flattens ``hermes_infoflow/*`` to the
 #      plugin dir root (same as B-extract).
 #

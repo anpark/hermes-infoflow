@@ -25,60 +25,149 @@ Baidu Infoflow（如流）Channel 插件 for [Hermes Agent](https://github.com/n
 
 ---
 
-## 4 种安装方式
+## 安装方式与覆盖规则
 
-主推 directory-style 三种（A / B `--mode extract` / D）；entry-point 方式（B `--mode pip` / C）作为高级用法。
+主推 directory-style：所有推荐路径都使用固定插件 ID `infoflow`，并最终写入同一个目录 `~/.hermes/plugins/infoflow/`。完整部署都会运行同一个归一化步骤：把源码扁平化到插件目录根、写入 `plugin.yaml`、同步 `scripts/`、补齐 `plugins.enabled` / `platform_toolsets.infoflow`，并维护 `~/.hermes/.env` 里的 `INFOFLOW_PORT`。因此 A / B / C / D 可以互相覆盖，最终 Hermes 里看到的插件名、平台名、工具集名都保持一致。
+
+旧式 `pip install hermes-infoflow` 只安装 entry-point，不再视为完整部署；完整 pip 部署需要再执行 `hermes-infoflow-deploy`。如果 Hermes runtime 中残留同名 entry-point，归一化步骤默认会尝试移除它，避免遮挡目录插件；可用 `HERMES_INFOFLOW_ENTRYPOINT_POLICY=warn` 只告警，或 `keep` 保留。
+
+完整安装方式共 **4 类**；其中 `hermes plugins install` 有两种归一化执行法，`hermes-infoflow-tools update` 有 `extract` / `pip` 两个入口，所以当前验证过的完整命令路径共 **6 条**：
+
+| # | 方式 | 是否支持包版本 | 完整命令 |
+|---|------|----------------|----------|
+| 1 | Hermes CLI + 内置 normalize 脚本 | 否（Git 最新提交） | `hermes plugins install --force --enable chbo297/hermes-infoflow` → `bash ~/.hermes/plugins/infoflow/scripts/normalize.sh --port 9000` → `hermes gateway restart` |
+| 2 | Hermes CLI + tools normalize | 否（Git 最新提交） | `hermes plugins install --force --enable chbo297/hermes-infoflow` → `pipx run hermes-infoflow-tools normalize --port 9000` → `hermes gateway restart` |
+| 3 | `hermes-infoflow-tools update --mode extract` | 是，`--version` | `pipx run hermes-infoflow-tools update --version <version> --mode extract --port 9000` → `hermes gateway restart` |
+| 4 | `hermes-infoflow-tools update --mode pip`（兼容别名） | 是，`--version` | `pipx run hermes-infoflow-tools update --version <version> --mode pip --port 9000` → `hermes gateway restart` |
+| 5 | `pip install hermes-infoflow` + deploy | 是，pip 版本规格 | `python -m pip install --upgrade 'hermes-infoflow==<version>'` → `hermes-infoflow-deploy --port 9000` → `hermes gateway restart` |
+| 6 | 本地开发 `scripts/deploy.sh` | 否（当前 checkout） | `git clone https://github.com/chbo297/hermes-infoflow` → `cd hermes-infoflow` → `bash scripts/deploy.sh --port 9000` → `hermes gateway restart` |
+
+需要固定版本时，优先使用 #3 / #4 / #5。`hermes plugins install` 走 Git clone，当前 Hermes CLI 不提供 PyPI 风格的 `--version`；本地开发方式则由你 checkout 的分支 / tag / commit 决定。
 
 ### A. `hermes plugins install`（最像 OpenClaw 体验）
 
 ```bash
-hermes plugins install <github-owner>/hermes-infoflow
-hermes plugins enable infoflow
+hermes plugins install --force --enable chbo297/hermes-infoflow
+bash ~/.hermes/plugins/infoflow/scripts/normalize.sh --port 9000
 hermes gateway restart
 ```
 
-hermes 内置命令；`git clone --depth 1` 到 `~/.hermes/plugins/infoflow/`。仓库根目录已包含 `__init__.py`（代理到 `hermes_infoflow/` 子包），无需手动扁平化即可直接工作。
+hermes 内置命令；`git clone --depth 1` 到 `~/.hermes/plugins/infoflow/`。随后执行 `scripts/normalize.sh` 会把 Git 克隆布局收敛成与 B / C / D 相同的扁平化目录，并补齐 `.env` / `config.yaml`。若目录已存在，Hermes CLI 需要 `--force` 才会重装覆盖；也可以直接用 B / C / D 覆盖。当前 Hermes CLI 没有 `--branch` / `--tag` 参数；需要固定分支、tag 或 commit 时，先手动 `git clone --branch <ref>` / `git checkout <commit>`，再执行本地开发方式里的 `bash scripts/deploy.sh`。
+
+也可以用 tools 执行归一化：
+
+```bash
+hermes plugins install --force --enable chbo297/hermes-infoflow
+pipx run hermes-infoflow-tools normalize --port 9000
+hermes gateway restart
+```
 
 ### B. `hermes-infoflow-tools`（对齐 `npx ... update`）
 
 > 推荐用 `pipx run` 或 `uvx`，免去全局污染。
 
-正式版（stable）：
+正式版（stable，固定 tools 包版本 + 固定插件包版本）：
 
 <!-- sync:hermes-infoflow-version:latest -->
 ```bash
-pipx run hermes-infoflow-tools update --version 2026.5.21
-pipx run hermes-infoflow-tools update --version 2026.5.21 --port 9000
+# 二选一：extract 模式
+pipx run --spec hermes-infoflow-tools==2026.5.21 hermes-infoflow-tools update --version 2026.5.21 --mode extract --port 9000
+# 二选一：pip 兼容别名
+pipx run --spec hermes-infoflow-tools==2026.5.21 hermes-infoflow-tools update --version 2026.5.21 --mode pip --port 9000
+hermes gateway restart
 ```
 <!-- /sync:hermes-infoflow-version:latest -->
 
-Beta 版（PEP 440 prerelease；不会被默认 `pip install` 拉到）：
+Beta 版（PEP 440 prerelease；精确指定版本即可安装）：
 
 <!-- sync:hermes-infoflow-version:beta -->
 ```bash
-pipx run hermes-infoflow-tools update --version 0.2.2b1
+# 二选一：extract 模式
+pipx run --spec hermes-infoflow-tools==0.2.2b1 hermes-infoflow-tools update --version 0.2.2b1 --mode extract --port 9000
+# 二选一：pip 兼容别名
+pipx run --spec hermes-infoflow-tools==0.2.2b1 hermes-infoflow-tools update --version 0.2.2b1 --mode pip --port 9000
+hermes gateway restart
 ```
 <!-- /sync:hermes-infoflow-version:beta -->
+
+兼容旧命令的 `pip` 模式同样支持版本：
+
+```bash
+pipx run --spec hermes-infoflow-tools==<version> hermes-infoflow-tools update --version <version> --mode pip --port 9000
+```
+
+不需要固定 tools 包本身时，也可以保留短命令：
+
+```bash
+pipx run hermes-infoflow-tools update --version <version> --port 9000
+```
 
 子命令参数：
 
 - `--version <ver>`：PyPI 版本号（缺省 `latest`，会被解析为当前正式版）
 - `--index-url <url>`：PyPI 源（默认 `https://pypi.org/simple`）
-- `--mode extract`（默认）：`pip download` sdist → 解包 → rsync 到 `~/.hermes/plugins/infoflow/`；体验对齐 OpenClaw。
-- `--mode pip`：`pip install --upgrade hermes-infoflow==<ver>` 到 site-packages。**注意**：此模式 hermes 不读 `plugin.yaml`，`hermes config` 不会列 `INFOFLOW_*`。
-- `--channel-id <id>`：目标目录名（默认 `infoflow`，仅在你知道自己在做什么时改）
+- `--mode extract`（默认）：`pip download` sdist → 解包 → normalize 到 `~/.hermes/plugins/infoflow/`；体验对齐 OpenClaw。
+- `--mode pip`：兼容旧命令的别名；现在仍走 directory-style 部署到 `~/.hermes/plugins/infoflow/`，不会再安装 entry point 遮挡目录插件。
+- `--channel-id <id>`：仅接受 `infoflow`；保留参数是为了旧脚本兼容，不能改成其它名字。
 - `--port <PORT>`：Webhook 端口（1–65535），写入 `~/.hermes/.env` 的 `INFOFLOW_PORT`；未传则保留已有值，缺失时写入默认 `26521`（`extract` 与 `pip` 模式均支持）
 - `--dry-run`：仅打印命令
 
-### C. `pip install hermes-infoflow`（最 Pythonic）
+如果已经先用 `hermes plugins install` 克隆过，也可以用 tools 做归一化：
 
 ```bash
-pip install hermes-infoflow
-hermes plugins enable infoflow
-hermes gateway restart
+pipx run hermes-infoflow-tools normalize
+pipx run hermes-infoflow-tools normalize --port 9000
 ```
 
-通过 PyPI 包的 `hermes_agent.plugins` entry-point 让 hermes 自动发现。**限制**：hermes 在 entry-point 模式下不读 `plugin.yaml`，所以 `hermes config` 不会列 `INFOFLOW_*` —— 需要你手动 `export` 或 `hermes config set` 这些环境变量。
+### C. `pip install hermes-infoflow`（最 Pythonic）
+
+正式版（stable）：
+
+<!-- sync:hermes-infoflow-version:latest -->
+```bash
+python -m pip install --upgrade 'hermes-infoflow==2026.5.21'
+hermes-infoflow-deploy --port 9000
+hermes gateway restart
+```
+<!-- /sync:hermes-infoflow-version:latest -->
+
+Beta 版：
+
+<!-- sync:hermes-infoflow-version:beta -->
+```bash
+python -m pip install --upgrade 'hermes-infoflow==0.2.2b1'
+hermes-infoflow-deploy --port 9000
+hermes gateway restart
+```
+<!-- /sync:hermes-infoflow-version:beta -->
+
+不想把包持久安装到当前 Python 环境时，可以用 `pipx run --spec` 一次性执行：
+
+<!-- sync:hermes-infoflow-version:latest -->
+```bash
+pipx run --spec hermes-infoflow==2026.5.21 hermes-infoflow-deploy --port 9000
+```
+<!-- /sync:hermes-infoflow-version:latest -->
+
+<!-- sync:hermes-infoflow-version:beta -->
+```bash
+pipx run --spec hermes-infoflow==0.2.2b1 hermes-infoflow-deploy --port 9000
+```
+<!-- /sync:hermes-infoflow-version:beta -->
+
+`hermes-infoflow-deploy` 会从已安装的 wheel 中抽取 `hermes_infoflow/` 和部署脚本，写入 `~/.hermes/plugins/infoflow/`，再执行同一个归一化部署流程。仅执行 `pip install hermes-infoflow` 不会修改 Hermes 配置，也不会创建插件目录；不建议把它当成完整安装方式。
+
+如果部署时提示 Hermes runtime 中已存在同名 entry-point 且无法自动卸载，可以临时改为只告警：
+
+```bash
+HERMES_INFOFLOW_ENTRYPOINT_POLICY=warn hermes-infoflow-deploy --port 9000
+```
+
+确认你确实要保留 entry-point 时可使用 `keep`，但同名 entry-point 可能遮挡目录插件：
+
+```bash
+HERMES_INFOFLOW_ENTRYPOINT_POLICY=keep hermes-infoflow-deploy --port 9000
+```
 
 ### D. 本地开发：`bash scripts/deploy.sh`
 
@@ -90,7 +179,7 @@ bash scripts/deploy.sh --dry-run   # 仅打印操作
 bash scripts/deploy.sh --port 9000 # 指定 webhook 端口并写入 ~/.hermes/.env
 ```
 
-`deploy.sh` 会同步插件并自动选择 Python：优先 `hermes` / `pipx` 的 `hermes-agent` venv，再尝试 `python3`。若缺少 `cryptography` / `aiohttp` / `pyyaml`，默认会尝试 `pipx inject hermes-agent …` 或对当前解释器 `pip install`（可用 `HERMES_DEPLOY_AUTO_PIP=0` 关闭）。若检测到的解释器与 gateway 实际用的 pipx venv 不一致，脚本会打印 warning。
+`deploy.sh` 会同步插件并自动选择 Python：优先 `hermes` / `pipx` 的 `hermes-agent` venv，再尝试 `python3`。若缺少 `cryptography` / `aiohttp` / `pyyaml`，默认会尝试 `pipx inject hermes-agent …` 或对当前解释器 `pip install`（可用 `HERMES_DEPLOY_AUTO_PIP=0` 关闭）。若检测到的解释器与 gateway 实际用的 pipx venv 不一致，脚本会打印 warning。历史上的 hermes-agent fork 同步已改为显式 opt-in：只有设置 `HERMES_INFOFLOW_SYNC_AGENT_FORK=1` 时才会执行。
 
 部署时还会维护 `~/.hermes/.env` 中的 `INFOFLOW_PORT`：传 `--port` 则写入指定端口；未传时若 `.env` 已有 `INFOFLOW_PORT` 则保留，否则写入默认 `26521`（便于查看当前监听端口）。同时会补齐 `~/.hermes/config.yaml` 里的 `platform_toolsets.infoflow`，让 Infoflow 会话拥有与 CLI 会话一致的基础工具权限，并包含 `hermes-infoflow` 工具集。
 
