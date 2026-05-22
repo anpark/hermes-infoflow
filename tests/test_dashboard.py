@@ -497,21 +497,25 @@ def test_post_llm_call_pushes_display_hermes_when_text_diverges(
     assert hermes_events[0].payload["text"] == "Hi polished"
 
 
-def test_post_tool_call_skips_tool_line_when_progress_end_already_fired(
+def test_post_tool_call_skips_tool_line_when_progress_pipeline_active(
     tracker: SessionTracker,
 ) -> None:
-    """on_tool_progress(stage=end) already rendered the tool completion as
-    a display.tool_progress line. post_tool_call must not duplicate it via
-    display.tool_line for the same tool_call_id."""
+    """In hermes-agent the real ordering is start → post_tool_call → end.
+
+    When on_tool_progress(start) has fired for this tool_call_id, the richer
+    progress pipeline is in use and post_tool_call must NOT push the older
+    display.tool_line. Otherwise the UI shows both the in-place updating
+    progress line AND a duplicate completion line.
+    """
     hooks = make_plugin_hooks(tracker)
     hooks["on_tool_progress"](
         session_id="sess-td",
         task_id="",
         tool_name="search_files",
         tool_call_id="tc-dup",
-        stage="end",
-        text="",
-        duration_ms=500.0,
+        stage="start",
+        text="todos",
+        duration_ms=None,
         is_error=False,
     )
     hooks["post_tool_call"](
@@ -523,10 +527,92 @@ def test_post_tool_call_skips_tool_line_when_progress_end_already_fired(
         tool_call_id="tc-dup",
         duration_ms=500,
     )
+    hooks["on_tool_progress"](
+        session_id="sess-td",
+        task_id="",
+        tool_name="search_files",
+        tool_call_id="tc-dup",
+        stage="end",
+        text="",
+        duration_ms=500.0,
+        is_error=False,
+    )
     kinds = [e.kind for e in tracker.snapshot("sess-td")]
-    assert "display.tool_progress" in kinds
+    # Both start and end progress lines, but no duplicate display.tool_line.
+    assert kinds.count("display.tool_progress") == 2
     assert "display.tool_line" not in kinds
     assert "tool.end" in kinds
+
+
+def test_concurrent_tools_do_not_drop_progress_dedup(
+    tracker: SessionTracker,
+) -> None:
+    """When two tools run in parallel (start A, start B, post A, post B,
+    end A, end B), neither post_tool_call should emit display.tool_line —
+    both tool_call_ids must remain tracked across each other's lifecycles."""
+    hooks = make_plugin_hooks(tracker)
+    for tid in ("tc-A", "tc-B"):
+        hooks["on_tool_progress"](
+            session_id="sess-conc", task_id="", tool_name="search_files",
+            tool_call_id=tid, stage="start", text="x",
+            duration_ms=None, is_error=False,
+        )
+    for tid in ("tc-A", "tc-B"):
+        hooks["post_tool_call"](
+            tool_name="search_files", args={"q": tid}, result="ok",
+            task_id="", session_id="sess-conc",
+            tool_call_id=tid, duration_ms=10,
+        )
+    for tid in ("tc-A", "tc-B"):
+        hooks["on_tool_progress"](
+            session_id="sess-conc", task_id="", tool_name="search_files",
+            tool_call_id=tid, stage="end", text="",
+            duration_ms=10.0, is_error=False,
+        )
+    snap = tracker.snapshot("sess-conc")
+    kinds = [e.kind for e in snap]
+    assert "display.tool_line" not in kinds
+    assert kinds.count("display.tool_progress") == 4  # 2 starts + 2 ends
+    assert kinds.count("tool.end") == 2
+
+
+def test_session_end_clears_dedup_state(tracker: SessionTracker) -> None:
+    """on_session_end / on_session_finalize must drop the per-session
+    bookkeeping so long-lived processes don't accumulate one entry per
+    session for streams / tool progress that never reach post_llm_call.
+
+    Reaches into the hook closures via a controlled probe: after end,
+    a brand-new tool_call_id with on_tool_progress(start) then
+    post_tool_call should still suppress display.tool_line — proving the
+    started-set is functional, not leaking entries from the prior session.
+    """
+    hooks = make_plugin_hooks(tracker)
+    # Seed prior-session state via on_tool_progress(start) for sid=old.
+    hooks["on_tool_progress"](
+        session_id="old", task_id="", tool_name="t",
+        tool_call_id="tc-old", stage="start", text="",
+        duration_ms=None, is_error=False,
+    )
+    hooks["on_stream_delta"](
+        session_id="old", platform="infoflow", model="m",
+        delta_text="hi", content_type="text",
+        message_so_far="hi", stream_id="s-old", final=False,
+    )
+    # End the session.
+    hooks["on_session_end"](
+        session_id="old", platform="infoflow", model="m",
+    )
+    # Restart with the *same* sid (Hermes may rotate ids but reuse a key).
+    # post_tool_call for the unseen tool_call_id must render display.tool_line
+    # because the new session has no on_tool_progress(start) for it.
+    hooks["post_tool_call"](
+        tool_name="t", args={}, result="ok",
+        task_id="", session_id="old",
+        tool_call_id="tc-fresh", duration_ms=5,
+    )
+    kinds_after = [e.kind for e in tracker.snapshot("old")]
+    # Fresh tool_call_id is not in any stale started-set → tool_line renders.
+    assert "display.tool_line" in kinds_after
 
 
 def test_post_tool_call_still_renders_tool_line_when_no_progress_hook(

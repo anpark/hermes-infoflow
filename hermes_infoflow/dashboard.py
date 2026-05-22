@@ -441,9 +441,22 @@ def _peek_gateway_session(
 def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
     """Build hermes-agent plugin hook callbacks for the tracker."""
 
+    # Per-session bookkeeping for the streaming / tool dedup logic.
+    # All access happens from the agent's single asyncio loop, so plain
+    # dicts are fine (no lock needed for add/discard/pop atomic ops).
     _stream_state: dict[str, dict[str, Any]] = {}
     _last_streamed_text: dict[str, str] = {}
-    _tool_progress_ended: dict[str, set[str]] = {}
+    # Tools that have an active on_tool_progress(start) for this session.
+    # post_tool_call fires *between* start and end (start -> post -> end),
+    # so we record at start and check at post_tool_call: if the richer
+    # tool_progress pipeline is in use for this tool_call_id, suppress
+    # the older display.tool_line to avoid two lines per tool.
+    _tool_progress_started: dict[str, set[str]] = {}
+
+    def _drop_session_state(sid: str) -> None:
+        _stream_state.pop(sid, None)
+        _last_streamed_text.pop(sid, None)
+        _tool_progress_started.pop(sid, None)
 
     def _safe(fn: Callable[..., Any]) -> Callable[..., Any]:
         def wrapper(**kwargs: Any) -> None:
@@ -485,6 +498,7 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
             },
             platform=plat,
         )
+        _drop_session_state(sid)
 
     @_safe
     def on_session_finalize(**kw: Any) -> None:
@@ -499,6 +513,7 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
             {"finalized": True, "platform": plat},
             platform=plat,
         )
+        _drop_session_state(sid)
 
     @_safe
     def pre_llm_call(**kw: Any) -> None:
@@ -602,16 +617,15 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
         duration_ms = kw.get("duration_ms") or 0
         tool_call_id = str(kw.get("tool_call_id") or "")
 
-        # When a richer on_tool_progress(stage=end) already pushed a
-        # display.tool_progress line for this tool_call_id, do not also push
-        # display.tool_line — they render the same logical event and would
-        # appear twice in the Session Tracker terminal.
-        progress_ended = _tool_progress_ended.get(sid, set())
-        suppress_tool_line = tool_call_id in progress_ended
-        if tool_call_id and progress_ended:
-            progress_ended.discard(tool_call_id)
-            if not progress_ended:
-                _tool_progress_ended.pop(sid, None)
+        # Ordering in hermes-agent: on_tool_progress(start) → post_tool_call →
+        # on_tool_progress(end). When the richer tool_progress pipeline is in
+        # use for this tool_call_id we suppress the older display.tool_line so
+        # the UI shows a single line that updates in place (start → ✓ done),
+        # instead of a stale "preparing" line plus a separate completion line.
+        started = _tool_progress_started.get(sid)
+        suppress_tool_line = bool(
+            tool_call_id and started and tool_call_id in started
+        )
 
         line = ""
         try:
@@ -796,8 +810,13 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
         tool_name = str(kw.get("tool_name") or "tool")
         tool_call_id = str(kw.get("tool_call_id") or "")
         text = kw.get("text") or ""
-        if stage == "end" and tool_call_id:
-            _tool_progress_ended.setdefault(sid, set()).add(tool_call_id)
+        if tool_call_id:
+            if stage == "start":
+                _tool_progress_started.setdefault(sid, set()).add(tool_call_id)
+            elif stage == "end":
+                started = _tool_progress_started.get(sid)
+                if started:
+                    started.discard(tool_call_id)
         if stage == "start":
             try:
                 from agent.display import get_tool_emoji
