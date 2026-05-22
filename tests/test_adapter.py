@@ -22,6 +22,7 @@ gateway_base = pytest.importorskip("gateway.platforms.base")
 from hermes_infoflow import api as _api  # noqa: E402
 from hermes_infoflow import crypto as _crypto  # noqa: E402
 from hermes_infoflow.adapter import (  # noqa: E402
+    GATEWAY_STARTED_NOTICE,
     InfoflowAdapter,
     MessageEvent,
     MessageType,
@@ -569,6 +570,106 @@ def test_group_runtime_status_suppression_survives_admin_redirect_exception(
         and item["extra"]["redirected_to_admin"] is False
         for item in pushed
     )
+
+
+def test_connect_schedules_gateway_started_notice_after_success(
+    configured_env, monkeypatch
+) -> None:
+    monkeypatch.setenv("INFOFLOW_ADMIN_USER", "admin01")
+    adapter = InfoflowAdapter(_make_config())
+    adapter._port = 0
+    adapter._webhook_server.start = AsyncMock()
+    adapter._webhook_server.stop = AsyncMock()
+
+    async def _go():
+        blocker = asyncio.Future()
+
+        async def fake_notify(*, session=None):
+            await blocker
+
+        adapter._notify_admin_gateway_started = AsyncMock(side_effect=fake_notify)
+        try:
+            result = await adapter.connect()
+            assert result is True
+            adapter._notify_admin_gateway_started.assert_called_once()
+            assert len(adapter._background_tasks) == 1
+            task = next(iter(adapter._background_tasks))
+            assert not task.done()
+            blocker.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            return result
+        finally:
+            await adapter.disconnect()
+
+    result = asyncio.run(_go())
+
+    assert result is True
+
+
+def test_gateway_started_notice_sent_to_admin_dm(
+    configured_env, monkeypatch
+) -> None:
+    monkeypatch.setenv("INFOFLOW_ADMIN_USER", "admin01")
+    adapter = InfoflowAdapter(_make_config())
+    adapter._bot.send_message = AsyncMock(
+        return_value=SentResult(success=True, message_id="DM-1")
+    )
+    adapter._push_infoflow_event = MagicMock()
+
+    async def _go():
+        await adapter._notify_admin_gateway_started()
+
+    asyncio.run(_go())
+
+    adapter._bot.send_message.assert_awaited_once()
+    kwargs = adapter._bot.send_message.await_args.kwargs
+    assert kwargs["dm_user_id"] == "admin01"
+    assert kwargs["text"] == GATEWAY_STARTED_NOTICE
+    assert kwargs["text"] == "gateway started"
+
+    pushed = [call.kwargs for call in adapter._push_infoflow_event.call_args_list]
+    assert any(
+        item["chat_id"] == "admin01"
+        and item["extra"]["gateway_startup_notice"] is True
+        and item["extra"]["attempted"] is True
+        and item["extra"]["preview"] == GATEWAY_STARTED_NOTICE
+        for item in pushed
+    )
+
+
+def test_gateway_started_notice_ignores_dashboard_errors(
+    configured_env, monkeypatch
+) -> None:
+    monkeypatch.setenv("INFOFLOW_ADMIN_USER", "admin01")
+    adapter = InfoflowAdapter(_make_config())
+    adapter._bot.send_message = AsyncMock(
+        return_value=SentResult(success=True, message_id="DM-1")
+    )
+    adapter._push_infoflow_event = MagicMock(side_effect=RuntimeError("tracker boom"))
+
+    async def _go():
+        await adapter._notify_admin_gateway_started()
+
+    asyncio.run(_go())
+
+    adapter._bot.send_message.assert_awaited_once()
+
+
+def test_gateway_started_notice_send_errors_are_swallowed(
+    configured_env, monkeypatch
+) -> None:
+    monkeypatch.setenv("INFOFLOW_ADMIN_USER", "admin01")
+    adapter = InfoflowAdapter(_make_config())
+    adapter._bot.send_message = AsyncMock(side_effect=RuntimeError("send boom"))
+    adapter._push_infoflow_event = MagicMock()
+
+    async def _go():
+        await adapter._notify_admin_gateway_started()
+
+    asyncio.run(_go())
+
+    adapter._bot.send_message.assert_awaited_once()
+    adapter._push_infoflow_event.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

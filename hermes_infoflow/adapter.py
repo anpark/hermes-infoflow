@@ -40,6 +40,7 @@ _GROUP_STATUS_REDIRECT_PREFIXES = (
     "⚡ Interrupting current task",
     "💾 Self-improvement review:",
 )
+GATEWAY_STARTED_NOTICE = "gateway started"
 
 
 def _looks_like_progress_line(text: str) -> bool:
@@ -418,6 +419,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             "[infoflow] Webhook listening on %s:%d%s",
             self._host, self._port, self._webhook_path,
         )
+        self._schedule_admin_gateway_started_notice()
         return True
 
     async def disconnect(self) -> None:
@@ -434,6 +436,92 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 await self._http_session.close()
             self._http_session = None
             self._serverapi.http_session = None
+
+    def _schedule_admin_gateway_started_notice(self) -> None:
+        """Best-effort startup notice; never block or fail ``connect()``."""
+        if not self._admin_uid:
+            return
+
+        try:
+            task = asyncio.create_task(
+                self._notify_admin_gateway_started(
+                    session=self._effective_session(self._http_session),
+                )
+            )
+        except Exception as exc:
+            with contextlib.suppress(Exception):
+                gw_log().warning(
+                    "[infoflow] failed to schedule gateway startup notice "
+                    "admin=%s error=%s",
+                    self._admin_uid,
+                    exc,
+                    exc_info=True,
+                )
+            return
+
+        with contextlib.suppress(Exception):
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+        with contextlib.suppress(Exception):
+            task.add_done_callback(self._consume_gateway_started_notice_task)
+
+    @staticmethod
+    def _consume_gateway_started_notice_task(task: asyncio.Task[Any]) -> None:
+        """Consume task errors so fire-and-forget startup notices stay isolated."""
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            return
+        if exc is None:
+            return
+        with contextlib.suppress(Exception):
+            gw_log().warning(
+                "[infoflow] gateway startup notice task failed: %s",
+                exc,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+
+    async def _notify_admin_gateway_started(
+        self,
+        *,
+        session: aiohttp.ClientSession | None = None,
+    ) -> None:
+        """Send a startup notice to the configured admin DM."""
+        if not self._admin_uid:
+            return
+
+        try:
+            await self._bot.send_message(
+                dm_user_id=self._admin_uid,
+                text=GATEWAY_STARTED_NOTICE,
+                session=session,
+            )
+        except Exception as exc:
+            with contextlib.suppress(Exception):
+                gw_log().warning(
+                    "[infoflow] failed to send gateway startup notice "
+                    "admin=%s error=%s",
+                    self._admin_uid,
+                    exc,
+                    exc_info=True,
+                )
+            return
+
+        with contextlib.suppress(Exception):
+            self._push_infoflow_event(
+                None,
+                kind="outbound.infoflow",
+                chat_id=self._admin_uid,
+                extra={
+                    "type": "text",
+                    "chars": len(GATEWAY_STARTED_NOTICE),
+                    "preview": GATEWAY_STARTED_NOTICE,
+                    "gateway_startup_notice": True,
+                    "attempted": True,
+                },
+            )
 
     # ------------------------------------------------------------------
     # Inbound message callback (from webhook server)
