@@ -11,6 +11,7 @@ import asyncio
 import json
 import os
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import urlencode
 
 import pytest
@@ -20,6 +21,7 @@ gateway_base = pytest.importorskip("gateway.platforms.base")  # noqa: F401  (pre
 from hermes_infoflow import api as _api  # noqa: E402
 from hermes_infoflow import crypto as _crypto  # noqa: E402
 from hermes_infoflow.adapter import InfoflowAdapter  # noqa: E402
+from hermes_infoflow.itypes import SentResult  # noqa: E402
 from hermes_infoflow.sent_store import SentMessageStore  # noqa: E402
 from tests._aes_helpers import aes_ecb_encrypt_b64url, aes_key_b64url  # noqa: E402
 
@@ -363,6 +365,85 @@ def test_send_records_bot_reply_for_follow_up(configured_env, monkeypatch) -> No
     assert result.success is True
     # The policy's follow-up bookkeeping is updated.
     assert "42" in adapter._policy.last_reply_at
+
+
+def test_group_runtime_status_is_suppressed_and_redirected_to_admin(
+    configured_env, monkeypatch
+) -> None:
+    monkeypatch.setenv("INFOFLOW_ADMIN_USER", "admin01")
+    adapter = InfoflowAdapter(_make_config())
+    adapter._bot.send_message = AsyncMock(
+        return_value=SentResult(success=True, message_id="DM-1")
+    )
+    adapter._push_infoflow_event = MagicMock()
+
+    async def fake_send_group(*args, **kwargs):
+        raise AssertionError("group send must not be called for runtime status")
+
+    monkeypatch.setattr(_api, "send_group_message", fake_send_group)
+
+    content = "⚡ Interrupting current task. I'll respond to your message shortly."
+
+    async def _go():
+        return await adapter.send("group:42", content)
+
+    result = asyncio.run(_go())
+
+    assert result.success is True
+    adapter._bot.send_message.assert_awaited_once()
+    admin_kwargs = adapter._bot.send_message.await_args.kwargs
+    assert admin_kwargs["dm_user_id"] == "admin01"
+    assert "group:42" in admin_kwargs["text"]
+    assert content in admin_kwargs["text"]
+
+    pushed = [call.kwargs for call in adapter._push_infoflow_event.call_args_list]
+    assert any(
+        item["chat_id"] == "admin01"
+        and item["extra"]["admin_status_redirect"] is True
+        and item["extra"]["success"] is True
+        for item in pushed
+    )
+    assert any(
+        item["chat_id"] == "group:42"
+        and item["extra"]["suppressed_group_status"] is True
+        and item["extra"]["redirected_to_admin"] is True
+        for item in pushed
+    )
+
+
+def test_group_runtime_status_suppression_survives_admin_redirect_exception(
+    configured_env, monkeypatch
+) -> None:
+    monkeypatch.setenv("INFOFLOW_ADMIN_USER", "admin01")
+    adapter = InfoflowAdapter(_make_config())
+    adapter._bot.send_message = AsyncMock(side_effect=RuntimeError("boom"))
+    adapter._push_infoflow_event = MagicMock()
+
+    async def fake_send_group(*args, **kwargs):
+        raise AssertionError("group send must not be called for runtime status")
+
+    monkeypatch.setattr(_api, "send_group_message", fake_send_group)
+
+    async def _go():
+        return await adapter.send("group:42", "💾 Self-improvement review: Memory updated")
+
+    result = asyncio.run(_go())
+
+    assert result.success is True
+    pushed = [call.kwargs for call in adapter._push_infoflow_event.call_args_list]
+    assert any(
+        item["chat_id"] == "admin01"
+        and item["extra"]["admin_status_redirect"] is True
+        and item["extra"]["success"] is False
+        and "boom" in item["extra"]["error"]
+        for item in pushed
+    )
+    assert any(
+        item["chat_id"] == "group:42"
+        and item["extra"]["suppressed_group_status"] is True
+        and item["extra"]["redirected_to_admin"] is False
+        for item in pushed
+    )
 
 
 # ---------------------------------------------------------------------------

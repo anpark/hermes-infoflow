@@ -36,6 +36,10 @@ import socket as _socket
 from typing import Any
 
 _PROGRESS_LINE_RE = re.compile(r"^[┊\s]*[🔍⚙️💻🌐📁📝🧠✨]")
+_GROUP_STATUS_REDIRECT_PREFIXES = (
+    "⚡ Interrupting current task",
+    "💾 Self-improvement review:",
+)
 
 
 def _looks_like_progress_line(text: str) -> bool:
@@ -43,6 +47,28 @@ def _looks_like_progress_line(text: str) -> bool:
     if not t or len(t) > 400:
         return False
     return bool(_PROGRESS_LINE_RE.match(t)) or "┊" in t[:20]
+
+
+def _group_status_redirect_kind(text: str) -> str:
+    t = (text or "").lstrip()
+    for prefix in _GROUP_STATUS_REDIRECT_PREFIXES:
+        if t.startswith(prefix):
+            return prefix
+    return ""
+
+
+def _format_group_status_admin_notice(
+    *,
+    group_id: str,
+    content: str,
+    status_kind: str,
+) -> str:
+    return (
+        "Infoflow 群聊状态消息已拦截\n"
+        f"群：group:{group_id}\n"
+        f"类型：{status_kind}\n\n"
+        f"{content}"
+    )
 
 import aiohttp
 
@@ -838,6 +864,41 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         session = self._effective_session(self._http_session)
         kind, group_id, dm_user = self._parse_target(chat_id)
 
+        status_kind = (
+            _group_status_redirect_kind(content)
+            if kind == "group" and group_id is not None
+            else ""
+        )
+        if status_kind:
+            redirected = await self._redirect_group_status_to_admin(
+                group_id=str(group_id),
+                content=content,
+                status_kind=status_kind,
+                session=session,
+            )
+            gw_log().info(
+                "[iflow:send] suppressed group status target=%s kind=%s redirected_admin=%s",
+                chat_id,
+                status_kind,
+                redirected,
+            )
+            self._push_infoflow_event(
+                None,
+                kind="outbound.infoflow",
+                chat_id=chat_id,
+                extra={
+                    "type": "text",
+                    "chars": len(content or ""),
+                    "success": True,
+                    "message_id": "",
+                    "error": "",
+                    "suppressed_group_status": True,
+                    "redirected_to_admin": redirected,
+                    "preview": (content or "")[:200],
+                },
+            )
+            return SendResult(success=True)
+
         # Build reply_info from inbound context
         reply_info: ReplyInfo | None = None
         if reply_to:
@@ -867,6 +928,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             reply_info=reply_info,
             options=options,
             session=session,
+            reaction_message_id=reply_to,
         )
 
         # Trace outbound with inbound mid (if available via contextvar)
@@ -902,6 +964,80 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             error=bot_result.error,
             retryable=False,
         )
+
+    async def _redirect_group_status_to_admin(
+        self,
+        *,
+        group_id: str,
+        content: str,
+        status_kind: str,
+        session: aiohttp.ClientSession | None = None,
+    ) -> bool:
+        """Forward suppressed Hermes runtime status from a group to admin DM."""
+        if not self._admin_uid:
+            return False
+
+        notice = _format_group_status_admin_notice(
+            group_id=group_id,
+            content=content,
+            status_kind=status_kind,
+        )
+
+        # This is an out-of-band admin notice, not the final answer for the
+        # current group turn. Preserve the group's processing emoji until the
+        # actual queued/final response path clears it.
+        from .bot import _reaction_promise_cv
+
+        result_success = False
+        result_message_id = ""
+        result_error = ""
+        redirect_error_logged = False
+        token = _reaction_promise_cv.set(None)
+        try:
+            try:
+                result = await self._bot.send_message(
+                    dm_user_id=self._admin_uid,
+                    text=notice,
+                    session=session,
+                )
+                result_success = result.success
+                result_message_id = result.message_id
+                result_error = result.error
+            except Exception as exc:
+                result_error = str(exc)
+                gw_log().warning(
+                    "[iflow:send] failed to redirect group status to admin=%s group=%s error=%s",
+                    self._admin_uid,
+                    group_id,
+                    result_error,
+                    exc_info=True,
+                )
+                redirect_error_logged = True
+        finally:
+            _reaction_promise_cv.reset(token)
+        self._push_infoflow_event(
+            None,
+            kind="outbound.infoflow",
+            chat_id=self._admin_uid,
+            extra={
+                "type": "text",
+                "chars": len(notice),
+                "success": result_success,
+                "message_id": result_message_id,
+                "error": result_error,
+                "preview": notice[:200],
+                "admin_status_redirect": True,
+                "source_group_id": group_id,
+            },
+        )
+        if result_error and not result_success and not redirect_error_logged:
+            gw_log().warning(
+                "[iflow:send] failed to redirect group status to admin=%s group=%s error=%s",
+                self._admin_uid,
+                group_id,
+                result_error,
+            )
+        return result_success
 
     async def send_typing(self, chat_id: str, metadata: dict[str, Any] | None = None) -> None:
         return None
@@ -944,6 +1080,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             caption=caption,
             reply_info=reply_info,
             session=session,
+            reaction_message_id=reply_to,
         )
 
         # Trace outbound with inbound mid

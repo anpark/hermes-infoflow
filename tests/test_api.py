@@ -347,6 +347,23 @@ def test_build_emoji_reaction_body_omits_empty_msgid2() -> None:
     assert parsed["chatType"] == 7
 
 
+def test_parse_recall_response_accepts_emoji_bizcode_success() -> None:
+    res = api._parse_recall_response(
+        '{"code":"ok","data":{"bizCode":200,"bizMsg":"ok","bizData":null}}',
+        kind="emoji_del",
+    )
+    assert res == {"ok": True}
+
+
+def test_parse_recall_response_rejects_emoji_bizcode_failure() -> None:
+    res = api._parse_recall_response(
+        '{"code":"ok","data":{"bizCode":500,"bizMsg":"not found","bizData":null}}',
+        kind="emoji_del",
+    )
+    assert res["ok"] is False
+    assert "not found" in res["error"]
+
+
 def test_build_private_payload_image_uses_native_msgtype() -> None:
     payload = api._build_private_payload("alice", [api.ContentItem("image", "BASE64...")])
     assert payload == {

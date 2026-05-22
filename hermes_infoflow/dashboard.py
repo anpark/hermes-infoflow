@@ -746,7 +746,11 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
             chat_id=chat_id,
         )
         if text:
-            display_text = _sessiontracker_user_display_text(text)
+            display_text = (
+                _sessiontracker_user_display_text(text)
+                if plat == "infoflow"
+                else text
+            )
             tracker.push_event(
                 target_sid,
                 "display.user",
