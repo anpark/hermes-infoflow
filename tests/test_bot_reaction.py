@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from hermes_infoflow.bot import Bot
+from hermes_infoflow.bot import Bot, _reaction_promise_cv
 from hermes_infoflow.itypes import IncomingMessage, RecallResult
 from hermes_infoflow.policy import Action, GroupPolicy, PolicyDecision
 
@@ -54,6 +54,21 @@ def _bot() -> Bot:
         dedup_set=set(),
         message_store=MagicMock(),
     )
+
+
+async def _settle_reaction_tasks(bot: Bot) -> None:
+    while bot._reactions._tasks:
+        tasks = list(bot._reactions._tasks)
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.sleep(0)
+
+
+async def _spin_until(predicate, *, rounds: int = 20) -> None:
+    for _ in range(rounds):
+        if predicate():
+            return
+        await asyncio.sleep(0)
+    assert predicate()
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +211,7 @@ async def test_dispatch_adds_reaction_and_deletes_on_no_reply_send() -> None:
     adapter.handle_message = AsyncMock(side_effect=_handle_message)
 
     await bot.dispatch_inbound(msg, decision, adapter)
+    await _settle_reaction_tasks(bot)
 
     bot._serverapi.add_message_reaction.assert_awaited_once()
     bot._serverapi.delete_message_reaction.assert_awaited_once()
@@ -203,7 +219,7 @@ async def test_dispatch_adds_reaction_and_deletes_on_no_reply_send() -> None:
 
 
 @pytest.mark.asyncio
-async def test_dispatch_does_not_delete_when_handle_message_returns_before_send() -> None:
+async def test_dispatch_finishes_reaction_when_handle_message_returns_without_send() -> None:
     bot = _bot()
     msg = _group_msg()
     decision = PolicyDecision(
@@ -217,14 +233,16 @@ async def test_dispatch_does_not_delete_when_handle_message_returns_before_send(
     bot._schedule_reaction_fallback_cleanup = MagicMock()
 
     await bot.dispatch_inbound(msg, decision, adapter)
+    await _settle_reaction_tasks(bot)
 
     bot._serverapi.add_message_reaction.assert_awaited_once()
-    bot._serverapi.delete_message_reaction.assert_not_awaited()
-    bot._schedule_reaction_fallback_cleanup.assert_called_once()
+    bot._serverapi.delete_message_reaction.assert_awaited_once()
+    bot._schedule_reaction_fallback_cleanup.assert_not_called()
+    assert bot._reactions.active_state("group:4507088") is None
 
 
 @pytest.mark.asyncio
-async def test_background_send_inherits_reaction_and_deletes_later() -> None:
+async def test_background_send_after_dispatch_does_not_keep_reaction_open() -> None:
     bot = _bot()
     msg = _group_msg()
     decision = PolicyDecision(
@@ -249,13 +267,16 @@ async def test_background_send_inherits_reaction_and_deletes_later() -> None:
     bot._schedule_reaction_fallback_cleanup = MagicMock()
 
     await bot.dispatch_inbound(msg, decision, adapter)
-    bot._serverapi.delete_message_reaction.assert_not_awaited()
+    await _settle_reaction_tasks(bot)
+    bot._serverapi.delete_message_reaction.assert_awaited_once()
+    bot._schedule_reaction_fallback_cleanup.assert_not_called()
 
     release.set()
     assert background_task is not None
     await background_task
+    await _settle_reaction_tasks(bot)
 
-    bot._serverapi.delete_message_reaction.assert_awaited_once()
+    assert bot._serverapi.delete_message_reaction.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -275,13 +296,14 @@ async def test_dispatch_add_fail_skips_delete() -> None:
     adapter.handle_message = AsyncMock()
 
     await bot.dispatch_inbound(msg, decision, adapter)
+    await _settle_reaction_tasks(bot)
 
     bot._serverapi.add_message_reaction.assert_awaited_once()
     bot._serverapi.delete_message_reaction.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_dispatch_handle_error_schedules_fallback_cleanup() -> None:
+async def test_dispatch_handle_error_deletes_reaction_immediately() -> None:
     bot = _bot()
     msg = _group_msg()
     decision = PolicyDecision(
@@ -296,9 +318,458 @@ async def test_dispatch_handle_error_schedules_fallback_cleanup() -> None:
 
     with patch("hermes_infoflow.bot.gw_log"):
         await bot.dispatch_inbound(msg, decision, adapter)
+    await _settle_reaction_tasks(bot)
+
+    bot._serverapi.delete_message_reaction.assert_awaited_once()
+    bot._schedule_reaction_fallback_cleanup.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_group_reaction_replaced_when_new_message_gets_indicator() -> None:
+    bot = _bot()
+    calls: list[tuple[str, str]] = []
+
+    async def _add(**kwargs):
+        calls.append(("add", kwargs["base_msg_id"]))
+        return RecallResult(success=True)
+
+    async def _delete(**kwargs):
+        calls.append(("del", kwargs["base_msg_id"]))
+        return RecallResult(success=True)
+
+    bot._serverapi.add_message_reaction = AsyncMock(side_effect=_add)
+    bot._serverapi.delete_message_reaction = AsyncMock(side_effect=_delete)
+
+    def _handle(mid: str) -> dict[str, str]:
+        return {
+            "chat_type": "group",
+            "group_id": "4507088",
+            "base_msg_id": mid,
+            "msgid2": "300014580",
+            "from_uid": "bob",
+            "emoji_code": "d135",
+            "emoji_desc": "(qjp)",
+        }
+
+    await bot._start_reaction_run(_handle("M1"))
+    await _settle_reaction_tasks(bot)
+    await bot._start_reaction_run(_handle("M2"))
+    await _settle_reaction_tasks(bot)
+
+    assert calls == [("add", "M1"), ("del", "M1"), ("add", "M2")]
+    state = bot._reactions.active_state("group:4507088")
+    assert state is not None
+    assert state.handle is not None
+    assert state.handle["base_msg_id"] == "M2"
+
+
+@pytest.mark.asyncio
+async def test_group_reaction_replaced_locally_when_previous_delete_fails() -> None:
+    bot = _bot()
+    bot._serverapi.delete_message_reaction = AsyncMock(
+        return_value=RecallResult(success=False, error="api failed")
+    )
+
+    def _handle(mid: str) -> dict[str, str]:
+        return {
+            "chat_type": "group",
+            "group_id": "4507088",
+            "base_msg_id": mid,
+            "msgid2": "300014580",
+            "from_uid": "bob",
+            "emoji_code": "d135",
+            "emoji_desc": "(qjp)",
+        }
+
+    await bot._start_reaction_run(_handle("M1"))
+    await _settle_reaction_tasks(bot)
+    await bot._start_reaction_run(_handle("M2"))
+    await _settle_reaction_tasks(bot)
+
+    assert bot._serverapi.add_message_reaction.await_count == 2
+    assert bot._serverapi.delete_message_reaction.await_count == 1
+    state = bot._reactions.active_state("group:4507088")
+    assert state is not None
+    assert state.handle is not None
+    assert state.handle["base_msg_id"] == "M2"
+
+
+@pytest.mark.asyncio
+async def test_group_reaction_stale_add_cannot_overwrite_newer_indicator() -> None:
+    bot = _bot()
+    calls: list[tuple[str, str]] = []
+    m1_add_started = asyncio.Event()
+    release_m1_add = asyncio.Event()
+
+    def _handle(mid: str) -> dict[str, str]:
+        return {
+            "chat_type": "group",
+            "group_id": "4507088",
+            "base_msg_id": mid,
+            "msgid2": "300014580",
+            "from_uid": "bob",
+            "emoji_code": "d135",
+            "emoji_desc": "(qjp)",
+        }
+
+    async def _add(**kwargs):
+        mid = kwargs["base_msg_id"]
+        calls.append(("add", mid))
+        if mid == "M1":
+            m1_add_started.set()
+            await release_m1_add.wait()
+        return RecallResult(success=True)
+
+    async def _delete(**kwargs):
+        calls.append(("del", kwargs["base_msg_id"]))
+        return RecallResult(success=True)
+
+    bot._serverapi.add_message_reaction = AsyncMock(side_effect=_add)
+    bot._serverapi.delete_message_reaction = AsyncMock(side_effect=_delete)
+
+    m1_task = asyncio.create_task(bot._start_reaction_run(_handle("M1")))
+    await m1_add_started.wait()
+
+    m2_token = await bot._start_reaction_run(_handle("M2"))
+    assert m2_token is not None
+    await _spin_until(
+        lambda: (
+            bot._reactions.active_state("group:4507088") is not None
+            and bot._reactions.active_state("group:4507088").handle is not None
+        ),
+    )
+    state = bot._reactions.active_state("group:4507088")
+    assert state is not None
+    assert state.handle is not None
+    assert state.handle["base_msg_id"] == "M2"
+
+    release_m1_add.set()
+    m1_token = await m1_task
+    await _settle_reaction_tasks(bot)
+
+    assert m1_token is not None
+    assert m1_token.stale is True
+    assert bot._reactions.active_state("group:4507088") is state
+    assert calls == [("add", "M1"), ("add", "M2"), ("del", "M1")]
+
+
+@pytest.mark.asyncio
+async def test_stale_add_owner_finish_does_not_clear_newer_indicator() -> None:
+    bot = _bot()
+    calls: list[tuple[str, str]] = []
+    m1_add_started = asyncio.Event()
+    release_m1_add = asyncio.Event()
+
+    def _handle(mid: str) -> dict[str, str]:
+        return {
+            "chat_type": "group",
+            "group_id": "4507088",
+            "base_msg_id": mid,
+            "msgid2": "300014580",
+            "from_uid": "bob",
+            "emoji_code": "d135",
+            "emoji_desc": "(qjp)",
+        }
+
+    async def _add(**kwargs):
+        mid = kwargs["base_msg_id"]
+        calls.append(("add", mid))
+        if mid == "M1":
+            m1_add_started.set()
+            await release_m1_add.wait()
+        return RecallResult(success=True)
+
+    async def _delete(**kwargs):
+        calls.append(("del", kwargs["base_msg_id"]))
+        return RecallResult(success=True)
+
+    bot._serverapi.add_message_reaction = AsyncMock(side_effect=_add)
+    bot._serverapi.delete_message_reaction = AsyncMock(side_effect=_delete)
+
+    m1_task = asyncio.create_task(bot._start_reaction_run(_handle("M1")))
+    await m1_add_started.wait()
+    m2_token = await bot._start_reaction_run(_handle("M2"))
+    await _spin_until(
+        lambda: (
+            bot._reactions.active_state("group:4507088") is not None
+            and bot._reactions.active_state("group:4507088").token is m2_token
+        ),
+    )
+    release_m1_add.set()
+    m1_token = await m1_task
+    await _settle_reaction_tasks(bot)
+
+    assert m1_token is not None
+    assert m1_token.stale is True
+    assert m2_token is not None
+
+    token = _reaction_promise_cv.set(m1_token)
+    try:
+        await bot.send_message(group_id="4507088", text="NO_REPLY")
+    finally:
+        _reaction_promise_cv.reset(token)
+    await _settle_reaction_tasks(bot)
+
+    state = bot._reactions.active_state("group:4507088")
+    assert state is not None
+    assert state.token is m2_token
+    assert calls == [("add", "M1"), ("add", "M2"), ("del", "M1")]
+
+
+@pytest.mark.asyncio
+async def test_replacing_group_reaction_does_not_wait_for_previous_delete() -> None:
+    bot = _bot()
+    delete_started = asyncio.Event()
+    release_delete = asyncio.Event()
+
+    async def _delete(**kwargs):
+        delete_started.set()
+        await release_delete.wait()
+        return RecallResult(success=True)
+
+    bot._serverapi.delete_message_reaction = AsyncMock(side_effect=_delete)
+
+    def _handle(mid: str) -> dict[str, str]:
+        return {
+            "chat_type": "group",
+            "group_id": "4507088",
+            "base_msg_id": mid,
+            "msgid2": "300014580",
+            "from_uid": "bob",
+            "emoji_code": "d135",
+            "emoji_desc": "(qjp)",
+        }
+
+    await bot._start_reaction_run(_handle("M1"))
+    await _settle_reaction_tasks(bot)
+
+    token = await asyncio.wait_for(
+        bot._start_reaction_run(_handle("M2")),
+        timeout=0.5,
+    )
+    assert token is not None
+
+    await _spin_until(delete_started.is_set)
+    state = bot._reactions.active_state("group:4507088")
+    assert state is not None
+    assert state.anchor_message_id == "M2"
+
+    release_delete.set()
+    await _settle_reaction_tasks(bot)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_dispatch_during_pending_add_cleans_when_add_succeeds() -> None:
+    bot = _bot()
+    add_started = asyncio.Event()
+    release_add = asyncio.Event()
+    handle_started = asyncio.Event()
+
+    async def _add(**kwargs):
+        add_started.set()
+        await release_add.wait()
+        return RecallResult(success=True)
+
+    async def _handle(_event):
+        handle_started.set()
+        await asyncio.Event().wait()
+
+    bot._serverapi.add_message_reaction = AsyncMock(side_effect=_add)
+    decision = PolicyDecision(
+        should_dispatch=True,
+        action=Action.DISPATCH,
+        trigger_reason="bot-mentioned",
+    )
+    adapter = MagicMock()
+    adapter.build_message_event = AsyncMock(return_value={"event": True})
+    adapter.handle_message = AsyncMock(side_effect=_handle)
+
+    task = asyncio.create_task(bot.dispatch_inbound(_group_msg(), decision, adapter))
+    await add_started.wait()
+    await handle_started.wait()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    release_add.set()
+    await _settle_reaction_tasks(bot)
+
+    bot._serverapi.delete_message_reaction.assert_awaited_once()
+    assert bot._reactions.active_state("group:4507088") is None
+
+
+@pytest.mark.asyncio
+async def test_group_send_clears_active_reaction_by_anchor_without_contextvar() -> None:
+    bot = _bot()
+    handle = {
+        "chat_type": "group",
+        "group_id": "4507088",
+        "base_msg_id": "M2",
+        "msgid2": "300014580",
+        "from_uid": "bob",
+        "emoji_code": "d135",
+        "emoji_desc": "(qjp)",
+    }
+    token = await bot._start_reaction_run(handle)
+    assert token is not None
+
+    await bot.send_message(
+        group_id="4507088",
+        text="NO_REPLY",
+        reaction_message_id="M2",
+    )
+    await _settle_reaction_tasks(bot)
+
+    assert bot._serverapi.delete_message_reaction.await_count == 1
+    assert token.finished is True
+    assert bot._reactions.active_state("group:4507088") is None
+
+
+@pytest.mark.asyncio
+async def test_anchor_finish_requires_matching_target_scope() -> None:
+    bot = _bot()
+    handle = {
+        "chat_type": "group",
+        "group_id": "4507088",
+        "base_msg_id": "M2",
+        "msgid2": "300014580",
+        "from_uid": "bob",
+        "emoji_code": "d135",
+        "emoji_desc": "(qjp)",
+    }
+    token = await bot._start_reaction_run(handle)
+    assert token is not None
+    await _settle_reaction_tasks(bot)
+    bot._serverapi.delete_message_reaction.reset_mock()
+
+    await bot.send_message(
+        group_id="9999",
+        text="NO_REPLY",
+        reaction_message_id="M2",
+    )
+    await _settle_reaction_tasks(bot)
 
     bot._serverapi.delete_message_reaction.assert_not_awaited()
-    bot._schedule_reaction_fallback_cleanup.assert_called_once()
+    assert bot._reactions.active_state("group:4507088") is not None
+    assert token.finished is False
+
+
+@pytest.mark.asyncio
+async def test_anchor_finish_with_expected_scope_handles_duplicate_anchor_ids() -> None:
+    bot = _bot()
+    handle_a = {
+        "chat_type": "group",
+        "group_id": "4507088",
+        "base_msg_id": "M2",
+        "msgid2": "300014580",
+        "from_uid": "bob",
+        "emoji_code": "d135",
+        "emoji_desc": "(qjp)",
+    }
+    handle_b = {
+        **handle_a,
+        "group_id": "9999",
+        "msgid2": "300014581",
+    }
+
+    token_a = await bot._start_reaction_run(handle_a)
+    token_b = await bot._start_reaction_run(handle_b)
+    assert token_a is not None
+    assert token_b is not None
+    await _settle_reaction_tasks(bot)
+    bot._serverapi.delete_message_reaction.reset_mock()
+
+    await bot.send_message(
+        group_id="4507088",
+        text="NO_REPLY",
+        reaction_message_id="M2",
+    )
+    await _settle_reaction_tasks(bot)
+
+    bot._serverapi.delete_message_reaction.assert_awaited_once()
+    assert (
+        bot._serverapi.delete_message_reaction.await_args.kwargs["group_id"]
+        == "4507088"
+    )
+    assert token_a.finished is True
+    assert token_b.finished is False
+    assert bot._reactions.active_state("group:4507088") is None
+    assert bot._reactions.active_state("group:9999") is not None
+
+    await bot.send_message(
+        group_id="9999",
+        text="NO_REPLY",
+        reaction_message_id="M2",
+    )
+    await _settle_reaction_tasks(bot)
+
+    assert bot._serverapi.delete_message_reaction.await_count == 2
+    assert token_b.finished is True
+    assert bot._reactions.active_state("group:9999") is None
+
+
+@pytest.mark.asyncio
+async def test_group_send_without_owner_does_not_clear_active_reaction() -> None:
+    bot = _bot()
+    handle = {
+        "chat_type": "group",
+        "group_id": "4507088",
+        "base_msg_id": "M2",
+        "msgid2": "300014580",
+        "from_uid": "bob",
+        "emoji_code": "d135",
+        "emoji_desc": "(qjp)",
+    }
+    token = await bot._start_reaction_run(handle)
+    assert token is not None
+    bot._serverapi.delete_message_reaction.reset_mock()
+
+    await bot.send_message(group_id="4507088", text="NO_REPLY")
+    await _settle_reaction_tasks(bot)
+
+    bot._serverapi.delete_message_reaction.assert_not_awaited()
+    assert bot._reactions.active_state("group:4507088") is not None
+    assert token.finished is False
+
+
+@pytest.mark.asyncio
+async def test_superseded_group_context_does_not_clear_newer_active_reaction() -> None:
+    bot = _bot()
+    old_handle = {
+        "chat_type": "group",
+        "group_id": "4507088",
+        "base_msg_id": "M1",
+        "msgid2": "300014580",
+        "from_uid": "bob",
+        "emoji_code": "d135",
+        "emoji_desc": "(qjp)",
+    }
+    new_handle = {
+        **old_handle,
+        "base_msg_id": "M2",
+    }
+    old_token = await bot._start_reaction_run(old_handle)
+    new_token = await bot._start_reaction_run(new_handle)
+    assert old_token is not None
+    assert new_token is not None
+    bot._serverapi.delete_message_reaction.reset_mock()
+
+    token = _reaction_promise_cv.set(old_token)
+    try:
+        await bot.send_message(group_id="4507088", text="NO_REPLY")
+    finally:
+        _reaction_promise_cv.reset(token)
+    await _settle_reaction_tasks(bot)
+
+    assert bot._serverapi.delete_message_reaction.await_count == 1
+    assert (
+        bot._serverapi.delete_message_reaction.await_args.kwargs["base_msg_id"]
+        == "M1"
+    )
+    assert bot._reactions.active_state("group:4507088") is not None
+    assert bot._reactions.active_state("group:4507088").token is new_token
+    assert new_token.finished is False
 
 
 # ---------------------------------------------------------------------------
@@ -372,14 +843,15 @@ async def test_dispatch_dm_adds_reaction_and_deletes_on_reply() -> None:
     adapter = MagicMock()
     adapter.build_message_event = AsyncMock(return_value={"event": True})
 
-    # Use NO_REPLY sentinel so the test exits the send path via
-    # _delete_current_reaction_promise without needing the gateway truncate util.
+    # Use NO_REPLY sentinel so the test exits the send path without needing the
+    # gateway truncate util.
     async def _handle_message(_event):
         await bot.send_message(dm_user_id="chengbo05", text="NO_REPLY")
 
     adapter.handle_message = AsyncMock(side_effect=_handle_message)
 
     await bot.dispatch_inbound(msg, decision, adapter)
+    await _settle_reaction_tasks(bot)
 
     bot._serverapi.add_message_reaction.assert_awaited_once()
     add_kwargs = bot._serverapi.add_message_reaction.await_args.kwargs

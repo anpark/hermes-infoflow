@@ -1064,6 +1064,10 @@ def _parse_recall_response(response_text: str, *, kind: str) -> dict[str, Any]:
         err = inner.get("errmsg") or f"errcode {inner.get('errcode')}"
         logger.error("[infoflow:recall%s] failed: %s", kind.title(), err)
         return {"ok": False, "error": str(err)}
+    if inner is not None and inner.get("bizCode") not in (None, 200):
+        err = inner.get("bizMsg") or f"bizCode {inner.get('bizCode')}"
+        logger.error("[infoflow:recall%s] failed: %s", kind.title(), err)
+        return {"ok": False, "error": str(err)}
     return {"ok": True}
 
 

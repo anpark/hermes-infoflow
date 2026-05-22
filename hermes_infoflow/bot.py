@@ -37,6 +37,7 @@ from .policy import (
     PolicyDecision,
     evaluate_inbound,
 )
+from .reactions import ReactionController, ReactionRunToken
 from .recall import (
     _InboundContext,
     _register_inbound_context,
@@ -136,7 +137,7 @@ _send_path_cv: contextvars.ContextVar[str] = contextvars.ContextVar(
     "send_path", default="",
 )
 
-_reaction_promise_cv: contextvars.ContextVar[dict[str, Any] | None] = (
+_reaction_promise_cv: contextvars.ContextVar[ReactionRunToken | None] = (
     contextvars.ContextVar("reaction_promise", default=None)
 )
 
@@ -215,6 +216,10 @@ class Bot:
         self._admin_uid = admin_uid.strip().lower()
         self._robot_id: str = str(settings.get("robot_id") or "")
         self._reaction_cleanup_tasks: set[asyncio.Task[Any]] = set()
+        self._reactions = ReactionController(
+            add_reaction=self._try_add_reaction,
+            delete_reaction=self._try_delete_reaction,
+        )
         gw_log().info("[infoflow] Bot init: robot_id=%s admin_uid=%s", self._robot_id, self._admin_uid)
 
     # -- robot_id management ------------------------------------------------
@@ -633,50 +638,73 @@ class Bot:
             gw_log().exception("[iflow:reaction] add raised")
             return False
 
-    async def _try_delete_reaction(self, handle: dict[str, str]) -> None:
+    async def _try_delete_reaction(self, handle: dict[str, str]) -> bool:
         try:
             res = await self._serverapi.delete_message_reaction(**handle)
             if not res.success:
                 gw_log().warning("[iflow:reaction] del failed: %s", res.error)
+            return res.success
         except Exception:
             gw_log().exception("[iflow:reaction] del raised")
+            return False
 
-    async def _delete_reaction_promise(
-        self,
-        promise: dict[str, Any] | None,
+    @staticmethod
+    def _reaction_scope_for_target(
         *,
-        reason: str,
-    ) -> None:
-        """Delete a promised processing reaction at most once."""
-        if not promise or promise.get("deleted"):
-            return
-        handle = promise.get("handle")
-        if not isinstance(handle, dict):
-            return
-        promise["deleted"] = True
-        gw_log().info(
-            "[iflow:reaction] delete reason=%s mid=%s",
-            reason,
-            handle.get("base_msg_id", "-"),
-        )
-        await self._try_delete_reaction(handle)
+        group_id: str | None,
+        dm_user_id: str | None,
+    ) -> str:
+        if group_id:
+            return f"group:{group_id}"
+        if dm_user_id:
+            return f"dm:{dm_user_id}"
+        return ""
 
-    async def _cleanup_reaction_after_timeout(self, promise: dict[str, Any]) -> None:
+    async def _start_reaction_run(
+        self,
+        handle: dict[str, str],
+    ) -> ReactionRunToken | None:
+        """Start a session thinking indicator for this inbound run."""
+        return await self._reactions.start(handle)
+
+    async def _cleanup_reaction_after_timeout(self, token: ReactionRunToken) -> None:
         try:
             await asyncio.sleep(_REACTION_FALLBACK_CLEANUP_SECONDS)
-            await self._delete_reaction_promise(promise, reason="timeout")
+            await self._reactions.finish(token, reason="timeout")
         except asyncio.CancelledError:
             raise
         except Exception:
             gw_log().exception("[iflow:reaction] fallback cleanup failed")
 
-    def _schedule_reaction_fallback_cleanup(self, promise: dict[str, Any]) -> None:
-        task = asyncio.create_task(self._cleanup_reaction_after_timeout(promise))
+    def _schedule_reaction_fallback_cleanup(self, token: ReactionRunToken) -> None:
+        task = asyncio.create_task(self._cleanup_reaction_after_timeout(token))
         self._reaction_cleanup_tasks.add(task)
         task.add_done_callback(self._reaction_cleanup_tasks.discard)
 
-    async def _delete_current_reaction_promise(self, *, reason: str) -> None:
-        await self._delete_reaction_promise(_reaction_promise_cv.get(None), reason=reason)
+    async def _finish_reaction_for_send_target(
+        self,
+        *,
+        group_id: str | None,
+        dm_user_id: str | None = None,
+        reaction_message_id: str | None = None,
+        reason: str,
+    ) -> None:
+        token = _reaction_promise_cv.get(None)
+        target_scope = self._reaction_scope_for_target(
+            group_id=group_id,
+            dm_user_id=dm_user_id,
+        )
+        if token is not None:
+            if not target_scope or token.scope_key == target_scope:
+                await self._reactions.finish(token, reason=reason)
+            return
+        if reaction_message_id:
+            await self._reactions.finish_by_anchor(
+                reaction_message_id,
+                expected_scope=target_scope,
+                reason=reason,
+            )
+            return
 
     # -- dispatch orchestration ---------------------------------------------
 
@@ -693,28 +721,37 @@ class Bot:
         _send_path_cv.set(decision.trigger_reason or "")
         hint = msg.message_id or None
 
-        reaction_token = None
-        reaction_promise: dict[str, Any] | None = None
+        reaction_cv_token = None
+        reaction_run: ReactionRunToken | None = None
         reaction = self._build_reaction_handle(msg, decision)
         if reaction:
-            ok = await self._try_add_reaction(reaction)
-            if ok:
-                reaction_promise = {"handle": reaction, "deleted": False}
-                reaction_token = _reaction_promise_cv.set(reaction_promise)
+            reaction_run = await self._start_reaction_run(reaction)
+            if reaction_run is not None:
+                reaction_cv_token = _reaction_promise_cv.set(reaction_run)
 
+        dispatch_completed = False
         try:
             with recall_inbound_message_id_hint_scope(hint):
                 event = await adapter.build_message_event(msg, decision)
                 await adapter.handle_message(event)
+                dispatch_completed = True
         except asyncio.CancelledError:
+            await self._reactions.finish(reaction_run, reason="dispatch_cancelled")
             raise
         except Exception:
             gw_log().exception("[infoflow] inbound dispatch failed")
+            await self._reactions.finish(reaction_run, reason="dispatch_error")
         finally:
-            if reaction_promise is not None and not reaction_promise.get("deleted"):
-                self._schedule_reaction_fallback_cleanup(reaction_promise)
-            if reaction_token is not None:
-                _reaction_promise_cv.reset(reaction_token)
+            if reaction_run is not None and not reaction_run.finished:
+                if dispatch_completed:
+                    await self._reactions.finish(
+                        reaction_run,
+                        reason="dispatch_complete",
+                    )
+                else:
+                    self._schedule_reaction_fallback_cleanup(reaction_run)
+            if reaction_cv_token is not None:
+                _reaction_promise_cv.reset(reaction_cv_token)
             _send_path_cv.set("")
 
     def spawn_dispatch(
@@ -744,6 +781,7 @@ class Bot:
         reply_info: ReplyInfo | None = None,
         options: SendOptions | None = None,
         session: Any = None,
+        reaction_message_id: str | None = None,
     ) -> SentResult:
         """Send a text/markdown message.  Handles NO_REPLY, chunking,
         dedup, message store, and follow-up tracking.
@@ -757,7 +795,12 @@ class Bot:
                 "[iflow:send] mid=%s path=%s NO_REPLY sentinel suppressed",
                 _mid_var.get(""), _path,
             )
-            await self._delete_current_reaction_promise(reason="no_reply")
+            await self._finish_reaction_for_send_target(
+                group_id=group_id,
+                dm_user_id=dm_user_id,
+                reaction_message_id=reaction_message_id,
+                reason="no_reply",
+            )
             return SentResult(success=True)
 
         # Static refusal-regex filter (zero-latency Layer-3 fallback).
@@ -772,7 +815,12 @@ class Bot:
                 "[iflow:send] mid=%s path=%s refusal-regex SUPPRESS preview=%r",
                 _mid_var.get(""), _path, (text or "")[:60],
             )
-            await self._delete_current_reaction_promise(reason="refusal_suppressed")
+            await self._finish_reaction_for_send_target(
+                group_id=group_id,
+                dm_user_id=dm_user_id,
+                reaction_message_id=reaction_message_id,
+                reason="refusal_suppressed",
+            )
             return SentResult(success=True)
 
         # Truncate into chunks (Hermes convention, 2KB per message ceiling)
@@ -834,7 +882,12 @@ class Bot:
             gw_log().info("[iflow:send] mid=%s step=record_bot_reply group=%s reply_to=%s", _mid_var.get(""), group_id, _reply_key)
 
         if first_error:
-            await self._delete_current_reaction_promise(reason="send_error")
+            await self._finish_reaction_for_send_target(
+                group_id=group_id,
+                dm_user_id=dm_user_id,
+                reaction_message_id=reaction_message_id,
+                reason="send_error",
+            )
             return SentResult(
                 success=False,
                 message_id=last_message_id,
@@ -843,7 +896,12 @@ class Bot:
                     if succeeded else first_error
                 ),
             )
-        await self._delete_current_reaction_promise(reason="send_complete")
+        await self._finish_reaction_for_send_target(
+            group_id=group_id,
+            dm_user_id=dm_user_id,
+            reaction_message_id=reaction_message_id,
+            reason="send_complete",
+        )
         return SentResult(success=True, message_id=last_message_id)
 
     # ======================================================================
@@ -859,6 +917,7 @@ class Bot:
         caption: str | None = None,
         reply_info: ReplyInfo | None = None,
         session: Any = None,
+        reaction_message_id: str | None = None,
     ) -> SentResult:
         """Send an image (optionally with caption)."""
         from .adapter import _inbound_mid as _mid_var
@@ -872,7 +931,12 @@ class Bot:
                 dm_user_id, image_bytes, caption=caption, session=session,
             )
         else:
-            await self._delete_current_reaction_promise(reason="image_no_target")
+            await self._finish_reaction_for_send_target(
+                group_id=group_id,
+                dm_user_id=dm_user_id,
+                reaction_message_id=reaction_message_id,
+                reason="image_no_target",
+            )
             return SentResult(success=False, error="no target specified")
 
         if result.success:
@@ -894,7 +958,12 @@ class Bot:
                     reply_to_sender=_reply_key,
                 )
                 gw_log().info("[iflow:send] mid=%s step=record_bot_reply group=%s (image) reply_to=%s", _mid_var.get(""), group_id, _reply_key)
-        await self._delete_current_reaction_promise(reason="image_complete")
+        await self._finish_reaction_for_send_target(
+            group_id=group_id,
+            dm_user_id=dm_user_id,
+            reaction_message_id=reaction_message_id,
+            reason="image_complete",
+        )
         return result
 
     # ======================================================================

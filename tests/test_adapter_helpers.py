@@ -18,6 +18,10 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_infoflow import recall as ad
+from hermes_infoflow.adapter import (
+    _format_group_status_admin_notice,
+    _group_status_redirect_kind,
+)
 from hermes_infoflow.recall import (
     _InboundContext,
     _looks_like_recall_intent,
@@ -238,6 +242,36 @@ def test_parse_infoflow_target_thread_always_none() -> None:
         result = _parse_infoflow_target(ref)
         assert result is not None
         assert result[1] is None
+
+
+# ---------------------------------------------------------------------------
+# Group status suppression helpers
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "⚡ Interrupting current task. I'll respond to your message shortly.",
+        "  💾 Self-improvement review: Memory updated",
+    ],
+)
+def test_group_status_redirect_kind_matches_hermes_runtime_messages(text: str) -> None:
+    assert _group_status_redirect_kind(text)
+
+
+def test_group_status_redirect_kind_does_not_match_normal_text() -> None:
+    assert _group_status_redirect_kind("用户正常问：Memory updated 是什么意思？") == ""
+
+
+def test_format_group_status_admin_notice_identifies_group() -> None:
+    notice = _format_group_status_admin_notice(
+        group_id="4507088",
+        content="💾 Self-improvement review: Memory updated",
+        status_kind="💾 Self-improvement review:",
+    )
+    assert "group:4507088" in notice
+    assert "Memory updated" in notice
 
 
 def test_parse_infoflow_target_account_id_dm() -> None:
