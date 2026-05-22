@@ -38,6 +38,7 @@ _EXPECTED_PACKAGE_FILES = {
     "__init__.py",
     "adapter.py",
     "api.py",
+    "config_editor.py",
     "crypto.py",
     "parser.py",
     "policy.py",
@@ -168,6 +169,20 @@ def test_scripts_synced_for_extract_mode_reruns(deployed: Path) -> None:
     assert (deployed / "scripts" / "lib" / "deploy-common.sh").is_file()
     assert (deployed / "scripts" / "lib" / "edit_hermes_config.py").is_file()
     assert (deployed / "scripts" / "lib" / "edit_hermes_env.py").is_file()
+
+
+def test_flat_layout_config_script_loads_shared_editor(deployed: Path) -> None:
+    pytest.importorskip("yaml")
+    script = deployed / "scripts" / "lib" / "edit_hermes_config.py"
+    spec = importlib.util.spec_from_file_location(
+        "deployed_edit_hermes_config",
+        script,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    assert "terminal" in module.DEFAULT_INFOFLOW_PLATFORM_TOOLSETS
 
 
 def test_deploy_seeds_default_port_in_env(tmp_path: Path) -> None:

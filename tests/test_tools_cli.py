@@ -8,6 +8,8 @@ from contextlib import redirect_stdout
 import pytest
 from hermes_infoflow_tools import cli
 
+from hermes_infoflow import config_editor
+
 
 def _run_dry(args: list[str]) -> str:
     out = io.StringIO()
@@ -92,7 +94,7 @@ def test_pip_mode_enables_plugin_in_config(monkeypatch, tmp_path) -> None:
     assert "- infoflow" in config_text
     config = yaml.safe_load(config_text)
     assert config["platform_toolsets"]["infoflow"] == list(
-        cli.DEFAULT_INFOFLOW_PLATFORM_TOOLSETS
+        config_editor.DEFAULT_INFOFLOW_PLATFORM_TOOLSETS
     )
 
 

@@ -94,6 +94,8 @@ bash scripts/deploy.sh --port 9000 # 指定 webhook 端口并写入 ~/.hermes/.e
 
 部署时还会维护 `~/.hermes/.env` 中的 `INFOFLOW_PORT`：传 `--port` 则写入指定端口；未传时若 `.env` 已有 `INFOFLOW_PORT` 则保留，否则写入默认 `26521`（便于查看当前监听端口）。同时会补齐 `~/.hermes/config.yaml` 里的 `platform_toolsets.infoflow`，让 Infoflow 会话拥有与 CLI 会话一致的基础工具权限，并包含 `hermes-infoflow` 工具集。
 
+> 当前安全取舍：项目初期以使用效率优先，部署脚本会主动给 `platform_toolsets.infoflow` 补齐 CLI 级基础工具权限（如 terminal / file / browser / web / code_execution 等）。`infoflow_get_group_members` 也允许显式传入 `group_id` 查询群成员，暂不强制绑定当前会话群。除非后续安全策略变更，这两点视为当前设计选择，不作为缺陷处理；需要收紧时再引入 allowlist / admin-only / 当前会话限定等策略。
+
 镜像 [`openclaw-infoflow/scripts/deploy.sh`](https://github.com/chbo297/openclaw-infoflow/blob/main/scripts/deploy.sh)。
 
 ---

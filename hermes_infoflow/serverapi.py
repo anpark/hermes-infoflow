@@ -19,8 +19,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import concurrent.futures
 import contextlib
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from enum import Enum, StrEnum
@@ -52,7 +54,8 @@ _MEMBERS_CACHE_TTL = 300  # 5 minutes
 # Per-group guarded-fetch state (module-level for singleton semantics).
 # ``last_result`` holds the most recent GroupMembersFetchResult (success OR
 # failure) so we can debounce both success and failure storms uniformly.
-_guarded_state: dict[str, dict] = {}  # group_id → {task, task_loop, last_ts, last_result}
+_guarded_state: dict[str, dict] = {}  # group_id → {future, task, last_ts, last_result}
+_guarded_lock = threading.Lock()
 _DEBOUNCE_SECONDS = 3.0
 
 
@@ -826,52 +829,104 @@ class ServerAPI:
                     status=GroupMembersFetchStatus.OK_CACHED,
                 )
 
-        state = _guarded_state.setdefault(
-            gid, {"task": None, "task_loop": None, "last_ts": 0.0, "last_result": None},
-        )
-        now = time.time()
-        if (
-            state.get("last_result") is not None
-            and (now - state["last_ts"]) < _DEBOUNCE_SECONDS
-        ):
-            return self._replay_guarded_result(state["last_result"])
+        replay: GroupMembersFetchResult | None = None
+        created = False
+        with _guarded_lock:
+            state = _guarded_state.setdefault(
+                gid, {"future": None, "task": None, "last_ts": 0.0, "last_result": None},
+            )
+            now = time.time()
+            if (
+                state.get("last_result") is not None
+                and (now - state["last_ts"]) < _DEBOUNCE_SECONDS
+            ):
+                replay = self._replay_guarded_result(state["last_result"])
+                shared_future = None
+            else:
+                future = state.get("future")
+                if (
+                    isinstance(future, concurrent.futures.Future)
+                    and not future.done()
+                ):
+                    shared_future = future
+                else:
+                    shared_future = concurrent.futures.Future()
+                    state["future"] = shared_future
+                    created = True
 
-        current_loop = asyncio.get_running_loop()
-        task = state.get("task")
-        task_loop = state.get("task_loop")
-        if task is not None and not task.done() and task_loop is current_loop:
-            return await task
+        if replay is not None:
+            return replay
+        if not created:
+            assert shared_future is not None
+            return await asyncio.shield(asyncio.wrap_future(shared_future))
+
+        assert shared_future is not None
+
+        def _finish_shared_result(result: GroupMembersFetchResult) -> None:
+            with _guarded_lock:
+                state["last_result"] = result
+                state["last_ts"] = time.time()
+                should_set_result = not shared_future.done()
+                if state.get("future") is shared_future:
+                    state["future"] = None
+                    state["task"] = None
+            if should_set_result:
+                with contextlib.suppress(concurrent.futures.InvalidStateError):
+                    shared_future.set_result(result)
+
+        def _finish_shared_exception(exc: BaseException) -> None:
+            with _guarded_lock:
+                should_set_exception = not shared_future.done()
+                if state.get("future") is shared_future:
+                    state["future"] = None
+                    state["task"] = None
+            if not should_set_exception:
+                return
+            if isinstance(exc, asyncio.CancelledError):
+                shared_future.cancel()
+                return
+            with contextlib.suppress(concurrent.futures.InvalidStateError):
+                shared_future.set_exception(exc)
 
         async def _run() -> GroupMembersFetchResult:
             try:
-                async with self._ensure_session(session) as sess:
-                    result = await self._fetch_group_members_remote(group_id, sess)
-            except Exception as exc:
-                cached = _MEMBERS_CACHE.get(gid)
-                if cached:
-                    result = GroupMembersFetchResult(
-                        members=cached[0],
-                        status=GroupMembersFetchStatus.OK_STALE,
-                    )
-                else:
-                    result = GroupMembersFetchResult(
-                        members=[],
-                        status=GroupMembersFetchStatus.FAILED,
-                        error=str(exc),
-                    )
-            state["last_result"] = result
-            state["last_ts"] = time.time()
-            return result
+                try:
+                    async with self._ensure_session(session) as sess:
+                        result = await self._fetch_group_members_remote(group_id, sess)
+                except Exception as exc:
+                    cached = _MEMBERS_CACHE.get(gid)
+                    if cached:
+                        result = GroupMembersFetchResult(
+                            members=cached[0],
+                            status=GroupMembersFetchStatus.OK_STALE,
+                        )
+                    else:
+                        result = GroupMembersFetchResult(
+                            members=[],
+                            status=GroupMembersFetchStatus.FAILED,
+                            error=str(exc),
+                        )
+                _finish_shared_result(result)
+                return result
+            except BaseException as exc:
+                _finish_shared_exception(exc)
+                raise
+
+        def _task_done(done_task: asyncio.Task[GroupMembersFetchResult]) -> None:
+            if shared_future.done():
+                return
+            if done_task.cancelled():
+                _finish_shared_exception(asyncio.CancelledError())
+                return
+            exc = done_task.exception()
+            if exc is not None:
+                _finish_shared_exception(exc)
 
         task = asyncio.ensure_future(_run())
-        state["task"] = task
-        state["task_loop"] = current_loop
-        try:
-            return await task
-        finally:
-            if state.get("task") is task:
-                state["task"] = None
-                state["task_loop"] = None
+        task.add_done_callback(_task_done)
+        with _guarded_lock:
+            state["task"] = task
+        return await asyncio.shield(asyncio.wrap_future(shared_future))
 
     async def fetch_group_members_detailed(
         self,

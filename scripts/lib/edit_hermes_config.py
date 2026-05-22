@@ -29,6 +29,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import sys
 from pathlib import Path
 from typing import Any
@@ -43,26 +44,32 @@ except ImportError as exc:  # pragma: no cover - bootstrap path
     sys.exit(2)
 
 
-DEFAULT_INFOFLOW_PLATFORM_TOOLSETS = (
-    "browser",
-    "clarify",
-    "code_execution",
-    "computer_use",
-    "cronjob",
-    "delegation",
-    "file",
-    "hermes-infoflow",
-    "image_gen",
-    "memory",
-    "messaging",
-    "session_search",
-    "skills",
-    "terminal",
-    "todo",
-    "tts",
-    "vision",
-    "web",
-)
+def _load_config_editor():
+    self_dir = Path(__file__).resolve().parent
+    candidates = [
+        # Source checkout: scripts/lib/edit_hermes_config.py -> hermes_infoflow/config_editor.py
+        self_dir.parent.parent / "hermes_infoflow" / "config_editor.py",
+        # Flattened deploy layout: plugin_dir/scripts/lib/edit_hermes_config.py -> plugin_dir/config_editor.py
+        self_dir.parent.parent / "config_editor.py",
+    ]
+    for path in candidates:
+        if not path.is_file():
+            continue
+        spec = importlib.util.spec_from_file_location("hermes_infoflow_config_editor", path)
+        if spec is None or spec.loader is None:
+            continue
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    try:
+        from hermes_infoflow import config_editor as module
+    except Exception as exc:  # pragma: no cover - defensive deploy path
+        raise SystemExit("Cannot find hermes_infoflow config_editor.py") from exc
+    return module
+
+
+_CONFIG_EDITOR = _load_config_editor()
+DEFAULT_INFOFLOW_PLATFORM_TOOLSETS = _CONFIG_EDITOR.DEFAULT_INFOFLOW_PLATFORM_TOOLSETS
 
 
 def _load(path: Path) -> dict[str, Any]:
@@ -90,51 +97,9 @@ def _save(path: Path, data: dict[str, Any]) -> None:
     path.write_text(serialized, encoding="utf-8")
 
 
-def _normalize_toolsets(value: Any, label: str) -> list[str]:
-    if value is None:
-        return []
-    if not isinstance(value, list):
-        raise SystemExit(f"{label} must be a list; got {type(value).__name__}")
-    return [
-        str(item)
-        for item in value
-        if isinstance(item, (str, int)) and str(item).strip()
-    ]
-
-
-def _dedupe(items: list[str]) -> list[str]:
-    seen: set[str] = set()
-    result: list[str] = []
-    for item in items:
-        if item in seen:
-            continue
-        seen.add(item)
-        result.append(item)
-    return result
-
-
-def _reference_toolsets(platform_toolsets: dict[str, Any]) -> list[str]:
-    cli_toolsets = _normalize_toolsets(platform_toolsets.get("cli"), "platform_toolsets.cli")
-    return _dedupe([*cli_toolsets, *DEFAULT_INFOFLOW_PLATFORM_TOOLSETS])
-
-
 def ensure_platform_toolsets(data: dict[str, Any], plugin_id: str) -> bool:
     """Ensure ``platform_toolsets.<plugin_id>`` can call the standard tools."""
-    platform_toolsets = data.setdefault("platform_toolsets", {})
-    if not isinstance(platform_toolsets, dict):
-        raise SystemExit("platform_toolsets: must be a mapping; refusing to edit")
-
-    required = _reference_toolsets(platform_toolsets)
-    current = _normalize_toolsets(
-        platform_toolsets.get(plugin_id),
-        f"platform_toolsets.{plugin_id}",
-    )
-    merged = _dedupe([*current, *required])
-    if current == merged:
-        return False
-    platform_toolsets[plugin_id] = merged
-    data["platform_toolsets"] = platform_toolsets
-    return True
+    return _CONFIG_EDITOR.ensure_platform_toolsets(data, plugin_id)
 
 
 def apply(data: dict[str, Any], plugin_id: str, *, remove: bool = False) -> bool:
@@ -142,32 +107,7 @@ def apply(data: dict[str, Any], plugin_id: str, *, remove: bool = False) -> bool
 
     Returns True iff ``data`` was modified.
     """
-    changed = False
-    plugins = data.setdefault("plugins", {})
-    if not isinstance(plugins, dict):
-        raise SystemExit("plugins: must be a mapping; refusing to edit")
-    enabled = plugins.get("enabled")
-    if enabled is None:
-        enabled = []
-    if not isinstance(enabled, list):
-        raise SystemExit(
-            f"plugins.enabled must be a list; got {type(enabled).__name__}"
-        )
-    # Normalize to list[str] (PyYAML may parse bare strings as plain str).
-    current = [str(item) for item in enabled if isinstance(item, (str, int))]
-
-    if remove:
-        if plugin_id in current:
-            plugins["enabled"] = [p for p in current if p != plugin_id]
-            data["plugins"] = plugins
-            changed = True
-    else:
-        if plugin_id not in current:
-            plugins["enabled"] = [*current, plugin_id]
-            data["plugins"] = plugins
-            changed = True
-        changed = ensure_platform_toolsets(data, plugin_id) or changed
-    return changed
+    return _CONFIG_EDITOR.apply(data, plugin_id, remove=remove)
 
 
 def main(argv: list[str] | None = None) -> int:

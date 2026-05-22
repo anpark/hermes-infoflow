@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
+import threading
 import time
 from unittest.mock import AsyncMock, patch
 
@@ -207,20 +207,10 @@ def test_concurrent_callers_share_inflight_fetch(serverapi: ServerAPI) -> None:
     assert all(r.status == GroupMembersFetchStatus.OK for r in results)
 
 
-def test_inflight_task_from_other_loop_is_not_awaited(serverapi: ServerAPI) -> None:
-    """Tool worker loops must not await a task created on the gateway loop."""
-
-    async def _never_finishes():
-        await asyncio.Future()
-
-    old_loop = asyncio.new_event_loop()
-    old_task = old_loop.create_task(_never_finishes())
-    _guarded_state["99"] = {
-        "task": old_task,
-        "task_loop": old_loop,
-        "last_ts": 0.0,
-        "last_result": None,
-    }
+def test_cross_loop_callers_share_inflight_fetch(serverapi: ServerAPI) -> None:
+    """Gateway and tool worker loops should share one remote member fetch."""
+    entered_remote = threading.Event()
+    release_remote = threading.Event()
     api_members = [
         type("M", (), {
             "uid": "fresh", "name": "fresh", "agent_id": None,
@@ -228,23 +218,89 @@ def test_inflight_task_from_other_loop_is_not_awaited(serverapi: ServerAPI) -> N
         })(),
     ]
 
-    try:
-        with patch(
-            "hermes_infoflow.serverapi._api.get_group_members",
-            new_callable=AsyncMock,
-            return_value=api_members,
-        ) as mock_api:
-            result = asyncio.run(
+    async def _slow_fetch(*_args, **_kwargs):
+        entered_remote.set()
+        await asyncio.to_thread(release_remote.wait)
+        return api_members
+
+    thread_result: dict[str, object] = {}
+    thread_errors: list[BaseException] = []
+
+    def _thread_run() -> None:
+        try:
+            thread_result["first"] = asyncio.run(
                 serverapi.fetch_group_members_detailed("99", force_refresh=True),
             )
-    finally:
-        old_task.cancel()
-        with contextlib.suppress(Exception):
-            old_loop.run_until_complete(
-                asyncio.gather(old_task, return_exceptions=True),
-            )
-        old_loop.close()
+        except BaseException as exc:  # pragma: no cover - test diagnostics
+            thread_errors.append(exc)
 
+    with patch(
+        "hermes_infoflow.serverapi._api.get_group_members",
+        new=AsyncMock(side_effect=_slow_fetch),
+    ) as mock_api:
+        thread = threading.Thread(target=_thread_run)
+        thread.start()
+        assert entered_remote.wait(timeout=2)
+
+        async def _run_second_loop():
+            task = asyncio.create_task(
+                serverapi.fetch_group_members_detailed("99", force_refresh=True),
+            )
+            await asyncio.sleep(0.05)
+            assert not task.done()
+            release_remote.set()
+            return await task
+
+        second = asyncio.run(_run_second_loop())
+        thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert thread_errors == []
     assert mock_api.await_count == 1
-    assert result.status == GroupMembersFetchStatus.OK
-    assert result.members[0].uid == "fresh"
+    first = thread_result["first"]
+    assert isinstance(first, type(second))
+    assert first.status == GroupMembersFetchStatus.OK
+    assert second.status == GroupMembersFetchStatus.OK
+    assert first.members[0].uid == "fresh"
+    assert second.members[0].uid == "fresh"
+
+
+def test_inflight_task_cancellation_completes_shared_future(
+    serverapi: ServerAPI,
+) -> None:
+    async def _never_finishes(*_args, **_kwargs):
+        await asyncio.Future()
+
+    async def _wait_for_inflight_task() -> asyncio.Task:
+        for _ in range(100):
+            state = _guarded_state.get("99") or {}
+            task = state.get("task")
+            if isinstance(task, asyncio.Task):
+                return task
+            await asyncio.sleep(0.01)
+        raise AssertionError("group member fetch task was not registered")
+
+    async def _run() -> None:
+        first = asyncio.create_task(
+            serverapi.fetch_group_members_detailed("99", force_refresh=True),
+        )
+        inflight = await _wait_for_inflight_task()
+        second = asyncio.create_task(
+            serverapi.fetch_group_members_detailed("99", force_refresh=True),
+        )
+        await asyncio.sleep(0)
+
+        inflight.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(first, timeout=1)
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(second, timeout=1)
+        assert _guarded_state["99"]["future"] is None
+        assert _guarded_state["99"]["task"] is None
+
+    with patch(
+        "hermes_infoflow.serverapi._api.get_group_members",
+        new=AsyncMock(side_effect=_never_finishes),
+    ):
+        asyncio.run(_run())

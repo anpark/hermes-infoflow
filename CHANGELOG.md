@@ -20,6 +20,10 @@ versioning (with prerelease suffixes such as `0.1.0b1` for betas).
 - Deploy / installer config editing now ensures
   `platform_toolsets.infoflow` includes the same baseline tool permissions
   as CLI sessions, including the `hermes-infoflow` toolset.
+- Documented the current efficiency-first security posture: Infoflow sessions
+  intentionally receive CLI-level tool permissions, and
+  `infoflow_get_group_members` intentionally accepts an explicit `group_id`
+  until a stricter policy is introduced.
 
 ### Changed
 

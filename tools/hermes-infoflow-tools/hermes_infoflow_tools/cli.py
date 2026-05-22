@@ -48,26 +48,6 @@ from .env_editor import (
 DEFAULT_PACKAGE = "hermes-infoflow"
 DEFAULT_INDEX_URL = "https://pypi.org/simple"
 DEFAULT_CHANNEL_ID = "infoflow"
-DEFAULT_INFOFLOW_PLATFORM_TOOLSETS = (
-    "browser",
-    "clarify",
-    "code_execution",
-    "computer_use",
-    "cronjob",
-    "delegation",
-    "file",
-    "hermes-infoflow",
-    "image_gen",
-    "memory",
-    "messaging",
-    "session_search",
-    "skills",
-    "terminal",
-    "todo",
-    "tts",
-    "vision",
-    "web",
-)
 
 
 # ---------------------------------------------------------------------------
@@ -263,25 +243,7 @@ def _ensure_plugin_enabled(config_file: Path, plugin_id: str, *, dry_run: bool) 
         return parsed
 
     data = _load(config_file)
-    plugins = data.setdefault("plugins", {})
-    if not isinstance(plugins, dict):
-        raise SystemExit("plugins: must be a mapping; refusing to edit")
-    enabled = plugins.get("enabled")
-    if enabled is None:
-        enabled = []
-    if not isinstance(enabled, list):
-        raise SystemExit(
-            f"plugins.enabled must be a list; got {type(enabled).__name__}"
-        )
-
-    current = [str(item) for item in enabled if isinstance(item, (str, int))]
-    changed = False
-    if plugin_id not in current:
-        plugins["enabled"] = [*current, plugin_id]
-        data["plugins"] = plugins
-        changed = True
-
-    changed = _ensure_platform_toolsets(data, plugin_id) or changed
+    changed = _load_config_editor().apply(data, plugin_id)
     if not changed:
         print(f"[pip mode] no config change needed ({plugin_id} already enabled)")
         return False
@@ -300,49 +262,16 @@ def _ensure_plugin_enabled(config_file: Path, plugin_id: str, *, dry_run: bool) 
     return True
 
 
-def _normalize_toolsets(value: Any, label: str) -> list[str]:
-    if value is None:
-        return []
-    if not isinstance(value, list):
-        raise SystemExit(f"{label} must be a list; got {type(value).__name__}")
-    return [
-        str(item)
-        for item in value
-        if isinstance(item, (str, int)) and str(item).strip()
-    ]
-
-
-def _dedupe(items: list[str]) -> list[str]:
-    seen: set[str] = set()
-    result: list[str] = []
-    for item in items:
-        if item in seen:
-            continue
-        seen.add(item)
-        result.append(item)
-    return result
-
-
-def _ensure_platform_toolsets(data: dict[str, Any], plugin_id: str) -> bool:
-    platform_toolsets = data.setdefault("platform_toolsets", {})
-    if not isinstance(platform_toolsets, dict):
-        raise SystemExit("platform_toolsets: must be a mapping; refusing to edit")
-
-    cli_toolsets = _normalize_toolsets(
-        platform_toolsets.get("cli"),
-        "platform_toolsets.cli",
-    )
-    required = _dedupe([*cli_toolsets, *DEFAULT_INFOFLOW_PLATFORM_TOOLSETS])
-    current = _normalize_toolsets(
-        platform_toolsets.get(plugin_id),
-        f"platform_toolsets.{plugin_id}",
-    )
-    merged = _dedupe([*current, *required])
-    if current == merged:
-        return False
-    platform_toolsets[plugin_id] = merged
-    data["platform_toolsets"] = platform_toolsets
-    return True
+def _load_config_editor():
+    try:
+        from hermes_infoflow import config_editor
+    except Exception as exc:
+        raise SystemExit(
+            "hermes-infoflow must be installed before editing Hermes config. "
+            "The preceding pip install step should have provided "
+            "hermes_infoflow.config_editor."
+        ) from exc
+    return config_editor
 
 
 # ---------------------------------------------------------------------------
