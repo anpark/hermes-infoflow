@@ -199,6 +199,17 @@ https://<your-domain>/webhook/infoflow/sessiontracker?chatType=7&chatId=39500876
 
 详见 [docs/infoflow-getuserinfo-api.md](docs/infoflow-getuserinfo-api.md)。
 
+### Session 对应关系（与 Hermes gateway）
+
+| 场景 | Hermes `session_key`（持久） | `chat_id`（Tracker 绑定键） |
+|------|------------------------------|---------------------------|
+| 私聊 | `agent:main:infoflow:dm:{uuap}` | 与 gateway 相同：`{uuap}`（getuserinfo 的 `UserId`） |
+| 群聊 | `agent:main:infoflow:group:group:{群ID}:{发送者uuap}` | `group:{群ID}`（**每个发送者独立 session**） |
+
+- **同一私聊 / 同一群+发送者**：gateway **复用**同一 `session_key`，在 idle 重置或 `/new` 前保持同一 `session_id`。
+- **群聊 Tracker URL** 只带群号时，页面展示该群下 **最近活跃** 的那条 session（顶栏会显示 `user: {uuap}`）；不是把全群多人合并成一条 session。
+- **SSE 订阅**（`/sessiontracker/api/stream`）须携带与打开页面相同的 query（`chatType`、`chatId`、`code`），用于校验 `session_id` 属于该目标。
+
 ### 与 Dashboard 的区别
 
 | | Dashboard | Session Tracker |

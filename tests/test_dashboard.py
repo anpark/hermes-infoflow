@@ -98,8 +98,7 @@ def test_pre_gateway_dispatch_with_mock_gateway(tracker: SessionTracker) -> None
     )
     event = SimpleNamespace(source=source, text="hello")
 
-    entry = SimpleNamespace(session_id="gw-sess-1")
-    session_store = SimpleNamespace(_entries={"agent:main:infoflow:dm:alice": entry})
+    entry = SimpleNamespace(session_id="gw-sess-1", session_key="agent:main:infoflow:dm:alice")
 
     def _session_key_for_source(src: object) -> str:
         return "agent:main:infoflow:dm:alice"
@@ -107,6 +106,9 @@ def test_pre_gateway_dispatch_with_mock_gateway(tracker: SessionTracker) -> None
     def _ensure_loaded() -> None:
         return None
 
+    session_store = SimpleNamespace(
+        _entries={"agent:main:infoflow:dm:alice": entry},
+    )
     session_store._ensure_loaded = _ensure_loaded  # type: ignore[method-assign]
     gateway = SimpleNamespace(_session_key_for_source=_session_key_for_source)
 
@@ -117,8 +119,80 @@ def test_pre_gateway_dispatch_with_mock_gateway(tracker: SessionTracker) -> None
         session_store=session_store,
     )
     assert tracker.get_meta("gw-sess-1") is not None
+    assert tracker.lookup_session_id("alice") == "gw-sess-1"
     kinds = [e.kind for e in tracker.snapshot("gw-sess-1")]
     assert "inbound" in kinds
+
+
+def test_pre_gateway_dispatch_peek_without_create(tracker: SessionTracker) -> None:
+    from types import SimpleNamespace
+
+    class _Platform:
+        value = "infoflow"
+
+    source = SimpleNamespace(
+        platform=_Platform(),
+        chat_id="bob",
+        chat_type="dm",
+        user_id="bob",
+    )
+    event = SimpleNamespace(source=source, text="hi")
+    created = {"called": False}
+
+    def get_or_create_session(src: object) -> object:
+        created["called"] = True
+        return SimpleNamespace(session_id="should-not", session_key="")
+
+    def _session_key_for_source(src: object) -> str:
+        return "agent:main:infoflow:dm:bob"
+
+    session_store = SimpleNamespace(_entries={}, get_or_create_session=get_or_create_session)
+    session_store._ensure_loaded = lambda: None  # type: ignore[method-assign]
+    gateway = SimpleNamespace(_session_key_for_source=_session_key_for_source)
+
+    hooks = make_plugin_hooks(tracker)
+    hooks["pre_gateway_dispatch"](event=event, gateway=gateway, session_store=session_store)
+
+    assert created["called"] is False
+    assert tracker.lookup_session_id("bob") == "pending:bob"
+    assert len(tracker.snapshot("pending:bob")) == 1
+
+
+def test_pre_llm_call_binds_from_meta_chat_id(tracker: SessionTracker) -> None:
+    tracker.push_event("", "inbound", {"x": 1}, platform="infoflow", chat_id="carol")
+    tracker.bind_chat("carol", "sess-carol")
+    hooks = make_plugin_hooks(tracker)
+    hooks["pre_llm_call"](
+        session_id="sess-carol",
+        user_message="hi",
+        conversation_history=[],
+        is_first_turn=True,
+        model="m",
+        platform="infoflow",
+        sender_id="carol",
+    )
+    assert tracker.lookup_session_id("carol") == "sess-carol"
+
+
+def test_lookup_session_id_prefers_active_over_stale_map(tracker: SessionTracker) -> None:
+    tracker.bind_chat("group:9", "old-ended")
+    tracker.push_event("old-ended", "session.start", {}, platform="infoflow", chat_id="group:9")
+    meta_old = tracker.get_meta("old-ended")
+    assert meta_old is not None
+    meta_old.status = "ended"
+
+    tracker.push_event(
+        "new-active",
+        "display.tool_line",
+        {"line": "┊ ok"},
+        platform="infoflow",
+        chat_id="group:9",
+    )
+    meta_new = tracker.get_meta("new-active")
+    assert meta_new is not None
+    meta_new.status = "active"
+
+    assert tracker.lookup_session_id("group:9") == "new-active"
 
 
 @pytest.mark.asyncio

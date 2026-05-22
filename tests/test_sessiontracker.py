@@ -145,6 +145,17 @@ async def test_resolve_pending_status_waiting(tracker: SessionTracker) -> None:
     assert info["status"] == "waiting"
 
 
+def test_push_event_updates_chat_map_from_meta(tracker: SessionTracker) -> None:
+    tracker.push_event(
+        "sess-x",
+        "display.tool_line",
+        {"line": "x"},
+        platform="infoflow",
+        chat_id="group:42",
+    )
+    assert tracker.lookup_session_id("group:42") == "sess-x"
+
+
 def test_session_matches_target(tracker: SessionTracker) -> None:
     tracker.bind_chat("group:9", "sess-9")
     assert session_matches_target(tracker, "sess-9", "group:9")

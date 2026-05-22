@@ -143,9 +143,6 @@ class SessionTracker:
         if not sid:
             return None
 
-        if chat_id and not sid.startswith("pending:"):
-            self._chat_to_session[chat_id] = sid
-
         now = time.time()
         meta = self._meta.get(sid)
         if meta is None:
@@ -160,12 +157,17 @@ class SessionTracker:
         meta.last_event_at = now
         if platform:
             meta.platform = platform
+        effective_chat = chat_id or meta.chat_id
         if meta.chat_id and chat_id and meta.chat_id != chat_id:
             pass
         elif chat_id:
             meta.chat_id = chat_id
+            effective_chat = chat_id
         if model:
             meta.model = model
+
+        if effective_chat and not sid.startswith("pending:"):
+            self._chat_to_session[normalize_chat_id(effective_chat)] = sid
 
         seq = self._seq.get(sid, 0) + 1
         self._seq[sid] = seq
@@ -261,10 +263,37 @@ class SessionTracker:
         return chat_id
 
     def lookup_session_id(self, canonical_chat_id: str) -> str | None:
-        sid = self._chat_to_session.get(canonical_chat_id)
+        """Resolve the best tracker session for a canonical chat target.
+
+        Hermes reuses the same ``session_key`` but may rotate ``session_id``
+        after idle reset or ``/new``. Prefer the newest session whose
+        ``meta.chat_id`` matches (not a stale ``_chat_to_session`` entry).
+        """
+        canonical = normalize_chat_id(canonical_chat_id)
+        if not canonical:
+            return None
+
+        best_sid: str | None = None
+        best_rank = (-1, 0.0)  # (active=1/ended=0, last_event_at)
+        for sid, meta in self._meta.items():
+            if sid.startswith("pending:"):
+                continue
+            if normalize_chat_id(meta.chat_id) != canonical:
+                continue
+            rank = (1 if meta.status == "active" else 0, meta.last_event_at)
+            if rank > best_rank:
+                best_rank = rank
+                best_sid = sid
+
+        if best_sid:
+            self._chat_to_session[canonical] = best_sid
+            return best_sid
+
+        sid = self._chat_to_session.get(canonical)
         if sid and not sid.startswith("pending:"):
             return sid
-        pending = f"pending:{canonical_chat_id}"
+
+        pending = f"pending:{canonical}"
         if pending in self._meta:
             return pending
         return None
@@ -353,6 +382,32 @@ def _platform_str(platform: Any) -> str:
     return str(platform)
 
 
+def _peek_gateway_session(
+    gateway: Any,
+    session_store: Any,
+    source: Any,
+) -> tuple[str, str]:
+    """Return ``(session_id, session_key)`` from the store without creating an entry.
+
+    ``pre_gateway_dispatch`` runs before gateway auth; avoid
+    ``get_or_create_session`` here so unauthorized messages do not mint sessions.
+    """
+    session_id = ""
+    session_key = ""
+    if gateway is None or session_store is None:
+        return session_id, session_key
+    try:
+        session_key = gateway._session_key_for_source(source)  # noqa: SLF001
+        session_store._ensure_loaded()  # noqa: SLF001
+        entry = session_store._entries.get(session_key)  # noqa: SLF001
+        if entry is not None:
+            session_id = getattr(entry, "session_id", "") or ""
+            session_key = getattr(entry, "session_key", "") or session_key
+    except Exception:
+        pass
+    return session_id, session_key
+
+
 # ---------------------------------------------------------------------------
 # Plugin hooks
 # ---------------------------------------------------------------------------
@@ -420,6 +475,9 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
     def pre_llm_call(**kw: Any) -> None:
         sid = kw.get("session_id") or ""
         plat = _platform_str(kw.get("platform"))
+        meta = tracker.get_meta(sid) if sid else None
+        if meta is not None and meta.chat_id and sid:
+            tracker.bind_chat(normalize_chat_id(meta.chat_id), sid)
         tracker.push_event(
             sid,
             "llm.request",
@@ -562,24 +620,15 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
         chat_id = normalize_chat_id(getattr(source, "chat_id", "") or "")
         chat_type = getattr(source, "chat_type", "") or ""
         user_id = getattr(source, "user_id", "") or ""
-        session_id = ""
-        if gateway is not None and session_store is not None:
-            try:
-                session_key = gateway._session_key_for_source(source)  # noqa: SLF001
-                session_store._ensure_loaded()  # noqa: SLF001
-                entry = session_store._entries.get(session_key)  # noqa: SLF001
-                if entry is not None:
-                    session_id = entry.session_id or ""
-                    if chat_id:
-                        tracker.bind_chat(chat_id, session_id)
-                    meta = tracker.get_meta(session_id)
-                    if meta is not None:
-                        meta.chat_id = chat_id
-                        meta.chat_type = chat_type
-                        meta.user_id = user_id or ""
-                        meta.platform = plat or meta.platform
-            except Exception:
-                pass
+        session_id, session_key = _peek_gateway_session(gateway, session_store, source)
+        if session_id and chat_id:
+            tracker.bind_chat(chat_id, session_id)
+            meta = tracker.get_meta(session_id)
+            if meta is not None:
+                meta.chat_id = chat_id
+                meta.chat_type = chat_type
+                meta.user_id = user_id or ""
+                meta.platform = plat or meta.platform
         text = getattr(event, "text", "") or ""
         tracker.push_event(
             session_id or tracker.resolve_session_id(chat_id=chat_id),
@@ -590,6 +639,7 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
                 "chat_type": chat_type,
                 "user_id": user_id,
                 "user_name": getattr(source, "user_name", None),
+                "session_key": session_key,
                 "text": _trunc(text, 2000),
             },
             platform=plat,

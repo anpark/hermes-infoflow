@@ -102,6 +102,7 @@ async def resolve_target(
 
     session_id = tracker.lookup_session_id(canonical)
     status = "waiting"
+    meta = None
     if session_id:
         if session_id.startswith("pending:"):
             status = "waiting"
@@ -115,6 +116,7 @@ async def resolve_target(
         "session_id": session_id or "",
         "status": status,
         "chat_type": chat_type,
+        "user_id": (meta.user_id if meta else "") or "",
     }
 
 
@@ -343,8 +345,9 @@ async function init() {
   document.getElementById('title').textContent = info.label || 'Session Tracker';
   sessionId = info.session_id || '';
   const status = info.status || 'waiting';
+  const who = info.user_id ? (' | user: ' + info.user_id) : '';
   document.getElementById('meta-line').textContent =
-    (info.canonical_chat_id || '') + ' | session: ' + (sessionId || '(pending)') + ' | ' + status;
+    (info.canonical_chat_id || '') + who + ' | session: ' + (sessionId || '(pending)') + ' | ' + status;
   if (sessionId) {
     connectStream();
   } else {
@@ -356,8 +359,9 @@ async function init() {
         sessionId = j.session_id;
         clearInterval(poll);
         connectStream();
+        const who2 = j.user_id ? (' | user: ' + j.user_id) : '';
         document.getElementById('meta-line').textContent =
-          (j.canonical_chat_id || '') + ' | session: ' + sessionId + ' | ' + (j.status || '');
+          (j.canonical_chat_id || '') + who2 + ' | session: ' + sessionId + ' | ' + (j.status || '');
       }
     }, 2000);
   }
