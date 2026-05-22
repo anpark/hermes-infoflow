@@ -8,6 +8,7 @@ exercise the adapter end-to-end with a fake aiohttp request.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 from types import SimpleNamespace
@@ -16,12 +17,17 @@ from urllib.parse import urlencode
 
 import pytest
 
-gateway_base = pytest.importorskip("gateway.platforms.base")  # noqa: F401  (presence guard)
+gateway_base = pytest.importorskip("gateway.platforms.base")
 
 from hermes_infoflow import api as _api  # noqa: E402
 from hermes_infoflow import crypto as _crypto  # noqa: E402
-from hermes_infoflow.adapter import InfoflowAdapter  # noqa: E402
-from hermes_infoflow.itypes import SentResult  # noqa: E402
+from hermes_infoflow.adapter import (  # noqa: E402
+    InfoflowAdapter,
+    MessageEvent,
+    MessageType,
+    _inbound_mid,
+)
+from hermes_infoflow.itypes import RecallResult, SentResult  # noqa: E402
 from hermes_infoflow.sent_store import SentMessageStore  # noqa: E402
 from tests._aes_helpers import aes_ecb_encrypt_b64url, aes_key_b64url  # noqa: E402
 
@@ -93,6 +99,125 @@ def test_adapter_construction_reads_env(configured_env, monkeypatch) -> None:
     assert adapter._api_account.app_key == "k"
     assert adapter._policy.reply_mode == "mention-and-watch"
     assert adapter._policy.require_mention is True
+
+
+def test_hermes_background_processor_signature_matches_context_override() -> None:
+    method = gateway_base.BasePlatformAdapter._process_message_background
+
+    assert inspect.iscoroutinefunction(method)
+    assert list(inspect.signature(method).parameters) == [
+        "self",
+        "event",
+        "session_key",
+    ]
+
+
+def test_processing_context_binding_replaces_inherited_values(configured_env) -> None:
+    from hermes_infoflow.bot import (  # noqa: E402
+        _reaction_promise_cv,
+        _recall_hint,
+        _send_path_cv,
+    )
+
+    adapter = InfoflowAdapter(_make_config())
+    adapter._serverapi.add_message_reaction = AsyncMock(
+        return_value=RecallResult(success=True)
+    )
+    adapter._serverapi.delete_message_reaction = AsyncMock(
+        return_value=RecallResult(success=True)
+    )
+
+    async def _settle_reaction_tasks() -> None:
+        while adapter._bot._reactions._tasks:
+            tasks = list(adapter._bot._reactions._tasks)
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.sleep(0)
+
+    async def _go() -> None:
+        old_handle = {
+            "chat_type": "group",
+            "group_id": "4507088",
+            "base_msg_id": "M1",
+            "msgid2": "300014580",
+            "from_uid": "bob",
+            "emoji_code": "d135",
+            "emoji_desc": "(qjp)",
+        }
+        new_handle = {
+            **old_handle,
+            "base_msg_id": "M2",
+        }
+        old_token = await adapter._bot._start_reaction_run(old_handle)
+        assert old_token is not None
+        await _settle_reaction_tasks()
+        new_token = await adapter._bot._start_reaction_run(new_handle)
+        assert new_token is not None
+        await _settle_reaction_tasks()
+
+        source = adapter.build_source(
+            chat_id="group:4507088",
+            chat_name="group:4507088",
+            chat_type="group",
+            user_id="bob",
+            user_name="bob",
+            message_id="M2",
+        )
+        event = MessageEvent(
+            text="new",
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message={"trigger_reason": "bot-mentioned"},
+            message_id="M2",
+        )
+
+        outer_tokens = (
+            _inbound_mid.set("M1"),
+            _send_path_cv.set("followUp"),
+            _recall_hint.set("M1"),
+            _reaction_promise_cv.set(old_token),
+        )
+        try:
+            bound_tokens = adapter._bind_processing_context(event)
+            try:
+                assert _inbound_mid.get("") == "M2"
+                assert _send_path_cv.get("") == "bot-mentioned"
+                assert _recall_hint.get(None) == "M2"
+                assert _reaction_promise_cv.get(None) is new_token
+            finally:
+                adapter._reset_processing_context(bound_tokens)
+
+            assert _inbound_mid.get("") == "M1"
+            assert _send_path_cv.get("") == "followUp"
+            assert _recall_hint.get(None) == "M1"
+            assert _reaction_promise_cv.get(None) is old_token
+
+            event_without_reaction = MessageEvent(
+                text="newer",
+                message_type=MessageType.TEXT,
+                source=adapter.build_source(
+                    chat_id="group:4507088",
+                    chat_name="group:4507088",
+                    chat_type="group",
+                    user_id="bob",
+                    user_name="bob",
+                    message_id="M3",
+                ),
+                raw_message={"trigger_reason": "watchRegex#1"},
+                message_id="M3",
+            )
+            bound_tokens = adapter._bind_processing_context(event_without_reaction)
+            try:
+                assert _inbound_mid.get("") == "M3"
+                assert _send_path_cv.get("") == "watchRegex#1"
+                assert _recall_hint.get(None) == "M3"
+                assert _reaction_promise_cv.get(None) is None
+            finally:
+                adapter._reset_processing_context(bound_tokens)
+        finally:
+            for token in reversed(outer_tokens):
+                token.var.reset(token)
+
+    asyncio.run(_go())
 
 
 def test_handle_webhook_returns_echostr_synchronously(configured_env) -> None:

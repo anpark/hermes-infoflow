@@ -216,6 +216,7 @@ class Bot:
         self._admin_uid = admin_uid.strip().lower()
         self._robot_id: str = str(settings.get("robot_id") or "")
         self._reaction_cleanup_tasks: set[asyncio.Task[Any]] = set()
+        self._reaction_cleanup_tasks_by_run: dict[str, asyncio.Task[Any]] = {}
         self._reactions = ReactionController(
             add_reaction=self._try_add_reaction,
             delete_reaction=self._try_delete_reaction,
@@ -667,6 +668,23 @@ class Bot:
         """Start a session thinking indicator for this inbound run."""
         return await self._reactions.start(handle)
 
+    def reaction_token_for_context(
+        self,
+        *,
+        group_id: str | None,
+        dm_user_id: str | None = None,
+        reaction_message_id: str | None = None,
+    ) -> ReactionRunToken | None:
+        """Return the current processing-reaction token for this inbound event."""
+        target_scope = self._reaction_scope_for_target(
+            group_id=group_id,
+            dm_user_id=dm_user_id,
+        )
+        return self._reactions.token_by_anchor(
+            reaction_message_id,
+            expected_scope=target_scope,
+        )
+
     async def _cleanup_reaction_after_timeout(self, token: ReactionRunToken) -> None:
         try:
             await asyncio.sleep(_REACTION_FALLBACK_CLEANUP_SECONDS)
@@ -677,9 +695,55 @@ class Bot:
             gw_log().exception("[iflow:reaction] fallback cleanup failed")
 
     def _schedule_reaction_fallback_cleanup(self, token: ReactionRunToken) -> None:
+        existing = self._reaction_cleanup_tasks_by_run.get(token.run_id)
+        if existing is not None and not existing.done():
+            return
+        if existing is not None:
+            self._reaction_cleanup_tasks.discard(existing)
+            self._reaction_cleanup_tasks_by_run.pop(token.run_id, None)
+
         task = asyncio.create_task(self._cleanup_reaction_after_timeout(token))
         self._reaction_cleanup_tasks.add(task)
-        task.add_done_callback(self._reaction_cleanup_tasks.discard)
+        self._reaction_cleanup_tasks_by_run[token.run_id] = task
+        task.add_done_callback(
+            lambda done, run_id=token.run_id: self._discard_reaction_cleanup_task(
+                run_id,
+                done,
+            )
+        )
+
+    def _discard_reaction_cleanup_task(
+        self,
+        run_id: str,
+        task: asyncio.Task[Any],
+    ) -> None:
+        self._reaction_cleanup_tasks.discard(task)
+        if self._reaction_cleanup_tasks_by_run.get(run_id) is task:
+            self._reaction_cleanup_tasks_by_run.pop(run_id, None)
+
+    def _cancel_reaction_fallback_cleanup(
+        self,
+        token: ReactionRunToken | None,
+    ) -> None:
+        if token is None:
+            return
+        task = self._reaction_cleanup_tasks_by_run.pop(token.run_id, None)
+        if task is None:
+            return
+        self._reaction_cleanup_tasks.discard(task)
+        if not task.done():
+            task.cancel()
+
+    async def _finish_reaction_token(
+        self,
+        token: ReactionRunToken | None,
+        *,
+        reason: str,
+    ) -> bool:
+        finished = await self._reactions.finish(token, reason=reason)
+        if finished:
+            self._cancel_reaction_fallback_cleanup(token)
+        return finished
 
     async def _finish_reaction_for_send_target(
         self,
@@ -696,15 +760,37 @@ class Bot:
         )
         if token is not None:
             if not target_scope or token.scope_key == target_scope:
-                await self._reactions.finish(token, reason=reason)
-            return
+                await self._finish_reaction_token(token, reason=reason)
+                # Hermes may queue a newer event while the old background task is
+                # still unwinding. The queued task can inherit the old contextvar,
+                # so fall through to the message anchor when that token was stale.
+                if not token.stale or not reaction_message_id:
+                    return
+            elif not reaction_message_id:
+                return
         if reaction_message_id:
-            await self._reactions.finish_by_anchor(
+            anchor_token = self._reactions.token_by_anchor(
                 reaction_message_id,
                 expected_scope=target_scope,
-                reason=reason,
             )
+            await self._finish_reaction_token(anchor_token, reason=reason)
             return
+
+    async def finish_processing_reaction(
+        self,
+        *,
+        group_id: str | None,
+        dm_user_id: str | None = None,
+        reaction_message_id: str | None = None,
+        reason: str,
+    ) -> None:
+        """Finish the processing indicator when the Hermes run actually ends."""
+        await self._finish_reaction_for_send_target(
+            group_id=group_id,
+            dm_user_id=dm_user_id,
+            reaction_message_id=reaction_message_id,
+            reason=reason,
+        )
 
     # -- dispatch orchestration ---------------------------------------------
 
@@ -717,8 +803,9 @@ class Bot:
         """Build event and dispatch to agent via adapter."""
         # Propagate mid via contextvar so send() can trace it
         from .adapter import _inbound_mid
-        _inbound_mid.set(msg.message_id or "")
-        _send_path_cv.set(decision.trigger_reason or "")
+
+        inbound_mid_token = _inbound_mid.set(msg.message_id or "")
+        send_path_token = _send_path_cv.set(decision.trigger_reason or "")
         hint = msg.message_id or None
 
         reaction_cv_token = None
@@ -729,30 +816,31 @@ class Bot:
             if reaction_run is not None:
                 reaction_cv_token = _reaction_promise_cv.set(reaction_run)
 
-        dispatch_completed = False
         try:
             with recall_inbound_message_id_hint_scope(hint):
                 event = await adapter.build_message_event(msg, decision)
                 await adapter.handle_message(event)
-                dispatch_completed = True
         except asyncio.CancelledError:
-            await self._reactions.finish(reaction_run, reason="dispatch_cancelled")
+            await self._finish_reaction_token(
+                reaction_run,
+                reason="dispatch_cancelled",
+            )
             raise
         except Exception:
             gw_log().exception("[infoflow] inbound dispatch failed")
-            await self._reactions.finish(reaction_run, reason="dispatch_error")
+            await self._finish_reaction_token(
+                reaction_run,
+                reason="dispatch_error",
+            )
         finally:
             if reaction_run is not None and not reaction_run.finished:
-                if dispatch_completed:
-                    await self._reactions.finish(
-                        reaction_run,
-                        reason="dispatch_complete",
-                    )
-                else:
-                    self._schedule_reaction_fallback_cleanup(reaction_run)
+                # adapter.handle_message() may only hand the event to Hermes.
+                # The real run can finish later via send()/on_processing_complete().
+                self._schedule_reaction_fallback_cleanup(reaction_run)
             if reaction_cv_token is not None:
                 _reaction_promise_cv.reset(reaction_cv_token)
-            _send_path_cv.set("")
+            _send_path_cv.reset(send_path_token)
+            _inbound_mid.reset(inbound_mid_token)
 
     def spawn_dispatch(
         self,

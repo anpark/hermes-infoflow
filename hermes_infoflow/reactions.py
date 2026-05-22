@@ -76,6 +76,26 @@ class ReactionController:
         with self._lock:
             return self._states.get(scope_key)
 
+    def token_by_anchor(
+        self,
+        anchor_message_id: str | None,
+        *,
+        expected_scope: str = "",
+    ) -> ReactionRunToken | None:
+        """Return the current token anchored to *anchor_message_id*, if any."""
+        if not anchor_message_id:
+            return None
+        anchor = str(anchor_message_id)
+        with self._lock:
+            if expected_scope:
+                state = self._states.get(expected_scope)
+                if state is None or state.anchor_message_id != anchor:
+                    return None
+            else:
+                scope_key = self._anchor_to_scope.get(anchor)
+                state = self._states.get(scope_key or "") if scope_key else None
+            return state.token if state is not None else None
+
     async def start(self, handle: dict[str, Any]) -> ReactionRunToken | None:
         """Start a new thinking run and replace any visible marker in scope."""
         scope_key = self.scope_key_for_handle(handle)

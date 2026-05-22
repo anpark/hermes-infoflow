@@ -796,6 +796,88 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             event.reply_to_text = msg.reply_info.preview or None
         return event
 
+    def _target_from_event(self, event: Any) -> tuple[str | None, str | None]:
+        source = getattr(event, "source", None)
+        chat_id = getattr(source, "chat_id", "") or ""
+        group_id: str | None = None
+        dm_user: str | None = None
+        if chat_id:
+            kind, parsed_group_id, parsed_dm_user = self._parse_target(chat_id)
+            if kind == "group" and parsed_group_id is not None:
+                group_id = str(parsed_group_id)
+            else:
+                dm_user = parsed_dm_user or None
+        return group_id, dm_user
+
+    @staticmethod
+    def _event_message_id(event: Any) -> str:
+        source = getattr(event, "source", None)
+        message_id = (
+            getattr(event, "message_id", None)
+            or getattr(source, "message_id", None)
+            or ""
+        )
+        return str(message_id) if message_id else ""
+
+    @staticmethod
+    def _event_trigger_reason(event: Any) -> str:
+        raw_message = getattr(event, "raw_message", None)
+        if not isinstance(raw_message, dict):
+            return ""
+        return str(raw_message.get("trigger_reason") or "")
+
+    def _bind_processing_context(
+        self,
+        event: Any,
+    ) -> tuple[contextvars.Token[Any], ...]:
+        """Bind Infoflow contextvars to the event Hermes is processing now."""
+        from .bot import _reaction_promise_cv, _recall_hint, _send_path_cv
+
+        message_id = self._event_message_id(event)
+        group_id, dm_user = self._target_from_event(event)
+        reaction_token = self._bot.reaction_token_for_context(
+            group_id=group_id,
+            dm_user_id=dm_user,
+            reaction_message_id=message_id or None,
+        )
+        return (
+            _inbound_mid.set(message_id),
+            _send_path_cv.set(self._event_trigger_reason(event)),
+            _recall_hint.set(message_id or None),
+            _reaction_promise_cv.set(reaction_token),
+        )
+
+    @staticmethod
+    def _reset_processing_context(
+        tokens: tuple[contextvars.Token[Any], ...],
+    ) -> None:
+        for token in reversed(tokens):
+            token.var.reset(token)
+
+    async def _process_message_background(self, event: Any, session_key: str) -> None:
+        """Run one Hermes background task with event-specific Infoflow context."""
+        tokens = self._bind_processing_context(event)
+        try:
+            await super()._process_message_background(event, session_key)
+        finally:
+            self._reset_processing_context(tokens)
+
+    async def on_processing_complete(self, event: Any, outcome: Any) -> None:
+        """Clear the processing reaction after Hermes finishes the real run."""
+        group_id, dm_user = self._target_from_event(event)
+        outcome_label = str(
+            getattr(outcome, "value", None)
+            or getattr(outcome, "name", None)
+            or "complete"
+        ).lower()
+        reaction_message_id = self._event_message_id(event)
+        await self._bot.finish_processing_reaction(
+            group_id=group_id,
+            dm_user_id=dm_user,
+            reaction_message_id=reaction_message_id or None,
+            reason=f"processing_{outcome_label}",
+        )
+
     # ------------------------------------------------------------------
     # Session helpers
     # ------------------------------------------------------------------

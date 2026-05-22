@@ -219,7 +219,7 @@ async def test_dispatch_adds_reaction_and_deletes_on_no_reply_send() -> None:
 
 
 @pytest.mark.asyncio
-async def test_dispatch_finishes_reaction_when_handle_message_returns_without_send() -> None:
+async def test_dispatch_handoff_without_final_send_leaves_reaction_for_fallback() -> None:
     bot = _bot()
     msg = _group_msg()
     decision = PolicyDecision(
@@ -236,13 +236,13 @@ async def test_dispatch_finishes_reaction_when_handle_message_returns_without_se
     await _settle_reaction_tasks(bot)
 
     bot._serverapi.add_message_reaction.assert_awaited_once()
-    bot._serverapi.delete_message_reaction.assert_awaited_once()
-    bot._schedule_reaction_fallback_cleanup.assert_not_called()
-    assert bot._reactions.active_state("group:4507088") is None
+    bot._serverapi.delete_message_reaction.assert_not_awaited()
+    bot._schedule_reaction_fallback_cleanup.assert_called_once()
+    assert bot._reactions.active_state("group:4507088") is not None
 
 
 @pytest.mark.asyncio
-async def test_background_send_after_dispatch_does_not_keep_reaction_open() -> None:
+async def test_dispatch_keeps_reaction_open_until_background_send() -> None:
     bot = _bot()
     msg = _group_msg()
     decision = PolicyDecision(
@@ -268,8 +268,9 @@ async def test_background_send_after_dispatch_does_not_keep_reaction_open() -> N
 
     await bot.dispatch_inbound(msg, decision, adapter)
     await _settle_reaction_tasks(bot)
-    bot._serverapi.delete_message_reaction.assert_awaited_once()
-    bot._schedule_reaction_fallback_cleanup.assert_not_called()
+    bot._serverapi.delete_message_reaction.assert_not_awaited()
+    bot._schedule_reaction_fallback_cleanup.assert_called_once()
+    assert bot._reactions.active_state("group:4507088") is not None
 
     release.set()
     assert background_task is not None
@@ -277,6 +278,141 @@ async def test_background_send_after_dispatch_does_not_keep_reaction_open() -> N
     await _settle_reaction_tasks(bot)
 
     assert bot._serverapi.delete_message_reaction.await_count == 1
+    assert bot._reactions.active_state("group:4507088") is None
+
+
+@pytest.mark.asyncio
+async def test_background_send_cancels_fallback_cleanup_task() -> None:
+    bot = _bot()
+    msg = _group_msg()
+    decision = PolicyDecision(
+        should_dispatch=True,
+        action=Action.DISPATCH,
+        trigger_reason="bot-mentioned",
+    )
+    adapter = MagicMock()
+    adapter.build_message_event = AsyncMock(return_value={"event": True})
+    release = asyncio.Event()
+    background_task: asyncio.Task | None = None
+
+    async def _delayed_send():
+        await release.wait()
+        await bot.send_message(group_id="4507088", text="NO_REPLY")
+
+    async def _handle_message(_event):
+        nonlocal background_task
+        background_task = asyncio.create_task(_delayed_send())
+
+    adapter.handle_message = AsyncMock(side_effect=_handle_message)
+
+    await bot.dispatch_inbound(msg, decision, adapter)
+    await _settle_reaction_tasks(bot)
+
+    state = bot._reactions.active_state("group:4507088")
+    assert state is not None
+    cleanup_task = bot._reaction_cleanup_tasks_by_run[state.token.run_id]
+    assert cleanup_task in bot._reaction_cleanup_tasks
+
+    release.set()
+    assert background_task is not None
+    await background_task
+    await _settle_reaction_tasks(bot)
+    await asyncio.gather(cleanup_task, return_exceptions=True)
+
+    assert cleanup_task.cancelled()
+    assert cleanup_task not in bot._reaction_cleanup_tasks
+    assert state.token.run_id not in bot._reaction_cleanup_tasks_by_run
+    assert bot._reactions.active_state("group:4507088") is None
+
+
+@pytest.mark.asyncio
+async def test_processing_complete_clears_reaction_when_no_message_sent() -> None:
+    bot = _bot()
+    msg = _group_msg()
+    decision = PolicyDecision(
+        should_dispatch=True,
+        action=Action.DISPATCH,
+        trigger_reason="bot-mentioned",
+    )
+    adapter = MagicMock()
+    adapter.build_message_event = AsyncMock(return_value={"event": True})
+    release = asyncio.Event()
+    background_task: asyncio.Task | None = None
+
+    async def _complete_without_send():
+        await release.wait()
+        await bot.finish_processing_reaction(
+            group_id="4507088",
+            reaction_message_id=msg.message_id,
+            reason="processing_success",
+        )
+
+    async def _handle_message(_event):
+        nonlocal background_task
+        background_task = asyncio.create_task(_complete_without_send())
+
+    adapter.handle_message = AsyncMock(side_effect=_handle_message)
+    bot._schedule_reaction_fallback_cleanup = MagicMock()
+
+    await bot.dispatch_inbound(msg, decision, adapter)
+    await _settle_reaction_tasks(bot)
+    bot._serverapi.delete_message_reaction.assert_not_awaited()
+
+    release.set()
+    assert background_task is not None
+    await background_task
+    await _settle_reaction_tasks(bot)
+
+    bot._serverapi.delete_message_reaction.assert_awaited_once()
+    assert bot._reactions.active_state("group:4507088") is None
+
+
+@pytest.mark.asyncio
+async def test_processing_complete_cancels_fallback_cleanup_task() -> None:
+    bot = _bot()
+    msg = _group_msg()
+    decision = PolicyDecision(
+        should_dispatch=True,
+        action=Action.DISPATCH,
+        trigger_reason="bot-mentioned",
+    )
+    adapter = MagicMock()
+    adapter.build_message_event = AsyncMock(return_value={"event": True})
+    release = asyncio.Event()
+    background_task: asyncio.Task | None = None
+
+    async def _complete_without_send():
+        await release.wait()
+        await bot.finish_processing_reaction(
+            group_id="4507088",
+            reaction_message_id=msg.message_id,
+            reason="processing_success",
+        )
+
+    async def _handle_message(_event):
+        nonlocal background_task
+        background_task = asyncio.create_task(_complete_without_send())
+
+    adapter.handle_message = AsyncMock(side_effect=_handle_message)
+
+    await bot.dispatch_inbound(msg, decision, adapter)
+    await _settle_reaction_tasks(bot)
+
+    state = bot._reactions.active_state("group:4507088")
+    assert state is not None
+    cleanup_task = bot._reaction_cleanup_tasks_by_run[state.token.run_id]
+    assert cleanup_task in bot._reaction_cleanup_tasks
+
+    release.set()
+    assert background_task is not None
+    await background_task
+    await _settle_reaction_tasks(bot)
+    await asyncio.gather(cleanup_task, return_exceptions=True)
+
+    assert cleanup_task.cancelled()
+    assert cleanup_task not in bot._reaction_cleanup_tasks
+    assert state.token.run_id not in bot._reaction_cleanup_tasks_by_run
+    assert bot._reactions.active_state("group:4507088") is None
 
 
 @pytest.mark.asyncio
@@ -710,6 +846,52 @@ async def test_anchor_finish_with_expected_scope_handles_duplicate_anchor_ids() 
 
 
 @pytest.mark.asyncio
+async def test_reaction_token_lookup_uses_anchor_and_scope() -> None:
+    bot = _bot()
+    handle_a = {
+        "chat_type": "group",
+        "group_id": "4507088",
+        "base_msg_id": "M2",
+        "msgid2": "300014580",
+        "from_uid": "bob",
+        "emoji_code": "d135",
+        "emoji_desc": "(qjp)",
+    }
+    handle_b = {
+        **handle_a,
+        "group_id": "9999",
+        "msgid2": "300014581",
+    }
+
+    token_a = await bot._start_reaction_run(handle_a)
+    token_b = await bot._start_reaction_run(handle_b)
+    assert token_a is not None
+    assert token_b is not None
+
+    assert (
+        bot.reaction_token_for_context(
+            group_id="4507088",
+            reaction_message_id="M2",
+        )
+        is token_a
+    )
+    assert (
+        bot.reaction_token_for_context(
+            group_id="9999",
+            reaction_message_id="M2",
+        )
+        is token_b
+    )
+    assert (
+        bot.reaction_token_for_context(
+            group_id="4507088",
+            reaction_message_id="other",
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
 async def test_group_send_without_owner_does_not_clear_active_reaction() -> None:
     bot = _bot()
     handle = {
@@ -770,6 +952,56 @@ async def test_superseded_group_context_does_not_clear_newer_active_reaction() -
     assert bot._reactions.active_state("group:4507088") is not None
     assert bot._reactions.active_state("group:4507088").token is new_token
     assert new_token.finished is False
+
+
+@pytest.mark.asyncio
+async def test_stale_contextvar_falls_back_to_current_message_anchor() -> None:
+    bot = _bot()
+    old_handle = {
+        "chat_type": "group",
+        "group_id": "4507088",
+        "base_msg_id": "M1",
+        "msgid2": "300014580",
+        "from_uid": "bob",
+        "emoji_code": "d135",
+        "emoji_desc": "(qjp)",
+    }
+    new_handle = {
+        **old_handle,
+        "base_msg_id": "M2",
+    }
+    old_token = await bot._start_reaction_run(old_handle)
+    assert old_token is not None
+    await _settle_reaction_tasks(bot)
+    new_token = await bot._start_reaction_run(new_handle)
+    assert new_token is not None
+    await _settle_reaction_tasks(bot)
+    bot._schedule_reaction_fallback_cleanup(new_token)
+    cleanup_task = bot._reaction_cleanup_tasks_by_run[new_token.run_id]
+    bot._serverapi.delete_message_reaction.reset_mock()
+
+    token = _reaction_promise_cv.set(old_token)
+    try:
+        await bot.send_message(
+            group_id="4507088",
+            text="NO_REPLY",
+            reaction_message_id="M2",
+        )
+    finally:
+        _reaction_promise_cv.reset(token)
+    await _settle_reaction_tasks(bot)
+    await asyncio.gather(cleanup_task, return_exceptions=True)
+
+    bot._serverapi.delete_message_reaction.assert_awaited_once()
+    assert (
+        bot._serverapi.delete_message_reaction.await_args.kwargs["base_msg_id"]
+        == "M2"
+    )
+    assert cleanup_task.cancelled()
+    assert cleanup_task not in bot._reaction_cleanup_tasks
+    assert new_token.run_id not in bot._reaction_cleanup_tasks_by_run
+    assert new_token.finished is True
+    assert bot._reactions.active_state("group:4507088") is None
 
 
 # ---------------------------------------------------------------------------
