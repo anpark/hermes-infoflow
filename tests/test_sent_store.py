@@ -9,20 +9,24 @@ from hermes_infoflow.sent_store import (
 )
 
 
-def test_record_populates_shared_dedup_set() -> None:
-    """``record`` and inbound dedup MUST share one ``set`` instance."""
+def test_record_populates_shared_dedup_and_sent_sets() -> None:
+    """``record`` marks outbound ids for dedup and reply-to-self detection."""
     shared: set[str] = set()
-    store = SentMessageStore(dedup_set=shared)
+    sent: set[str] = set()
+    store = SentMessageStore(dedup_set=shared, sent_message_ids=sent)
     store.record("group:1", "mid-1")
     assert "mid-1" in shared
+    assert "mid-1" in sent
     assert store.is_duplicate("mid-1") is True
 
 
-def test_mark_seen_marks_foreign_id() -> None:
+def test_mark_seen_marks_foreign_id_without_sent_membership() -> None:
     shared: set[str] = set()
-    store = SentMessageStore(dedup_set=shared)
+    sent: set[str] = set()
+    store = SentMessageStore(dedup_set=shared, sent_message_ids=sent)
     store.mark_seen("inbound-42")
     assert "inbound-42" in shared
+    assert "inbound-42" not in sent
 
 
 def test_recent_returns_newest_first() -> None:
@@ -42,13 +46,17 @@ def test_recent_count_zero_returns_empty() -> None:
 
 def test_ttl_expiry_evicts_old_dedup_entries() -> None:
     shared: set[str] = set()
-    store = SentMessageStore(dedup_set=shared, ttl_seconds=10)
+    sent: set[str] = set()
+    store = SentMessageStore(dedup_set=shared, sent_message_ids=sent, ttl_seconds=10)
     store.record("g", "m1", now=1_000.0)
     assert "m1" in shared
+    assert "m1" in sent
     # Advance well past TTL.
     store.mark_seen("m2", now=1_100.0)
     assert "m1" not in shared
+    assert "m1" not in sent
     assert "m2" in shared
+    assert "m2" not in sent
 
 
 def test_find_returns_matching_entry() -> None:
@@ -68,12 +76,14 @@ def test_find_returns_matching_entry() -> None:
 
 def test_dedup_set_respects_max_size_cap() -> None:
     shared: set[str] = set()
-    store = SentMessageStore(dedup_set=shared, max_dedup_entries=3)
+    sent: set[str] = set()
+    store = SentMessageStore(dedup_set=shared, sent_message_ids=sent, max_dedup_entries=3)
     for i in range(10):
         store.record("g", f"m{i}", now=1_000.0 + i)
     # Only the most recent 3 must remain in the dedup set.
     assert len(shared) == 3
     assert shared == {"m7", "m8", "m9"}
+    assert sent == {"m7", "m8", "m9"}
 
 
 # ---------------------------------------------------------------------------

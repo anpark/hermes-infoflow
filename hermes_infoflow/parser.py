@@ -92,7 +92,8 @@ class BodyItem:
     downloadurl: str = ""
     messageid: str = ""  # for replyData items, the quoted message id (str)
     preview: str = ""    # for replyData items
-    is_bot_message: bool = False  # replyData target sent by us?
+    sender_imid: str = ""  # for replyData items, quoted sender's Infoflow imid
+    is_bot_message: bool = False  # platform says replyData target is a bot
 
 
 @dataclass
@@ -284,6 +285,12 @@ def _coerce_body_item(raw: dict[str, Any]) -> BodyItem:
         downloadurl=_stringify(raw.get("downloadurl")),
         messageid=_stringify(raw.get("messageid") or raw.get("sBasemsgId")),
         preview=_stringify(raw.get("preview")),
+        sender_imid=_stringify(
+            raw.get("imid")
+            or raw.get("imId")
+            or raw.get("sender_imid")
+            or raw.get("senderImid")
+        ),
         is_bot_message=bool(raw.get("isBotMessage") or raw.get("is_bot_message")),
     )
 
@@ -351,26 +358,34 @@ def _extract_reply_targets(
     body_items: list[BodyItem],
     *,
     sent_message_ids: set[str] | None = None,
+    bot_robot_id: str = "",
 ) -> tuple[list[dict[str, Any]], bool]:
     """Return ``(targets, is_reply_to_bot)`` extracted from replyData items."""
     targets: list[dict[str, Any]] = []
     is_reply_to_bot = False
+    current_bot_imid = (bot_robot_id or "").strip()
     for item in body_items:
         if item.type not in ("replyData", "REPLYDATA", "reply"):
             continue
         if not item.messageid:
             continue
-        is_bot = item.is_bot_message
-        if not is_bot and sent_message_ids is not None:
-            is_bot = item.messageid in sent_message_ids
+        reply_sender_imid = (item.sender_imid or "").strip()
+        if reply_sender_imid and current_bot_imid:
+            is_current_bot = reply_sender_imid == current_bot_imid
+        elif sent_message_ids is not None:
+            is_current_bot = item.messageid in sent_message_ids
+        else:
+            is_current_bot = False
         targets.append(
             {
                 "messageid": item.messageid,
                 "preview": item.preview or item.content,
-                "isBotMessage": is_bot,
+                "isBotMessage": is_current_bot,
+                "platformIsBotMessage": item.is_bot_message,
+                "sender_imid": item.sender_imid,
             }
         )
-        if is_bot:
+        if is_current_bot:
             is_reply_to_bot = True
     return targets, is_reply_to_bot
 
@@ -643,6 +658,7 @@ def build_group_inbound(
     reply_targets, is_reply_to_bot = _extract_reply_targets(
         body_items,
         sent_message_ids=sent_message_ids,
+        bot_robot_id=account.robot_id,
     )
 
     if not raw_text.strip() and not image_urls and not reply_targets and not body_for_agent:

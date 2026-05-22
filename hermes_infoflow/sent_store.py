@@ -1,14 +1,18 @@
 """Recent-outbound-message tracking + self-reflection dedup.
 
-Two responsibilities that *must* share one underlying set:
+Two responsibilities use related but separate membership sets:
 
-1. **Self-reflection guard** — Infoflow occasionally replays bot-sent
-   messages back to the webhook (e.g. ``MESSAGE_RECEIVE`` events or the
-   ``ALL_MESSAGE_FORWARD`` mirror). Recording every outbound ``message_id``
-   we send into the same dedup set inbound webhooks consult lets us drop
-   them as duplicates and avoid an infinite reply loop.
+1. **Self-reflection / replay guard** — Infoflow occasionally replays
+   webhook messages. ``dedup_set`` contains both inbound messages we've
+   already handled and outbound messages we sent, so repeated webhooks and
+   bot echoes are dropped as duplicates.
 
-2. **By-count / by-id recall** — ``infoflow_recall_message count=N``
+2. **Reply-to-self detection** — ``sent_message_ids`` contains only
+   message IDs returned by successful outbound sends. Parsers use it to
+   decide whether a quote/reply targets this bot; inbound ``mark_seen``
+   calls must not populate it.
+
+3. **By-count / by-id recall** — ``infoflow_recall_message count=N``
    looks up the N most recently sent messages on a chat to recall.
    ``message_id`` queries verify the LLM passed a valid bot-sent id.
 
@@ -70,6 +74,10 @@ class SentMessageStore:
     consults. Pass the same set in to both this store and the adapter so
     self-reflection (bot reading its own message back) drops as a dup.
 
+    ``sent_message_ids`` is a narrower shared set containing only messages
+    this bot successfully sent. The parser uses it for reply-to-self
+    detection; inbound ``mark_seen`` calls intentionally do not add to it.
+
     Bounded by two limits: ``ttl_seconds`` (lazy-swept on every mutation)
     and ``max_dedup_entries`` (hard ceiling — when exceeded, oldest entries
     are evicted in insertion order via the parallel ``_expiry`` mapping).
@@ -81,6 +89,7 @@ class SentMessageStore:
     """
 
     dedup_set: set[str] = field(default_factory=set)
+    sent_message_ids: set[str] = field(default_factory=set)
     ttl_seconds: float = DEFAULT_TTL_SECONDS
     per_chat_limit: int = DEFAULT_PER_CHAT_LIMIT
     max_dedup_entries: int = DEFAULT_MAX_DEDUP_ENTRIES
@@ -90,7 +99,8 @@ class SentMessageStore:
 
     _entries: dict[str, deque[SentMessage]] = field(default_factory=dict)
     # Insertion-ordered expiry map: messageid -> expiry_ts (s). Using
-    # OrderedDict lets us prune both by TTL and by size in O(1) per drop.
+    # OrderedDict lets us prune both dedup and sent-message membership by TTL
+    # and by size in O(1) per drop.
     _expiry: OrderedDict[str, float] = field(default_factory=OrderedDict)
     _db_initialized: bool = False
     _db_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -108,7 +118,10 @@ class SentMessageStore:
         digest: str = "",
         now: float | None = None,
     ) -> SentMessage:
-        """Add an outbound message; also marks ``messageid`` as seen-for-dedup."""
+        """Add an outbound message.
+
+        Outbound IDs are both dedup entries and reply-to-self candidates.
+        """
         ts = now if now is not None else time.time()
         self._sweep(ts)
         entry = SentMessage(
@@ -122,6 +135,7 @@ class SentMessageStore:
         buf.append(entry)
         if messageid:
             self.dedup_set.add(messageid)
+            self.sent_message_ids.add(messageid)
             # Drop any prior expiry mapping so it re-inserts at the tail (FIFO).
             self._expiry.pop(messageid, None)
             self._expiry[messageid] = ts + self.ttl_seconds
@@ -215,6 +229,7 @@ class SentMessageStore:
             kept = deque((e for e in buf if e.messageid != messageid), maxlen=self.per_chat_limit)
             self._entries[chat_id] = kept
         self.dedup_set.discard(messageid)
+        self.sent_message_ids.discard(messageid)
         self._expiry.pop(messageid, None)
         self._db_delete(chat_id, messageid)
 
@@ -237,6 +252,7 @@ class SentMessageStore:
                 break
         for mid in to_drop:
             self.dedup_set.discard(mid)
+            self.sent_message_ids.discard(mid)
             self._expiry.pop(mid, None)
 
     def _enforce_max_size(self) -> None:
@@ -246,6 +262,7 @@ class SentMessageStore:
         while len(self._expiry) > self.max_dedup_entries:
             mid, _ = self._expiry.popitem(last=False)
             self.dedup_set.discard(mid)
+            self.sent_message_ids.discard(mid)
 
     # ----- SQLite backing -----
 

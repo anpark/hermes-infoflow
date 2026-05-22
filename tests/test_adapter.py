@@ -177,8 +177,9 @@ def test_outbound_send_records_dedup_id(configured_env, monkeypatch) -> None:
     result = asyncio.run(_go())
     assert result.success is True
     assert result.message_id == "MSG-1"
-    # Stored AND inserted into the shared dedup set.
+    # Stored, inserted into replay dedup, and tracked as bot-sent for reply parsing.
     assert "MSG-1" in adapter._dedup_set
+    assert "MSG-1" in adapter._sent_message_ids
     assert adapter._sent_store.find("alice", "MSG-1") is not None
 
 

@@ -49,7 +49,7 @@ def parse_webhook_request(
     content_type: str,
     raw_body: str,
     parser_account: object,
-    dedup_set: set[str] | None = None,
+    sent_message_ids: set[str] | None = None,
 ) -> WebhookResult:
     """Parse an inbound HTTP webhook request.
 
@@ -64,9 +64,9 @@ def parse_webhook_request(
         A ``parser.AccountConfig``-like object with ``check_token``,
         ``encoding_aes_key``, ``robot_name``, ``app_agent_id``, and
         ``robot_id`` fields.
-    dedup_set:
-        Shared dedup set consulted by the parser to filter bot-echo
-        messages.
+    sent_message_ids:
+        Shared set containing only message IDs successfully sent by this bot.
+        The parser uses it as a fallback for reply-to-self detection.
 
     Returns
     -------
@@ -80,7 +80,7 @@ def parse_webhook_request(
         content_type=content_type,
         raw_body=raw_body,
         account=parser_account,  # type: ignore[arg-type]
-        sent_message_ids=dedup_set,
+        sent_message_ids=sent_message_ids,
     )
 
     if parsed.kind == "echostr_ok":
@@ -123,7 +123,7 @@ class WebhookServer:
         self,
         *,
         serverapi: ServerAPI,
-        dedup_set: set[str],
+        sent_message_ids: set[str],
         webhook_path: str,
         host: str,
         port: int,
@@ -133,7 +133,7 @@ class WebhookServer:
         tracker: SessionTracker | None = None,
     ) -> None:
         self._serverapi = serverapi
-        self._dedup_set = dedup_set
+        self._sent_message_ids = sent_message_ids
         self._tracker = tracker
         self._webhook_path = webhook_path
         self._host = host
@@ -230,7 +230,7 @@ class WebhookServer:
             content_type=content_type,
             raw_body=raw_body,
             parser_account=self._serverapi.parser_account,
-            dedup_set=self._dedup_set,
+            sent_message_ids=self._sent_message_ids,
         )
 
         # 4. Non-message responses (echostr, error, ignored)

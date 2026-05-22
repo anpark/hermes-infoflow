@@ -253,8 +253,10 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
 
         # ── Dedup set + stores ────────────────────────────────────────
         self._dedup_set: set[str] = set()
+        self._sent_message_ids: set[str] = set()
         self._sent_store = SentMessageStore(
             dedup_set=self._dedup_set,
+            sent_message_ids=self._sent_message_ids,
             account_id=self._settings.get("app_key") or "default",
         )
         self._message_store = MessageStore(
@@ -293,7 +295,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         # ── HTTP webhook server (delegated to webhook.py) ──────────
         self._webhook_server = WebhookServer(
             serverapi=self._serverapi,
-            dedup_set=self._dedup_set,
+            sent_message_ids=self._sent_message_ids,
             webhook_path=self._webhook_path,
             host=self._host,
             port=self._port,

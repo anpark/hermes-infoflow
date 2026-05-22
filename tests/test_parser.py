@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import os
 from urllib.parse import urlencode
@@ -9,6 +10,7 @@ from urllib.parse import urlencode
 import pytest
 
 from hermes_infoflow import crypto, parser
+from hermes_infoflow.sent_store import SentMessageStore
 from tests._aes_helpers import aes_ecb_encrypt_b64url, aes_key_b64url
 
 
@@ -251,6 +253,98 @@ def test_group_message_reply_to_bot_marked_when_in_sent_set(account):
     assert res.kind == "message"
     assert res.inbound.is_reply_to_bot is True
     assert res.inbound.reply_targets[0]["messageid"] == "77777777777777777"
+
+
+def test_group_message_reply_to_seen_inbound_is_not_reply_to_bot(account):
+    acct, raw_key = account
+    store = SentMessageStore()
+    store.mark_seen("77777777777777777")
+    payload = {
+        "message": {
+            "header": {"fromuserid": "carol", "groupid": 999, "messageid": 1},
+            "body": [
+                {
+                    "type": "replyData",
+                    "messageid": "77777777777777777",
+                    "preview": "earlier human message",
+                },
+                {"type": "TEXT", "content": "thanks!"},
+            ],
+        }
+    }
+    ct = aes_ecb_encrypt_b64url(json.dumps(payload), raw_key)
+    res = parser.parse_webhook(
+        content_type="text/plain",
+        raw_body=ct,
+        account=acct,
+        sent_message_ids=store.sent_message_ids,
+    )
+    assert res.kind == "message"
+    assert res.inbound.is_reply_to_bot is False
+    assert res.inbound.reply_targets[0]["isBotMessage"] is False
+
+
+def test_group_message_reply_to_other_bot_is_not_reply_to_current_bot(account):
+    acct, raw_key = account
+    acct = replace(acct, robot_id="BOT-IMID")
+    payload = {
+        "message": {
+            "header": {"fromuserid": "carol", "groupid": 999, "messageid": 1},
+            "body": [
+                {
+                    "type": "replyData",
+                    "messageid": "OTHER-BOT-MSG",
+                    "preview": "other bot reply",
+                    "isBotMessage": True,
+                    "imid": "OTHER-BOT-IMID",
+                },
+                {"type": "TEXT", "content": "no need to answer"},
+            ],
+        }
+    }
+    ct = aes_ecb_encrypt_b64url(json.dumps(payload), raw_key)
+    res = parser.parse_webhook(
+        content_type="text/plain",
+        raw_body=ct,
+        account=acct,
+        sent_message_ids=set(),
+    )
+    assert res.kind == "message"
+    assert res.inbound.is_reply_to_bot is False
+    target = res.inbound.reply_targets[0]
+    assert target["isBotMessage"] is False
+    assert target["platformIsBotMessage"] is True
+    assert target["sender_imid"] == "OTHER-BOT-IMID"
+
+
+def test_group_message_reply_to_current_bot_marked_by_reply_imid(account):
+    acct, raw_key = account
+    acct = replace(acct, robot_id="BOT-IMID")
+    payload = {
+        "message": {
+            "header": {"fromuserid": "carol", "groupid": 999, "messageid": 1},
+            "body": [
+                {
+                    "type": "replyData",
+                    "messageid": "BOT-MSG",
+                    "preview": "our bot reply",
+                    "isBotMessage": True,
+                    "imid": "BOT-IMID",
+                },
+                {"type": "TEXT", "content": "answer this"},
+            ],
+        }
+    }
+    ct = aes_ecb_encrypt_b64url(json.dumps(payload), raw_key)
+    res = parser.parse_webhook(
+        content_type="text/plain",
+        raw_body=ct,
+        account=acct,
+        sent_message_ids=set(),
+    )
+    assert res.kind == "message"
+    assert res.inbound.is_reply_to_bot is True
+    assert res.inbound.reply_targets[0]["isBotMessage"] is True
 
 
 def test_unsupported_content_type(account):
