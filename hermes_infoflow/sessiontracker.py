@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import re
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -14,6 +16,14 @@ from .api import InfoflowAccountAPI, InfoflowAPIError, get_user_info_by_code
 from .dashboard import SessionEvent, SessionTracker, normalize_chat_id, sessiontracker_enabled
 
 logger = logging.getLogger(__name__)
+
+# Headers for nginx (and other reverse proxies) to stream SSE without buffering.
+_SSE_RESPONSE_HEADERS = {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+}
 
 TERMINAL_EVENT_KINDS = frozenset({
     "display.tool_line",
@@ -28,6 +38,69 @@ TERMINAL_EVENT_KINDS = frozenset({
 })
 
 _PROGRESS_LINE_RE = re.compile(r"^[┊\s]*[🔍⚙️💻🌐📁📝🧠✨]")
+
+# OAuth code is one-time; cache successful code -> user_id for resolve polling / SSE.
+_CODE_USER_CACHE_TTL_SECONDS = int(os.getenv("HERMES_INFOFLOW_CODE_CACHE_TTL", "86400"))
+_CODE_USER_CACHE_MAX = int(os.getenv("HERMES_INFOFLOW_CODE_CACHE_MAX", "1024"))
+_code_user_cache: dict[str, tuple[str, float]] = {}
+_code_user_cache_lock = asyncio.Lock()
+
+
+def _code_cache_key(code: str, account: InfoflowAccountAPI | None = None) -> str:
+    """Hash OAuth code (and optional account) for in-memory cache lookup."""
+    normalized = code.strip()
+    parts = [normalized]
+    if account is not None:
+        parts.append(account.app_key)
+    digest = hashlib.sha256("|".join(parts).encode()).hexdigest()
+    return digest
+
+
+def _prune_code_user_cache(now: float) -> None:
+    expired = [k for k, (_, exp) in _code_user_cache.items() if exp <= now]
+    for k in expired:
+        del _code_user_cache[k]
+    if len(_code_user_cache) <= _CODE_USER_CACHE_MAX:
+        return
+    by_expiry = sorted(_code_user_cache.items(), key=lambda item: item[1][1])
+    for k, _ in by_expiry[: len(_code_user_cache) - _CODE_USER_CACHE_MAX]:
+        del _code_user_cache[k]
+
+
+async def resolve_user_id_by_code_cached(
+    account: InfoflowAccountAPI,
+    code: str,
+    *,
+    http_session: Any = None,
+) -> str:
+    """Resolve OAuth code to uuap, caching successful lookups in-process."""
+    stripped = code.strip()
+    if not stripped:
+        raise ValueError("code is required for chatType=7")
+
+    cache_key = _code_cache_key(stripped, account)
+    now = time.monotonic()
+
+    async with _code_user_cache_lock:
+        entry = _code_user_cache.get(cache_key)
+        if entry is not None:
+            user_id, expires_at = entry
+            if expires_at > now:
+                return user_id
+            del _code_user_cache[cache_key]
+
+    user_id = await get_user_info_by_code(
+        account, stripped, session=http_session,
+    )
+
+    async with _code_user_cache_lock:
+        _code_user_cache[cache_key] = (
+            user_id,
+            now + _CODE_USER_CACHE_TTL_SECONDS,
+        )
+        _prune_code_user_cache(now)
+
+    return user_id
 
 
 def format_terminal_line(event: SessionEvent) -> dict[str, Any] | None:
@@ -68,13 +141,24 @@ def format_terminal_line(event: SessionEvent) -> dict[str, Any] | None:
 
 def count_terminal_lines(tracker: SessionTracker, session_id: str) -> int:
     """Count events that render as terminal lines (for session pick ranking)."""
-    n = 0
-    for ev in tracker.snapshot(session_id, cursor=0):
+    return len(collect_terminal_blocks(tracker, session_id, cursor=0))
+
+
+def collect_terminal_blocks(
+    tracker: SessionTracker,
+    session_id: str,
+    *,
+    cursor: int = 0,
+) -> list[dict[str, Any]]:
+    """Build renderable terminal blocks for a session snapshot."""
+    blocks: list[dict[str, Any]] = []
+    for ev in tracker.snapshot(session_id, cursor=cursor):
         if ev.kind not in TERMINAL_EVENT_KINDS:
             continue
-        if event_to_terminal_dict(ev) is not None:
-            n += 1
-    return n
+        block = event_to_terminal_dict(ev)
+        if block is not None:
+            blocks.append(block)
+    return blocks
 
 
 def event_to_terminal_dict(event: SessionEvent) -> dict[str, Any] | None:
@@ -110,8 +194,8 @@ async def resolve_target(
             raise ValueError("code is required for chatType=7")
         if account is None:
             raise ValueError("Infoflow API account is required for chatType=7")
-        user_id = await get_user_info_by_code(
-            account, code.strip(), session=http_session,
+        user_id = await resolve_user_id_by_code_cached(
+            account, code, http_session=http_session,
         )
         canonical = user_id
         label = f"私聊 {user_id}"
@@ -139,6 +223,49 @@ async def resolve_target(
         "user_id": (meta.user_id if meta else "") or "",
         "terminal_lines": terminal_lines,
     }
+
+
+async def canonical_for_stream_access(
+    tracker: SessionTracker,
+    *,
+    session_id: str,
+    chat_type: int,
+    chat_id: str,
+    code: str,
+    account: InfoflowAccountAPI | None = None,
+) -> str:
+    """Resolve DM/group target for stream/history without re-requiring a fresh OAuth code.
+
+    Infoflow ``code`` in the page URL often expires quickly; ``EventSource`` reconnects
+    reuse the same query string. When *session_id* is already known to the tracker,
+    derive the canonical uuap from session metadata instead of calling getuserinfo again.
+    """
+    if chat_type == 2:
+        raw = (chat_id or "").strip()
+        if not raw:
+            raise ValueError("chatId is required for chatType=2")
+        return f"group:{raw}"
+
+    if chat_type != 7:
+        raise ValueError(f"unsupported chatType={chat_type}")
+
+    sid = (session_id or "").strip()
+    if sid and not sid.startswith("pending:"):
+        meta = tracker.get_meta(sid)
+        if meta is not None:
+            uid = normalize_chat_id(meta.user_id or meta.chat_id or "")
+            if uid and not uid.startswith("group:"):
+                return uid
+        for ev in tracker.snapshot(sid, cursor=0):
+            cid = normalize_chat_id((ev.payload or {}).get("chat_id") or "")
+            if cid and not cid.startswith("group:"):
+                return cid
+
+    if not (code or "").strip():
+        raise ValueError("code is required for chatType=7 when session is unknown")
+    if account is None:
+        raise ValueError("Infoflow API account is required for chatType=7")
+    return await resolve_user_id_by_code_cached(account, code)
 
 
 def session_matches_target(
@@ -350,16 +477,24 @@ function connectStream() {
       appendBlock(block);
     } catch (_) {}
   };
-  eventSource.addEventListener('snapshot', (msg) => {
-    try {
-      const data = JSON.parse(msg.data);
-      (data.lines || []).forEach(block => {
-        if (block.seq > lineCursor) lineCursor = block.seq;
-        appendBlock(block);
-      });
-    } catch (_) {}
-  });
   eventSource.onerror = () => { /* browser will retry */ };
+}
+
+async function loadHistory() {
+  if (!sessionId) return;
+  const r = await fetch(
+    apiBase + '/history?session_id=' + encodeURIComponent(sessionId)
+    + '&cursor=' + lineCursor + '&' + params.toString()
+  );
+  if (!r.ok) return;
+  const data = await r.json();
+  const blocks = data.lines || [];
+  if (!blocks.length) return;
+  blocks.forEach(block => {
+    if (block.seq <= lineCursor) return;
+    lineCursor = block.seq;
+    appendBlock(block);
+  });
 }
 
 function updateMetaLine(info) {
@@ -383,7 +518,7 @@ function updateEmptyHint(info) {
   }
 }
 
-function applyResolve(info) {
+async function applyResolve(info) {
   const prev = sessionId;
   document.getElementById('title').textContent = info.label || 'Session Tracker';
   updateMetaLine(info);
@@ -392,15 +527,24 @@ function applyResolve(info) {
     sessionId = '';
     return;
   }
-  if (info.session_id !== prev) {
+  const changed = info.session_id !== prev;
+  if (changed) {
     sessionId = info.session_id;
     lineCursor = 0;
     gotTerminalLines = false;
+    document.getElementById('terminal-wrap').innerHTML =
+      '<p class="empty" id="empty-hint">Loading…</p>';
     connectStream();
+    await loadHistory();
   } else if (!eventSource) {
     sessionId = info.session_id;
     connectStream();
+    await loadHistory();
+  } else {
+    sessionId = info.session_id;
+    if (!gotTerminalLines) await loadHistory();
   }
+  if (!gotTerminalLines) updateEmptyHint(info);
 }
 
 function startResolvePoll(qs) {
@@ -494,8 +638,9 @@ def register_sessiontracker_routes(
             except ValueError as exc:
                 return web.Response(status=500, text=str(exc))
         try:
-            target = await resolve_target(
+            canonical = await canonical_for_stream_access(
                 tracker,
+                session_id=sid,
                 chat_type=chat_type,
                 chat_id=chat_id,
                 code=code,
@@ -506,7 +651,6 @@ def register_sessiontracker_routes(
         except ValueError as exc:
             return web.Response(status=400, text=str(exc))
 
-        canonical = target["canonical_chat_id"]
         if not session_matches_target(tracker, sid, canonical):
             return web.Response(status=403, text="session_id does not match target")
 
@@ -515,30 +659,17 @@ def register_sessiontracker_routes(
         except ValueError as exc:
             return web.Response(status=400, text=str(exc))
 
-        response = web.StreamResponse(
-            status=200,
-            headers={
-                "Content-Type": "text/event-stream",
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-            },
-        )
+        response = web.StreamResponse(status=200, headers=_SSE_RESPONSE_HEADERS)
         await response.prepare(request)
 
-        lines: list[dict[str, Any]] = []
-        for ev in tracker.snapshot(sid, cursor=cursor):
-            if ev.kind not in TERMINAL_EVENT_KINDS:
-                continue
-            block = event_to_terminal_dict(ev)
-            if block:
-                lines.append(block)
-        if lines:
-            snap = json.dumps({"lines": lines}, ensure_ascii=False, default=str)
-            await response.write(f"event: snapshot\ndata: {snap}\n\n".encode())
+        seq_cursor = cursor
+        for block in collect_terminal_blocks(tracker, sid, cursor=cursor):
+            seq_cursor = max(seq_cursor, int(block.get("seq", 0)))
+            payload = json.dumps(block, ensure_ascii=False, default=str)
+            await response.write(f"data: {payload}\n\n".encode())
 
         q = tracker.subscribe(sid)
         try:
-            seq_cursor = cursor
             while True:
                 try:
                     ev = await asyncio.wait_for(q.get(), timeout=25.0)
@@ -561,17 +692,66 @@ def register_sessiontracker_routes(
             tracker.unsubscribe(sid, q)
         return response
 
+    @_require_sessiontracker_params
+    async def api_history(request: Any, **kw: Any) -> Any:
+        from aiohttp import web
+
+        sid = request.rel_url.query.get("session_id", "").strip()
+        if not sid:
+            return web.Response(status=400, text="session_id required")
+        if tracker.get_meta(sid) is None and sid not in tracker._events:  # noqa: SLF001
+            return web.Response(status=404, text="session not found")
+
+        chat_type = kw["chat_type"]
+        chat_id = kw["chat_id"]
+        code = kw["code"]
+        account = None
+        if chat_type == 7:
+            try:
+                account = _read_infoflow_account()
+            except ValueError as exc:
+                return web.Response(status=500, text=str(exc))
+        try:
+            canonical = await canonical_for_stream_access(
+                tracker,
+                session_id=sid,
+                chat_type=chat_type,
+                chat_id=chat_id,
+                code=code,
+                account=account,
+            )
+        except InfoflowAPIError as exc:
+            return web.Response(status=403, text=str(exc))
+        except ValueError as exc:
+            return web.Response(status=400, text=str(exc))
+
+        if not session_matches_target(tracker, sid, canonical):
+            return web.Response(status=403, text="session_id does not match target")
+
+        try:
+            cursor = _parse_cursor(request.rel_url.query.get("cursor", "0"))
+        except ValueError as exc:
+            return web.Response(status=400, text=str(exc))
+
+        return web.json_response({
+            "session_id": sid,
+            "lines": collect_terminal_blocks(tracker, sid, cursor=cursor),
+        })
+
     app.router.add_get(root, page)
     app.router.add_get(f"{root}/api/resolve", api_resolve)
+    app.router.add_get(f"{root}/api/history", api_history)
     app.router.add_get(f"{root}/api/stream", api_stream)
     logger.info("[infoflow] Session Tracker at <host>:<port>%s", root)
 
 
 __all__ = [
     "TERMINAL_EVENT_KINDS",
+    "collect_terminal_blocks",
     "count_terminal_lines",
     "format_terminal_line",
     "event_to_terminal_dict",
+    "canonical_for_stream_access",
     "resolve_target",
     "session_matches_target",
     "register_sessiontracker_routes",

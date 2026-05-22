@@ -208,7 +208,7 @@ https://<your-domain>/webhook/infoflow/sessiontracker?chatType=7&chatId=39500876
 
 - **同一私聊 / 同一群+发送者**：gateway **复用**同一 `session_key`，在 idle 重置或 `/new` 前保持同一 `session_id`。
 - **群聊 Tracker URL** 只带群号时，页面展示该群下 **最近活跃** 的那条 session（顶栏会显示 `user: {uuap}`）；不是把全群多人合并成一条 session。
-- **SSE 订阅**（`/sessiontracker/api/stream`）须携带与打开页面相同的 query（`chatType`、`chatId`、`code`），用于校验 `session_id` 属于该目标。
+- **SSE 订阅**（`/sessiontracker/api/stream`）须携带与打开页面相同的 query（`chatType`、`chatId`、`code`）。私聊 `code` 过期后，stream/history 会改用已绑定 session 的 metadata 校验，无需重新打开如流授权链接。
 
 ### 与 Dashboard 的区别
 

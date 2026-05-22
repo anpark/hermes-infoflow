@@ -174,6 +174,35 @@ def test_pre_llm_call_binds_from_meta_chat_id(tracker: SessionTracker) -> None:
     assert tracker.lookup_session_id("carol") == "sess-carol"
 
 
+def test_lookup_prefers_active_over_ended_with_more_lines(tracker: SessionTracker) -> None:
+    for i in range(10):
+        tracker.push_event(
+            "old-ended",
+            "display.tool_line",
+            {"line": f"line {i}"},
+            platform="infoflow",
+            chat_id="bob",
+        )
+    meta_old = tracker.get_meta("old-ended")
+    assert meta_old is not None
+    meta_old.status = "ended"
+    meta_old.last_event_at = 9999.0
+
+    tracker.push_event(
+        "new-active",
+        "session.start",
+        {},
+        platform="infoflow",
+        chat_id="bob",
+    )
+    meta_new = tracker.get_meta("new-active")
+    assert meta_new is not None
+    meta_new.status = "active"
+    meta_new.last_event_at = 10000.0
+
+    assert tracker.lookup_session_id("bob") == "new-active"
+
+
 def test_lookup_prefers_session_with_terminal_lines(tracker: SessionTracker) -> None:
     tracker.push_event(
         "empty-ended",

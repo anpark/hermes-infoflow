@@ -284,8 +284,8 @@ class SessionTracker:
         """Resolve the best tracker session for a canonical chat target.
 
         Hermes reuses the same ``session_key`` but may rotate ``session_id``
-        after idle reset or ``/new``. Rank by visible terminal lines, then
-        active status, then recency — not a stale ended empty session.
+        after idle reset or ``/new``. Prefer **active** sessions (live agent
+        run) over ended ones that merely have more historical lines.
         """
         from .sessiontracker import count_terminal_lines
 
@@ -294,7 +294,7 @@ class SessionTracker:
             return None
 
         best_sid: str | None = None
-        best_rank = (-1, -1, 0.0)  # (terminal_lines, active, last_event_at)
+        best_rank: tuple[int, float, int] = (-1, 0.0, -1)
         for sid, meta in self._meta.items():
             if sid.startswith("pending:"):
                 continue
@@ -302,11 +302,10 @@ class SessionTracker:
                 if not self._session_payload_matches(sid, canonical):
                     continue
             n_lines = count_terminal_lines(self, sid)
-            rank = (
-                n_lines,
-                1 if meta.status == "active" else 0,
-                meta.last_event_at,
-            )
+            if meta.status == "active":
+                rank = (1, meta.last_event_at, n_lines)
+            else:
+                rank = (0, n_lines, meta.last_event_at)
             if rank > best_rank:
                 best_rank = rank
                 best_sid = sid
@@ -971,14 +970,9 @@ def register_routes(app: Any, tracker: SessionTracker, *, base_path: str) -> Non
             return web.Response(status=404, text="session not found")
 
         cursor = int(request.rel_url.query.get("cursor", "0") or "0")
-        response = web.StreamResponse(
-            status=200,
-            headers={
-                "Content-Type": "text/event-stream",
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-            },
-        )
+        from .sessiontracker import _SSE_RESPONSE_HEADERS
+
+        response = web.StreamResponse(status=200, headers=_SSE_RESPONSE_HEADERS)
         await response.prepare(request)
 
         detail = tracker.session_detail(sid, cursor=cursor)

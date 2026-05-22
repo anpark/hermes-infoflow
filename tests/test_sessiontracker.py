@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from hermes_infoflow.api import InfoflowAccountAPI
+from hermes_infoflow.api import InfoflowAccountAPI, InfoflowAPIError
 from hermes_infoflow.dashboard import (
     SessionEvent,
     SessionTracker,
@@ -16,6 +16,8 @@ from hermes_infoflow.dashboard import (
 )
 from hermes_infoflow.sessiontracker import (
     TERMINAL_EVENT_KINDS,
+    _code_user_cache,
+    canonical_for_stream_access,
     event_to_terminal_dict,
     format_terminal_line,
     register_sessiontracker_routes,
@@ -37,6 +39,13 @@ def account() -> InfoflowAccountAPI:
         app_secret="s",
         app_agent_id=123,
     )
+
+
+@pytest.fixture(autouse=True)
+def _clear_code_user_cache() -> None:
+    _code_user_cache.clear()
+    yield
+    _code_user_cache.clear()
 
 
 def test_normalize_chat_id() -> None:
@@ -104,6 +113,91 @@ async def test_resolve_target_dm_mock_getuserinfo(
     assert info["session_id"] == ""
 
 
+@pytest.mark.asyncio
+async def test_resolve_target_dm_reuses_cached_code(
+    tracker: SessionTracker, account: InfoflowAccountAPI,
+) -> None:
+    with patch(
+        "hermes_infoflow.sessiontracker.get_user_info_by_code",
+        new_callable=AsyncMock,
+        return_value="chengbo05",
+    ) as mock_gu:
+        info1 = await resolve_target(
+            tracker,
+            chat_type=7,
+            chat_id="3950087625",
+            code="abc123",
+            account=account,
+        )
+        info2 = await resolve_target(
+            tracker,
+            chat_type=7,
+            chat_id="3950087625",
+            code="abc123",
+            account=account,
+        )
+    mock_gu.assert_awaited_once()
+    assert info1["canonical_chat_id"] == "chengbo05"
+    assert info2["canonical_chat_id"] == "chengbo05"
+
+
+@pytest.mark.asyncio
+async def test_resolve_target_dm_different_code_calls_api_again(
+    tracker: SessionTracker, account: InfoflowAccountAPI,
+) -> None:
+    with patch(
+        "hermes_infoflow.sessiontracker.get_user_info_by_code",
+        new_callable=AsyncMock,
+        return_value="chengbo05",
+    ) as mock_gu:
+        await resolve_target(
+            tracker,
+            chat_type=7,
+            chat_id="3950087625",
+            code="abc123",
+            account=account,
+        )
+        await resolve_target(
+            tracker,
+            chat_type=7,
+            chat_id="3950087625",
+            code="def456",
+            account=account,
+        )
+    assert mock_gu.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_resolve_target_dm_does_not_cache_failed_code(
+    tracker: SessionTracker, account: InfoflowAccountAPI,
+) -> None:
+    with patch(
+        "hermes_infoflow.sessiontracker.get_user_info_by_code",
+        new_callable=AsyncMock,
+        side_effect=[
+            InfoflowAPIError("oauth_code超时或者失效"),
+            "chengbo05",
+        ],
+    ) as patched:
+        with pytest.raises(InfoflowAPIError):
+            await resolve_target(
+                tracker,
+                chat_type=7,
+                chat_id="3950087625",
+                code="same-code",
+                account=account,
+            )
+        info = await resolve_target(
+            tracker,
+            chat_type=7,
+            chat_id="3950087625",
+            code="same-code",
+            account=account,
+        )
+    assert patched.await_count == 2
+    assert info["canonical_chat_id"] == "chengbo05"
+
+
 def test_bind_latest_pending_on_session_start(tracker: SessionTracker) -> None:
     tracker.push_event("", "inbound.infoflow", {"x": 1}, platform="infoflow", chat_id="bob")
     hooks = make_plugin_hooks(tracker)
@@ -162,6 +256,39 @@ def test_push_event_updates_chat_map_from_meta(tracker: SessionTracker) -> None:
     assert tracker.lookup_session_id("group:42") == "sess-x"
 
 
+@pytest.mark.asyncio
+async def test_stream_access_uses_session_meta_when_code_expired(
+    tracker: SessionTracker,
+) -> None:
+    tracker.push_event(
+        "sess-dm",
+        "display.hermes",
+        {"text": "hi"},
+        platform="infoflow",
+        chat_id="chengbo05",
+    )
+    meta = tracker.get_meta("sess-dm")
+    assert meta is not None
+    meta.user_id = "chengbo05"
+    meta.chat_id = "chengbo05"
+
+    with patch(
+        "hermes_infoflow.sessiontracker.get_user_info_by_code",
+        new_callable=AsyncMock,
+        side_effect=InfoflowAPIError("oauth_code超时或者失效"),
+    ):
+        canonical = await canonical_for_stream_access(
+            tracker,
+            session_id="sess-dm",
+            chat_type=7,
+            chat_id="3950087625",
+            code="expired-code",
+            account=None,
+        )
+    assert canonical == "chengbo05"
+    assert session_matches_target(tracker, "sess-dm", "chengbo05")
+
+
 def test_session_matches_target(tracker: SessionTracker) -> None:
     tracker.bind_chat("group:9", "sess-9")
     assert session_matches_target(tracker, "sess-9", "group:9")
@@ -215,6 +342,14 @@ async def test_sessiontracker_routes_resolve_and_stream() -> None:
             "/webhook/infoflow/sessiontracker/api/resolve?chatType=7&chatId=1",
         )
         assert resp.status == 400
+
+        resp = await client.get(
+            "/webhook/infoflow/sessiontracker/api/history"
+            "?session_id=st-sess&chatType=2&chatId=1",
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert len(body.get("lines", [])) >= 1
 
         resp = await client.get(
             "/webhook/infoflow/sessiontracker/api/stream"
