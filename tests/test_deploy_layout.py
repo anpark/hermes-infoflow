@@ -28,6 +28,8 @@ import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _DEPLOY_SCRIPT = _REPO_ROOT / "scripts" / "deploy.sh"
+_DEPLOY_COMMON_SCRIPT = _REPO_ROOT / "scripts" / "lib" / "deploy-common.sh"
+_EDIT_ENV_SCRIPT = _REPO_ROOT / "scripts" / "lib" / "edit_hermes_env.py"
 
 # Every file currently in hermes_infoflow/ should end up at the plugin
 # dir root (one level shallower than the repo). Kept as a literal set so
@@ -51,31 +53,53 @@ if shutil.which("rsync") is None or shutil.which("bash") is None:
     )
 
 
+def _deploy_env(home: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    env["HOME"] = str(home)
+    env["PYTHON"] = sys.executable
+    env["PATH"] = "/usr/bin:/bin"
+    return env
+
+
+def _run_deploy(
+    home: Path,
+    extra_args: list[str] | None = None,
+    *,
+    pre_config_lines: str | None = None,
+    pre_env_lines: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    home.mkdir(parents=True, exist_ok=True)
+    if pre_config_lines is not None:
+        hermes_dir = home / ".hermes"
+        hermes_dir.mkdir(parents=True, exist_ok=True)
+        (hermes_dir / "config.yaml").write_text(pre_config_lines, encoding="utf-8")
+    if pre_env_lines is not None:
+        hermes_dir = home / ".hermes"
+        hermes_dir.mkdir(parents=True, exist_ok=True)
+        (hermes_dir / ".env").write_text(pre_env_lines, encoding="utf-8")
+    cmd = ["bash", str(_DEPLOY_SCRIPT), *(extra_args or [])]
+    return subprocess.run(
+        cmd,
+        cwd=str(_REPO_ROOT),
+        env=_deploy_env(home),
+        capture_output=True,
+        text=True,
+    )
+
+
+def _read_env_port(env_file: Path) -> str | None:
+    spec = importlib.util.spec_from_file_location("edit_hermes_env", _EDIT_ENV_SCRIPT)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.read_key(env_file, "INFOFLOW_PORT")
+
+
 @pytest.fixture
 def deployed(tmp_path: Path) -> Path:
     """Run ``scripts/deploy.sh`` against an isolated $HOME and return the plugin dir."""
     home = tmp_path / "home"
-    home.mkdir()
-    env = os.environ.copy()
-    env["HOME"] = str(home)
-    # The test interpreter (pytest) already has cryptography / aiohttp /
-    # pyyaml available — its deps are what we're testing against — so
-    # force the deploy script to use it instead of the auto-detected
-    # hermes-agent Python.
-    env["PYTHON"] = sys.executable
-    # Sanitize PATH so `command -v hermes` returns nothing and
-    # deploy-common.sh takes the "hermes CLI not on PATH; skipping
-    # gateway restart" branch. /usr/bin and /bin together cover
-    # rsync / mkdir / head / bash on macOS and Linux.
-    env["PATH"] = "/usr/bin:/bin"
-
-    result = subprocess.run(
-        ["bash", str(_DEPLOY_SCRIPT)],
-        cwd=str(_REPO_ROOT),
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    result = _run_deploy(home)
     if result.returncode != 0:
         pytest.fail(
             f"scripts/deploy.sh failed (rc={result.returncode})\n"
@@ -143,6 +167,65 @@ def test_scripts_synced_for_extract_mode_reruns(deployed: Path) -> None:
     # in the deployed layout so that path keeps working.
     assert (deployed / "scripts" / "lib" / "deploy-common.sh").is_file()
     assert (deployed / "scripts" / "lib" / "edit_hermes_config.py").is_file()
+    assert (deployed / "scripts" / "lib" / "edit_hermes_env.py").is_file()
+
+
+def test_deploy_seeds_default_port_in_env(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    result = _run_deploy(home)
+    assert result.returncode == 0, result.stderr
+    env_file = home / ".hermes" / ".env"
+    assert env_file.is_file()
+    assert _read_env_port(env_file) == "26521"
+
+
+def test_deploy_preserves_existing_port(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    result = _run_deploy(home, pre_env_lines="INFOFLOW_PORT=7777\n")
+    assert result.returncode == 0, result.stderr
+    assert _read_env_port(home / ".hermes" / ".env") == "7777"
+
+
+def test_deploy_port_flag_overrides_env(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    result = _run_deploy(
+        home,
+        ["--port", "3333"],
+        pre_env_lines="INFOFLOW_PORT=7777\n",
+    )
+    assert result.returncode == 0, result.stderr
+    assert _read_env_port(home / ".hermes" / ".env") == "3333"
+
+
+def test_deploy_dry_run_rejects_invalid_port(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    result = _run_deploy(home, ["--port", "99999", "--dry-run"])
+    assert result.returncode != 0
+    assert "--port must be an integer 1-65535" in result.stderr
+
+
+def test_deploy_common_dry_run_rejects_invalid_port(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    result = subprocess.run(
+        [
+            "bash",
+            str(_DEPLOY_COMMON_SCRIPT),
+            "--plugin-dir",
+            str(home / ".hermes" / "plugins" / "infoflow"),
+            "--config-file",
+            str(home / ".hermes" / "config.yaml"),
+            "--port",
+            "99999",
+            "--dry-run",
+        ],
+        cwd=str(_REPO_ROOT),
+        env=_deploy_env(home),
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "--port must be an integer 1-65535" in result.stderr
 
 
 def test_no_nested_package_dir(deployed: Path) -> None:
@@ -163,6 +246,59 @@ def test_config_yaml_enabled_plugin(deployed: Path) -> None:
     assert "infoflow" in enabled, (
         f"expected 'infoflow' in plugins.enabled, got {enabled!r}"
     )
+
+
+def test_config_yaml_infoflow_platform_toolsets(deployed: Path) -> None:
+    """Deploy should grant infoflow the same baseline tools as CLI sessions."""
+    yaml = pytest.importorskip("yaml")
+    config_path = deployed.parent.parent / "config.yaml"
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    infoflow_toolsets = data.get("platform_toolsets", {}).get("infoflow", [])
+
+    expected = {
+        "browser",
+        "clarify",
+        "code_execution",
+        "computer_use",
+        "cronjob",
+        "delegation",
+        "file",
+        "hermes-infoflow",
+        "image_gen",
+        "memory",
+        "messaging",
+        "session_search",
+        "skills",
+        "terminal",
+        "todo",
+        "tts",
+        "vision",
+        "web",
+    }
+    assert expected.issubset(set(infoflow_toolsets))
+
+
+def test_deploy_preserves_custom_infoflow_toolsets(tmp_path: Path) -> None:
+    yaml = pytest.importorskip("yaml")
+    home = tmp_path / "home"
+    result = _run_deploy(
+        home,
+        pre_config_lines=(
+            "platform_toolsets:\n"
+            "  cli:\n"
+            "  - terminal\n"
+            "  - web\n"
+            "  infoflow:\n"
+            "  - custom-mcp\n"
+        ),
+    )
+    assert result.returncode == 0, result.stderr
+    data = yaml.safe_load((home / ".hermes" / "config.yaml").read_text(encoding="utf-8"))
+    infoflow_toolsets = data["platform_toolsets"]["infoflow"]
+    assert infoflow_toolsets[0] == "custom-mcp"
+    assert "terminal" in infoflow_toolsets
+    assert "web" in infoflow_toolsets
+    assert "hermes-infoflow" in infoflow_toolsets
 
 
 def test_flat_layout_loads_like_hermes_agent_does(deployed: Path) -> None:

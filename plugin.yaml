@@ -83,7 +83,7 @@ optional_env:
     prompt: "Bot display name"
     password: false
   - name: INFOFLOW_PORT
-    description: "Webhook listen port (default 8646)"
+    description: "Webhook listen port (default 26521)"
     prompt: "Webhook port"
     password: false
   - name: INFOFLOW_HOST

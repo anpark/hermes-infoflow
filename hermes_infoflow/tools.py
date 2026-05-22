@@ -167,6 +167,73 @@ REPLY_TOOL_SCHEMA = {
 }
 
 
+# Schema for the agent-callable infoflow_get_group_members tool.
+GROUP_MEMBERS_TOOL_SCHEMA = {
+    "name": "infoflow_get_group_members",
+    "description": (
+        "获取如流群聊的成员列表，返回人类成员与机器人成员。"
+        "结果最多每 3 秒刷新一次（并发请求会合并为同一次远端拉取）。\n\n"
+        "字段用途：\n"
+        "- 人类 `user_id`（uuapName）：文本 `@uuapName` 或 "
+        "`metadata.mention_user_ids`\n"
+        "- 机器人 `agent_id` + `name`：文本 `@显示名` / `@agentId` 或 "
+        "`metadata.mention_agent_ids`\n"
+        "- `imid` 一般不需要用于 @ 提及"
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "group_id": {
+                "type": "integer",
+                "description": "群聊 ID，例如 4507088",
+            },
+        },
+        "required": ["group_id"],
+    },
+}
+
+
+def _serialize_group_members_payload(
+    members: list[Any],
+    group_id: str,
+    *,
+    source: str | None = None,
+    stale: bool = False,
+) -> dict[str, Any]:
+    """Build the tool JSON payload from normalized GroupMember objects."""
+    users: list[dict[str, Any]] = []
+    bots: list[dict[str, Any]] = []
+    for m in members:
+        if m.is_bot:
+            bots.append({
+                "agent_id": int(m.agent_id or 0),
+                "name": m.name or "",
+                "imid": str(m.imid or ""),
+            })
+        else:
+            uid = str(m.uid or "")
+            users.append({
+                "user_id": uid,
+                "name": m.name or uid,
+            })
+    payload: dict[str, Any] = {
+        "success": True,
+        "group_id": str(group_id),
+        "users": users,
+        "bots": bots,
+        "counts": {
+            "users": len(users),
+            "bots": len(bots),
+            "total": len(users) + len(bots),
+        },
+    }
+    if source:
+        payload["source"] = source
+    if stale:
+        payload["stale"] = True
+    return payload
+
+
 # ---------------------------------------------------------------------------
 # Tool handler factories
 # ---------------------------------------------------------------------------
@@ -285,5 +352,48 @@ def make_recall_handler():
             "success": True,
             "message_id": str(mid) if mid is not None else None,
         })
+
+    return _handler
+
+
+def make_group_members_handler():
+    """Build the ``infoflow_get_group_members`` tool handler."""
+
+    async def _handler(args: dict, **_kwargs) -> str:
+        raw_gid = args.get("group_id")
+        if raw_gid is None or raw_gid == "":
+            return tool_result_json({"error": "group_id is required"})
+        try:
+            group_id = int(raw_gid)
+        except (TypeError, ValueError):
+            return tool_result_json({"error": "group_id must be an integer"})
+
+        adapter = _get_live_adapter()
+        if adapter is None:
+            return tool_result_json({"error": (
+                "Infoflow adapter not running — cannot fetch group members."
+            )})
+
+        from .serverapi import GroupMembersFetchStatus  # noqa: E402
+
+        fetch_result = await adapter._serverapi.fetch_group_members_detailed(
+            str(group_id),
+            force_refresh=True,
+        )
+        if fetch_result.status == GroupMembersFetchStatus.FAILED:
+            return tool_result_json({
+                "error": (
+                    fetch_result.error
+                    or "failed to fetch group members"
+                ),
+            })
+
+        payload = _serialize_group_members_payload(
+            fetch_result.members,
+            str(group_id),
+            source=fetch_result.status.value,
+            stale=fetch_result.status == GroupMembersFetchStatus.OK_STALE,
+        )
+        return tool_result_json(payload)
 
     return _handler

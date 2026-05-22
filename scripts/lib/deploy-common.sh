@@ -13,19 +13,38 @@
 #   --plugin-id  ID      plugin id (default: infoflow)
 #   --config-file PATH   path to ~/.hermes/config.yaml
 # Optional:
+#   --port PORT          webhook listen port (writes INFOFLOW_PORT to .env)
 #   --dry-run            print actions; don't mutate anything
 set -euo pipefail
 
 PLUGIN_DIR=""
 PLUGIN_ID="infoflow"
 CONFIG_FILE="${HOME}/.hermes/config.yaml"
+PORT=""
 DRY_RUN="false"
+DEFAULT_INFOFLOW_PORT=26521
+
+validate_port() {
+  local value="$1"
+  if [[ ! "$value" =~ ^[0-9]{1,5}$ ]] || (( 10#$value < 1 || 10#$value > 65535 )); then
+    echo "✗ --port must be an integer 1-65535 (got: $value)" >&2
+    exit 1
+  fi
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --plugin-dir)   PLUGIN_DIR="$2";   shift 2 ;;
     --plugin-id)    PLUGIN_ID="$2";    shift 2 ;;
     --config-file)  CONFIG_FILE="$2";  shift 2 ;;
+    --port)
+      if [[ $# -lt 2 ]]; then
+        echo "✗ --port requires a value" >&2
+        exit 1
+      fi
+      PORT="$2"
+      shift 2
+      ;;
     --dry-run)      DRY_RUN="true";    shift   ;;
     *)
       echo "Unknown argument: $1" >&2
@@ -33,6 +52,9 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+if [[ -n "$PORT" ]]; then
+  validate_port "$PORT"
+fi
 
 if [[ -z "$PLUGIN_DIR" ]]; then
   echo "Missing --plugin-dir" >&2
@@ -378,6 +400,28 @@ if [[ "$DRY_RUN" == "true" ]]; then
   EDIT_ARGS+=(--dry-run)
 fi
 run_cmd "$PY" "$EDIT_SCRIPT" "${EDIT_ARGS[@]}"
+
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+HERMES_ENV_FILE="$HERMES_HOME/.env"
+echo "==> Configuring INFOFLOW_PORT in $HERMES_ENV_FILE"
+EDIT_ENV_SCRIPT="$SELF_DIR/edit_hermes_env.py"
+if [[ ! -f "$EDIT_ENV_SCRIPT" ]]; then
+  EDIT_ENV_SCRIPT="$PLUGIN_DIR/scripts/lib/edit_hermes_env.py"
+fi
+if [[ ! -f "$EDIT_ENV_SCRIPT" ]]; then
+  echo "✗ Cannot find edit_hermes_env.py" >&2
+  exit 1
+fi
+ENV_ARGS=(--env-file "$HERMES_ENV_FILE")
+if [[ -n "$PORT" ]]; then
+  ENV_ARGS+=(--set "INFOFLOW_PORT=$PORT")
+else
+  ENV_ARGS+=(--ensure "INFOFLOW_PORT=$DEFAULT_INFOFLOW_PORT")
+fi
+if [[ "$DRY_RUN" == "true" ]]; then
+  ENV_ARGS+=(--dry-run)
+fi
+run_cmd "$PY" "$EDIT_ENV_SCRIPT" "${ENV_ARGS[@]}"
 
 echo "==> Checking hermes gateway status"
 if ! command -v hermes >/dev/null 2>&1; then

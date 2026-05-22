@@ -26,6 +26,7 @@ Non-obvious wire contract bits (do NOT change without an upstream notice):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -892,11 +893,8 @@ def _build_emoji_reaction_body(
         parts.append(f'"chatId":{int(group_id)}')
     parts.append(f'"baseMsgId":{json.dumps(str(base_msg_id))}')
     if msgid2:
-        try:
+        with contextlib.suppress(TypeError, ValueError):
             parts.append(f'"msgId2":{int(msgid2)}')
-        except (TypeError, ValueError):
-            # Non-numeric msgid2 — skip rather than break the request.
-            pass
     parts.append(f'"replyContent":{json.dumps(emoji_code)}')
     parts.append(f'"replyDesc":{json.dumps(emoji_desc)}')
     return "{" + ",".join(parts) + "}"

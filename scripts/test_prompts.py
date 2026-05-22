@@ -197,7 +197,7 @@ def load_config() -> dict[str, Any]:
                 raise ValueError("HERMES_LLM_EXTRA_HEADERS must be a JSON object")
             extra_headers = {str(k): str(v) for k, v in parsed.items()}
         except (json.JSONDecodeError, ValueError) as exc:
-            raise SystemExit(f"Bad HERMES_LLM_EXTRA_HEADERS: {exc}")
+            raise SystemExit(f"Bad HERMES_LLM_EXTRA_HEADERS: {exc}") from exc
 
     return {
         "base_url": base_url.rstrip("/"),

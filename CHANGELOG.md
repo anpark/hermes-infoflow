@@ -8,6 +8,24 @@ versioning (with prerelease suffixes such as `0.1.0b1` for betas).
 
 ## [Unreleased]
 
+### Added
+
+- `scripts/deploy.sh` and `scripts/lib/deploy-common.sh` accept `--port` to
+  set `INFOFLOW_PORT` in `~/.hermes/.env`; without `--port`, an existing
+  value is preserved and the default `26521` is seeded only when missing.
+- `hermes-infoflow-tools update` accepts `--port` for both `extract` and
+  `pip` modes (extract forwards to `deploy-common.sh`; pip writes `.env`
+  via bundled `env_editor`).
+- `scripts/lib/edit_hermes_env.py` for safe `.env` upserts during deploy.
+- Deploy / installer config editing now ensures
+  `platform_toolsets.infoflow` includes the same baseline tool permissions
+  as CLI sessions, including the `hermes-infoflow` toolset.
+
+### Changed
+
+- Default webhook listen port (`DEFAULT_PORT` / `INFOFLOW_PORT`) is now
+  **26521** (was 8646).
+
 ## [2026.5.21] - 2026-05-21
 
 ### Added

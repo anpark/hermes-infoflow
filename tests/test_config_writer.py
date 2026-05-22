@@ -32,7 +32,10 @@ def test_apply_creates_plugins_block_in_empty_config(edit_module) -> None:
     data: dict = {}
     changed = edit_module.apply(data, "infoflow")
     assert changed
-    assert data == {"plugins": {"enabled": ["infoflow"]}}
+    assert data["plugins"] == {"enabled": ["infoflow"]}
+    assert data["platform_toolsets"]["infoflow"] == list(
+        edit_module.DEFAULT_INFOFLOW_PLATFORM_TOOLSETS
+    )
 
 
 def test_apply_appends_to_existing_list(edit_module) -> None:
@@ -40,10 +43,16 @@ def test_apply_appends_to_existing_list(edit_module) -> None:
     changed = edit_module.apply(data, "infoflow")
     assert changed
     assert data["plugins"]["enabled"] == ["other", "infoflow"]
+    assert "hermes-infoflow" in data["platform_toolsets"]["infoflow"]
 
 
 def test_apply_is_idempotent(edit_module) -> None:
-    data = {"plugins": {"enabled": ["infoflow"]}}
+    data = {
+        "plugins": {"enabled": ["infoflow"]},
+        "platform_toolsets": {
+            "infoflow": list(edit_module.DEFAULT_INFOFLOW_PLATFORM_TOOLSETS),
+        },
+    }
     changed = edit_module.apply(data, "infoflow")
     assert changed is False
     assert data["plugins"]["enabled"] == ["infoflow"]
@@ -53,24 +62,59 @@ def test_apply_preserves_other_keys(edit_module) -> None:
     data = {
         "core": {"x": 1},
         "plugins": {"enabled": ["a"], "disabled": ["b"]},
+        "platform_toolsets": {"cli": ["terminal"], "other": ["web"]},
         "other": "kept",
     }
     edit_module.apply(data, "infoflow")
     assert data["core"] == {"x": 1}
     assert data["plugins"]["disabled"] == ["b"]
+    assert data["platform_toolsets"]["other"] == ["web"]
     assert data["other"] == "kept"
     assert data["plugins"]["enabled"] == ["a", "infoflow"]
+    assert data["platform_toolsets"]["infoflow"][0] == "terminal"
+    assert set(edit_module.DEFAULT_INFOFLOW_PLATFORM_TOOLSETS).issubset(
+        set(data["platform_toolsets"]["infoflow"])
+    )
+
+
+def test_apply_merges_existing_infoflow_toolsets(edit_module) -> None:
+    data = {
+        "plugins": {"enabled": ["infoflow"]},
+        "platform_toolsets": {
+            "cli": ["terminal", "web"],
+            "infoflow": ["custom-mcp"],
+        },
+    }
+    changed = edit_module.apply(data, "infoflow")
+    assert changed
+    assert data["platform_toolsets"]["infoflow"][0] == "custom-mcp"
+    assert "terminal" in data["platform_toolsets"]["infoflow"]
+    assert "web" in data["platform_toolsets"]["infoflow"]
+    assert "hermes-infoflow" in data["platform_toolsets"]["infoflow"]
 
 
 def test_apply_remove_drops_id(edit_module) -> None:
-    data = {"plugins": {"enabled": ["infoflow", "other"]}}
+    data = {
+        "plugins": {"enabled": ["infoflow", "other"]},
+        "platform_toolsets": {"infoflow": ["terminal"]},
+    }
     changed = edit_module.apply(data, "infoflow", remove=True)
     assert changed
     assert data["plugins"]["enabled"] == ["other"]
+    assert data["platform_toolsets"]["infoflow"] == ["terminal"]
 
 
 def test_apply_rejects_mapping_enabled(edit_module) -> None:
     data = {"plugins": {"enabled": {"infoflow": True}}}
+    with pytest.raises(SystemExit):
+        edit_module.apply(data, "infoflow")
+
+
+def test_apply_rejects_non_list_platform_toolsets(edit_module) -> None:
+    data = {
+        "plugins": {"enabled": ["infoflow"]},
+        "platform_toolsets": {"infoflow": {"terminal": True}},
+    }
     with pytest.raises(SystemExit):
         edit_module.apply(data, "infoflow")
 
@@ -81,7 +125,11 @@ def test_main_writes_yaml_round_trip(edit_module, tmp_path) -> None:
     rc = edit_module.main(["--config-file", str(cfg), "--plugin-id", "infoflow"])
     assert rc == 0
     loaded = yaml.safe_load(cfg.read_text(encoding="utf-8"))
-    assert loaded == {"core": {"x": 1}, "plugins": {"enabled": ["infoflow"]}}
+    assert loaded["core"] == {"x": 1}
+    assert loaded["plugins"] == {"enabled": ["infoflow"]}
+    assert loaded["platform_toolsets"]["infoflow"] == list(
+        edit_module.DEFAULT_INFOFLOW_PLATFORM_TOOLSETS
+    )
 
 
 def test_main_dry_run_does_not_write(edit_module, tmp_path) -> None:

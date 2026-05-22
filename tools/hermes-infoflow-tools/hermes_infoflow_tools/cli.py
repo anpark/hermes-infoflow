@@ -37,14 +37,50 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from .env_editor import (
+    DEFAULT_INFOFLOW_PORT,
+    ensure_key,
+    read_key,
+    upsert_key,
+    validate_port_value,
+)
+
 DEFAULT_PACKAGE = "hermes-infoflow"
 DEFAULT_INDEX_URL = "https://pypi.org/simple"
 DEFAULT_CHANNEL_ID = "infoflow"
+DEFAULT_INFOFLOW_PLATFORM_TOOLSETS = (
+    "browser",
+    "clarify",
+    "code_execution",
+    "computer_use",
+    "cronjob",
+    "delegation",
+    "file",
+    "hermes-infoflow",
+    "image_gen",
+    "memory",
+    "messaging",
+    "session_search",
+    "skills",
+    "terminal",
+    "todo",
+    "tts",
+    "vision",
+    "web",
+)
 
 
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
+
+
+def _parse_port_arg(value: str) -> int:
+    try:
+        validate_port_value(value)
+    except SystemExit as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+    return int(value)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -100,6 +136,17 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     upd.add_argument(
+        "--port",
+        type=_parse_port_arg,
+        metavar="PORT",
+        default=None,
+        help=(
+            "Webhook listen port (1-65535). Written to ~/.hermes/.env as "
+            "INFOFLOW_PORT. Without this flag, an existing value is kept and "
+            f"{DEFAULT_INFOFLOW_PORT} is seeded only when missing."
+        ),
+    )
+    upd.add_argument(
         "--dry-run",
         action="store_true",
         help="Print commands without executing them.",
@@ -129,6 +176,46 @@ class _Runner:
             sys.exit(result.returncode)
 
 
+def _configure_infoflow_port(
+    hermes_home: Path,
+    port: int | None,
+    *,
+    dry_run: bool,
+) -> None:
+    """Seed or override ``INFOFLOW_PORT`` in ``$HERMES_HOME/.env``."""
+    env_file = hermes_home / ".env"
+    print(f"==> Configuring INFOFLOW_PORT in {env_file}")
+    if port is not None:
+        validate_port_value(str(port))
+        if dry_run:
+            print(
+                f"[edit_hermes_env] (dry-run) would set INFOFLOW_PORT={port} in {env_file}"
+            )
+            return
+        changed = upsert_key(env_file, "INFOFLOW_PORT", str(port))
+    else:
+        if dry_run:
+            existing = read_key(env_file, "INFOFLOW_PORT")
+            if existing is not None:
+                print(
+                    f"[edit_hermes_env] (dry-run) would leave "
+                    f"INFOFLOW_PORT={existing} in {env_file}"
+                )
+            else:
+                print(
+                    f"[edit_hermes_env] (dry-run) would ensure "
+                    f"INFOFLOW_PORT={DEFAULT_INFOFLOW_PORT} in {env_file}"
+                )
+            return
+        changed = ensure_key(env_file, "INFOFLOW_PORT", str(DEFAULT_INFOFLOW_PORT))
+
+    if changed:
+        current = read_key(env_file, "INFOFLOW_PORT")
+        print(f"[edit_hermes_env] updated {env_file} (INFOFLOW_PORT={current})")
+    else:
+        print(f"[edit_hermes_env] no change needed ({env_file}: INFOFLOW_PORT already set)")
+
+
 def _resolve_pip_version_spec(package: str, version: str) -> str:
     """Return ``package==version`` (or just ``package`` for ``latest``)."""
     if version in ("", "latest"):
@@ -151,6 +238,10 @@ def _ensure_plugin_enabled(config_file: Path, plugin_id: str, *, dry_run: bool) 
     """
     if dry_run:
         print(f"$ ensure {plugin_id!r} is present in {config_file}:plugins.enabled")
+        print(
+            f"$ ensure {config_file}:platform_toolsets.{plugin_id} "
+            "includes CLI tool permissions"
+        )
         return True
 
     try:
@@ -184,12 +275,17 @@ def _ensure_plugin_enabled(config_file: Path, plugin_id: str, *, dry_run: bool) 
         )
 
     current = [str(item) for item in enabled if isinstance(item, (str, int))]
-    if plugin_id in current:
+    changed = False
+    if plugin_id not in current:
+        plugins["enabled"] = [*current, plugin_id]
+        data["plugins"] = plugins
+        changed = True
+
+    changed = _ensure_platform_toolsets(data, plugin_id) or changed
+    if not changed:
         print(f"[pip mode] no config change needed ({plugin_id} already enabled)")
         return False
 
-    plugins["enabled"] = [*current, plugin_id]
-    data["plugins"] = plugins
     config_file.parent.mkdir(parents=True, exist_ok=True)
     config_file.write_text(
         yaml.safe_dump(
@@ -201,6 +297,51 @@ def _ensure_plugin_enabled(config_file: Path, plugin_id: str, *, dry_run: bool) 
         encoding="utf-8",
     )
     print(f"[pip mode] enabled {plugin_id} in {config_file}")
+    return True
+
+
+def _normalize_toolsets(value: Any, label: str) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise SystemExit(f"{label} must be a list; got {type(value).__name__}")
+    return [
+        str(item)
+        for item in value
+        if isinstance(item, (str, int)) and str(item).strip()
+    ]
+
+
+def _dedupe(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+    return result
+
+
+def _ensure_platform_toolsets(data: dict[str, Any], plugin_id: str) -> bool:
+    platform_toolsets = data.setdefault("platform_toolsets", {})
+    if not isinstance(platform_toolsets, dict):
+        raise SystemExit("platform_toolsets: must be a mapping; refusing to edit")
+
+    cli_toolsets = _normalize_toolsets(
+        platform_toolsets.get("cli"),
+        "platform_toolsets.cli",
+    )
+    required = _dedupe([*cli_toolsets, *DEFAULT_INFOFLOW_PLATFORM_TOOLSETS])
+    current = _normalize_toolsets(
+        platform_toolsets.get(plugin_id),
+        f"platform_toolsets.{plugin_id}",
+    )
+    merged = _dedupe([*current, *required])
+    if current == merged:
+        return False
+    platform_toolsets[plugin_id] = merged
+    data["platform_toolsets"] = platform_toolsets
     return True
 
 
@@ -381,6 +522,8 @@ def _do_extract(args, hermes_home: Path) -> int:
             "--config-file",
             str(config_file),
         ]
+        if args.port is not None:
+            common_args.extend(["--port", str(args.port)])
         if args.dry_run:
             common_args.append("--dry-run")
         runner(common_args)
@@ -431,6 +574,7 @@ def _do_pip(args, hermes_home: Path) -> int:
     # will see it, so we only update plugins.enabled here. Users still need
     # to set INFOFLOW_* env vars themselves.
     _ensure_plugin_enabled(config_file, args.channel_id, dry_run=args.dry_run)
+    _configure_infoflow_port(hermes_home, args.port, dry_run=args.dry_run)
 
     print(
         "[pip mode] plugin installed via entry-point. Reminder: hermes "

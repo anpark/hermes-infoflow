@@ -48,6 +48,7 @@ hermes 内置命令；`git clone --depth 1` 到 `~/.hermes/plugins/infoflow/`。
 <!-- sync:hermes-infoflow-version:latest -->
 ```bash
 pipx run hermes-infoflow-tools update --version 2026.5.21
+pipx run hermes-infoflow-tools update --version 2026.5.21 --port 9000
 ```
 <!-- /sync:hermes-infoflow-version:latest -->
 
@@ -66,6 +67,7 @@ pipx run hermes-infoflow-tools update --version 0.2.2b1
 - `--mode extract`（默认）：`pip download` sdist → 解包 → rsync 到 `~/.hermes/plugins/infoflow/`；体验对齐 OpenClaw。
 - `--mode pip`：`pip install --upgrade hermes-infoflow==<ver>` 到 site-packages。**注意**：此模式 hermes 不读 `plugin.yaml`，`hermes config` 不会列 `INFOFLOW_*`。
 - `--channel-id <id>`：目标目录名（默认 `infoflow`，仅在你知道自己在做什么时改）
+- `--port <PORT>`：Webhook 端口（1–65535），写入 `~/.hermes/.env` 的 `INFOFLOW_PORT`；未传则保留已有值，缺失时写入默认 `26521`（`extract` 与 `pip` 模式均支持）
 - `--dry-run`：仅打印命令
 
 ### C. `pip install hermes-infoflow`（最 Pythonic）
@@ -85,9 +87,12 @@ git clone https://github.com/chbo297/hermes-infoflow
 cd hermes-infoflow
 bash scripts/deploy.sh             # 同步到 ~/.hermes/plugins/infoflow/、重启 gateway
 bash scripts/deploy.sh --dry-run   # 仅打印操作
+bash scripts/deploy.sh --port 9000 # 指定 webhook 端口并写入 ~/.hermes/.env
 ```
 
 `deploy.sh` 会同步插件并自动选择 Python：优先 `hermes` / `pipx` 的 `hermes-agent` venv，再尝试 `python3`。若缺少 `cryptography` / `aiohttp` / `pyyaml`，默认会尝试 `pipx inject hermes-agent …` 或对当前解释器 `pip install`（可用 `HERMES_DEPLOY_AUTO_PIP=0` 关闭）。若检测到的解释器与 gateway 实际用的 pipx venv 不一致，脚本会打印 warning。
+
+部署时还会维护 `~/.hermes/.env` 中的 `INFOFLOW_PORT`：传 `--port` 则写入指定端口；未传时若 `.env` 已有 `INFOFLOW_PORT` 则保留，否则写入默认 `26521`（便于查看当前监听端口）。同时会补齐 `~/.hermes/config.yaml` 里的 `platform_toolsets.infoflow`，让 Infoflow 会话拥有与 CLI 会话一致的基础工具权限，并包含 `hermes-infoflow` 工具集。
 
 镜像 [`openclaw-infoflow/scripts/deploy.sh`](https://github.com/chbo297/openclaw-infoflow/blob/main/scripts/deploy.sh)。
 
@@ -113,7 +118,7 @@ bash scripts/deploy.sh --dry-run   # 仅打印操作
 |------|------|------|
 | `INFOFLOW_APP_AGENT_ID` | 无 | 私聊撤回必须；如流后台「应用 ID」 |
 | `INFOFLOW_ROBOT_NAME` | 无 | 机器人显示名，用于 @-mention 识别 |
-| `INFOFLOW_PORT` | `8646` | Webhook 监听端口 |
+| `INFOFLOW_PORT` | `26521` | Webhook 监听端口 |
 | `INFOFLOW_HOST` | `0.0.0.0` | Webhook 监听地址 |
 | `INFOFLOW_WEBHOOK_PATH` | `/webhook/infoflow` | Webhook 路径 |
 | `INFOFLOW_HOME_CHANNEL` | 无 | cron `deliver=infoflow` 缺省目标，如 `bob` 或 `group:12345` |
@@ -151,7 +156,7 @@ hermes gateway status               # 期望看到 "infoflow: running"
 Gateway 启动且 infoflow 插件连接成功后，在本机浏览器打开：
 
 ```
-http://127.0.0.1:8646/webhook/infoflow/dashboard
+http://127.0.0.1:26521/webhook/infoflow/dashboard
 ```
 
 （端口与路径可通过 `INFOFLOW_PORT`、`INFOFLOW_WEBHOOK_PATH` 调整；路径为 `{WEBHOOK_PATH}/dashboard`。）
@@ -251,13 +256,13 @@ https://<your-domain>/webhook/infoflow/sessiontracker?chatType=7&chatId=39500876
 https://<your-domain>/webhook/infoflow
 ```
 
-> 注意：必须配 HTTPS。如果你的服务器对公网仅暴露 8646 / 内网端口，请在前面挂反向代理 + TLS。
+> 注意：必须配 HTTPS。如果你的服务器对公网仅暴露 `INFOFLOW_PORT`（默认 26521）/ 内网端口，请在前面挂反向代理 + TLS。
 
 ### Caddy 示例
 
 ```caddyfile
 hermes.example.com {
-    reverse_proxy /webhook/infoflow localhost:8646
+    reverse_proxy /webhook/infoflow localhost:26521
 }
 ```
 
@@ -271,7 +276,7 @@ server {
     ssl_certificate_key /etc/letsencrypt/live/hermes.example.com/privkey.pem;
 
     location /webhook/infoflow {
-        proxy_pass http://127.0.0.1:8646/webhook/infoflow;
+        proxy_pass http://127.0.0.1:26521/webhook/infoflow;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $remote_addr;
     }
@@ -286,7 +291,7 @@ tunnel: <tunnel-id>
 credentials-file: /Users/bo/.cloudflared/<tunnel-id>.json
 ingress:
   - hostname: hermes.example.com
-    service: http://localhost:8646
+    service: http://localhost:26521
   - service: http_status:404
 ```
 

@@ -23,7 +23,7 @@ import contextlib
 import logging
 import time
 from dataclasses import dataclass
-from enum import Enum
+from enum import Enum, StrEnum
 from typing import TYPE_CHECKING, Any
 
 import aiohttp
@@ -49,9 +49,47 @@ _MAX_PREVIEW_LENGTH = 200
 _MEMBERS_CACHE: dict[str, tuple[list[GroupMember], float]] = {}
 _MEMBERS_CACHE_TTL = 300  # 5 minutes
 
+# Per-group guarded-fetch state (module-level for singleton semantics).
+# ``last_result`` holds the most recent GroupMembersFetchResult (success OR
+# failure) so we can debounce both success and failure storms uniformly.
+_guarded_state: dict[str, dict] = {}  # group_id → {task, task_loop, last_ts, last_result}
+_DEBOUNCE_SECONDS = 3.0
+
+
+class GroupMembersFetchStatus(StrEnum):
+    """How a group member list was obtained."""
+
+    OK = "ok"  # remote succeeded (members may be empty)
+    OK_CACHED = "ok_cached"  # 5-minute TTL cache hit
+    OK_DEBOUNCED = "ok_debounced"  # reused list from recent guarded fetch
+    OK_STALE = "ok_stale"  # remote failed; stale TTL cache returned
+    FAILED = "failed"  # remote failed and no cache available
+
+
+@dataclass
+class GroupMembersFetchResult:
+    """Result of a group member list fetch with explicit status semantics."""
+
+    members: list[GroupMember]
+    status: GroupMembersFetchStatus
+    error: str | None = None
+
+
+def _api_members_to_group_members(api_members: list[Any]) -> list[GroupMember]:
+    return [
+        GroupMember(
+            uid=str(m.uid or ""),
+            name=m.name or "",
+            agent_id=int(m.agent_id or 0),
+            is_bot=m.is_bot,
+            imid=getattr(m, "imid", "") or "",
+        )
+        for m in api_members
+    ]
+
 
 # ---------------------------------------------------------------------------
-# resolve_member_identity — unified member lookup with guarded fetch
+# resolve_member_identity — single-member lookup via unified list fetch
 # ---------------------------------------------------------------------------
 
 class CacheRetrievalPolicy(Enum):
@@ -61,9 +99,31 @@ class CacheRetrievalPolicy(Enum):
     RETRIEVE_FROM_CACHE_THEN_REMOTE = "cache_then_remote"  # default
 
 
-# Per-group guarded-fetch state (module-level for singleton semantics)
-_guarded_state: dict[str, dict] = {}  # group_id → {task, last_ts, members}
-_DEBOUNCE_SECONDS = 3.0
+def _member_to_identity_dict(m: GroupMember) -> dict:
+    return {
+        "uid": m.uid,
+        "name": m.name,
+        "imid": m.imid,
+        "agent_id": m.agent_id,
+        "is_bot": m.is_bot,
+    }
+
+
+def _find_member_in_list(
+    members: list[GroupMember],
+    *,
+    bot_name: str | None,
+    agent_id: int | None,
+    imid: str | None,
+) -> dict:
+    for m in members:
+        if bot_name is not None and m.name == bot_name and m.is_bot:
+            return _member_to_identity_dict(m)
+        if agent_id is not None and m.agent_id == agent_id:
+            return _member_to_identity_dict(m)
+        if imid is not None and str(m.imid) == str(imid):
+            return _member_to_identity_dict(m)
+    return {}
 
 
 async def resolve_member_identity(
@@ -81,76 +141,41 @@ async def resolve_member_identity(
     Returns the matching ``GroupMember`` as a plain dict (same fields as the
     dataclass), or an empty dict if not found.
 
-    Guarantees at most **one** concurrent remote fetch per group_id.
-    Multiple concurrent callers share the same in-flight task.
-    A 3-second debounce suppresses redundant fetches after a successful one.
+    List fetching is delegated to :meth:`ServerAPI.fetch_group_members_detailed`
+    so debounce, in-flight coalescing, and cache updates stay in one place.
     """
     if not any(v is not None for v in (bot_name, agent_id, imid)):
         return {}
 
     gid = str(group_id)
 
-    # --- helpers ---
-    def _match(m: GroupMember) -> bool:
-        if bot_name is not None and m.name == bot_name and m.is_bot:
-            return True
-        if agent_id is not None and m.agent_id == agent_id:
-            return True
-        return imid is not None and str(m.imid) == str(imid)
-
-    def _to_dict(m: GroupMember) -> dict:
-        return {
-            "uid": m.uid,
-            "name": m.name,
-            "imid": m.imid,
-            "agent_id": m.agent_id,
-            "is_bot": m.is_bot,
-        }
-
-    # --- try cache first (unless REMOTE_ONLY) ---
     if cache_policy != CacheRetrievalPolicy.RETRIEVE_FROM_REMOTE_ONLY:
         cached = _MEMBERS_CACHE.get(gid)
         if cached and cached[0]:
-            for m in cached[0]:
-                if _match(m):
-                    return _to_dict(m)
+            hit = _find_member_in_list(
+                cached[0], bot_name=bot_name, agent_id=agent_id, imid=imid,
+            )
+            if hit:
+                return hit
 
-    # --- remote fetch (unless CACHE_ONLY) ---
-    if cache_policy != CacheRetrievalPolicy.RETRIEVE_FROM_CACHE_ONLY:
-        state = _guarded_state.setdefault(gid, {"task": None, "last_ts": 0.0, "members": None})
+    if cache_policy == CacheRetrievalPolicy.RETRIEVE_FROM_CACHE_ONLY:
+        return {}
 
-        # Skip if within debounce window and we already have members
-        now = time.time()
-        if state["members"] is not None and (now - state["last_ts"]) < _DEBOUNCE_SECONDS:
-            for m in state["members"]:
-                if _match(m):
-                    return _to_dict(m)
-            return {}  # debounce window — members list is fresh, skip remote fetch
+    if serverapi is None:
+        return {}
 
-        # Reuse inflight task or create a new one
-        if state["task"] is None or state["task"].done():
-            async def _fetch():
-                if serverapi is None:
-                    return []
-                try:
-                    members = await serverapi.get_group_members(
-                        gid, session=session, force_refresh=True,
-                    )
-                    state["members"] = members
-                    state["last_ts"] = time.time()
-                    return members
-                except Exception:
-                    state["task"] = None  # allow retry
-                    return []
-            state["task"] = asyncio.ensure_future(_fetch())
+    fetch_result = await serverapi.fetch_group_members_detailed(
+        gid, session=session, force_refresh=True,
+    )
+    if fetch_result.status == GroupMembersFetchStatus.FAILED:
+        return {}
 
-        members = await state["task"]
-        if members:
-            for m in members:
-                if _match(m):
-                    return _to_dict(m)
-
-    return {}
+    return _find_member_in_list(
+        fetch_result.members,
+        bot_name=bot_name,
+        agent_id=agent_id,
+        imid=imid,
+    )
 
 
 
@@ -714,6 +739,154 @@ class ServerAPI:
     # Group members (common capability)
     # ------------------------------------------------------------------
 
+    async def _fetch_group_members_remote(
+        self,
+        group_id: str,
+        session: aiohttp.ClientSession,
+    ) -> GroupMembersFetchResult:
+        """Single HTTP entry point — must not call :meth:`get_group_members`.
+
+        On success: updates ``_MEMBERS_CACHE``. The caller (``_guarded_fetch_group_members``)
+        is responsible for stamping ``_guarded_state[gid]`` with the returned
+        ``GroupMembersFetchResult`` so both success and failure are debounced uniformly.
+        """
+        gid = str(group_id)
+        try:
+            api_members = await _api.get_group_members(
+                self._api_account,
+                group_id=group_id,
+                session=session,
+                timeout=6.0,
+            )
+            members = _api_members_to_group_members(api_members)
+            now = time.time()
+            _MEMBERS_CACHE[gid] = (members, now)
+            logger.debug(
+                "[serverapi] get_group_members(%s): %d members cached",
+                gid, len(members),
+            )
+            return GroupMembersFetchResult(
+                members=members,
+                status=GroupMembersFetchStatus.OK,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[serverapi] get_group_members(%s) failed: %s", group_id, exc,
+            )
+            cached = _MEMBERS_CACHE.get(gid)
+            if cached:
+                logger.info(
+                    "[serverapi] get_group_members(%s) returning stale cache", gid,
+                )
+                return GroupMembersFetchResult(
+                    members=cached[0],
+                    status=GroupMembersFetchStatus.OK_STALE,
+                )
+            return GroupMembersFetchResult(
+                members=[],
+                status=GroupMembersFetchStatus.FAILED,
+                error=str(exc),
+            )
+
+    def _replay_guarded_result(
+        self, prev: GroupMembersFetchResult,
+    ) -> GroupMembersFetchResult:
+        """Re-emit a previously stamped guarded result for debounced replays."""
+        if prev.status == GroupMembersFetchStatus.OK:
+            return GroupMembersFetchResult(
+                members=prev.members,
+                status=GroupMembersFetchStatus.OK_DEBOUNCED,
+            )
+        # OK_STALE / FAILED / OK_DEBOUNCED replay as-is so the caller still
+        # sees the underlying outage signal during a failure storm.
+        return prev
+
+    async def _guarded_fetch_group_members(
+        self,
+        group_id: str,
+        *,
+        session: aiohttp.ClientSession | None,
+        force_refresh: bool,
+    ) -> GroupMembersFetchResult:
+        """Fetch full member list with TTL cache, 3s debounce, and in-flight merge.
+
+        Debounce applies to BOTH successful and failed fetches: after any
+        attempt, repeat calls within ``_DEBOUNCE_SECONDS`` are short-circuited
+        to the prior result. This prevents tool / @mention loops from hammering
+        ``/robot/group/memberList`` during an outage.
+        """
+        gid = str(group_id)
+
+        if not force_refresh:
+            cached = _MEMBERS_CACHE.get(gid)
+            if cached and (time.time() - cached[1]) < _MEMBERS_CACHE_TTL:
+                logger.debug("[serverapi] get_group_members(%s) cache hit", gid)
+                return GroupMembersFetchResult(
+                    members=cached[0],
+                    status=GroupMembersFetchStatus.OK_CACHED,
+                )
+
+        state = _guarded_state.setdefault(
+            gid, {"task": None, "task_loop": None, "last_ts": 0.0, "last_result": None},
+        )
+        now = time.time()
+        if (
+            state.get("last_result") is not None
+            and (now - state["last_ts"]) < _DEBOUNCE_SECONDS
+        ):
+            return self._replay_guarded_result(state["last_result"])
+
+        current_loop = asyncio.get_running_loop()
+        task = state.get("task")
+        task_loop = state.get("task_loop")
+        if task is not None and not task.done() and task_loop is current_loop:
+            return await task
+
+        async def _run() -> GroupMembersFetchResult:
+            try:
+                async with self._ensure_session(session) as sess:
+                    result = await self._fetch_group_members_remote(group_id, sess)
+            except Exception as exc:
+                cached = _MEMBERS_CACHE.get(gid)
+                if cached:
+                    result = GroupMembersFetchResult(
+                        members=cached[0],
+                        status=GroupMembersFetchStatus.OK_STALE,
+                    )
+                else:
+                    result = GroupMembersFetchResult(
+                        members=[],
+                        status=GroupMembersFetchStatus.FAILED,
+                        error=str(exc),
+                    )
+            state["last_result"] = result
+            state["last_ts"] = time.time()
+            return result
+
+        task = asyncio.ensure_future(_run())
+        state["task"] = task
+        state["task_loop"] = current_loop
+        try:
+            return await task
+        finally:
+            if state.get("task") is task:
+                state["task"] = None
+                state["task_loop"] = None
+
+    async def fetch_group_members_detailed(
+        self,
+        group_id: str,
+        *,
+        session: aiohttp.ClientSession | None = None,
+        force_refresh: bool = False,
+    ) -> GroupMembersFetchResult:
+        """Return group members with explicit fetch status (for tools and diagnostics)."""
+        return await self._guarded_fetch_group_members(
+            group_id,
+            session=session,
+            force_refresh=force_refresh,
+        )
+
     async def get_group_members(
         self,
         group_id: str,
@@ -724,47 +897,15 @@ class ServerAPI:
         """Return cached-then-fresh group member list.
 
         Results are cached per group_id for ``_MEMBERS_CACHE_TTL`` seconds.
-        Pass ``force_refresh=True`` to bypass the cache.
+        Pass ``force_refresh=True`` to bypass the TTL cache but still apply
+        3-second debounce and in-flight request coalescing.
         """
-        gid = str(group_id)
-        # Check cache
-        if not force_refresh:
-            cached = _MEMBERS_CACHE.get(gid)
-            if cached and (time.time() - cached[1]) < _MEMBERS_CACHE_TTL:
-                logger.debug("[serverapi] get_group_members(%s) cache hit", gid)
-                return cached[0]
-
-        async with self._ensure_session(session) as sess:
-            try:
-                api_members = await _api.get_group_members(
-                    self._api_account, group_id=group_id, session=sess,
-                    timeout=6.0,
-                )
-                members = [
-                    GroupMember(
-                        uid=str(m.uid or ""),
-                        name=m.name or "",
-                        agent_id=int(m.agent_id or 0),
-                        is_bot=m.is_bot,
-                        imid=getattr(m, "imid", "") or "",
-                    )
-                    for m in api_members
-                ]
-                # Update cache
-                _MEMBERS_CACHE[gid] = (members, time.time())
-                logger.debug(
-                    "[serverapi] get_group_members(%s): %d members cached",
-                    gid, len(members),
-                )
-                return members
-            except Exception as exc:
-                logger.warning("[serverapi] get_group_members(%s) failed: %s", group_id, exc)
-                # Return stale cache if available
-                cached = _MEMBERS_CACHE.get(gid)
-                if cached:
-                    logger.info("[serverapi] get_group_members(%s) returning stale cache", gid)
-                    return cached[0]
-                return []
+        result = await self.fetch_group_members_detailed(
+            group_id,
+            session=session,
+            force_refresh=force_refresh,
+        )
+        return result.members
 
     # ------------------------------------------------------------------
     # Image download

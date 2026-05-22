@@ -26,6 +26,7 @@ from hermes_infoflow.recall import (
     _register_inbound_context,
 )
 from hermes_infoflow.settings import (
+    DEFAULT_PORT,
     _parse_infoflow_target,
     _read_account_settings,
 )
@@ -129,6 +130,13 @@ def test_register_evicts_when_over_max() -> None:
 
 def _cfg(extra: dict | None = None):
     return SimpleNamespace(extra=extra or {})
+
+
+def test_read_settings_default_port_without_env(monkeypatch) -> None:
+    monkeypatch.delenv("INFOFLOW_PORT", raising=False)
+    s = _read_account_settings(_cfg())
+    assert s["port"] == DEFAULT_PORT
+    assert DEFAULT_PORT == 26521
 
 
 def test_read_settings_parses_watch_regex_via_separator(monkeypatch) -> None:

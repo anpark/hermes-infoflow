@@ -77,8 +77,10 @@ except ImportError:
 
 from .dashboard import get_tracker, normalize_chat_id
 from .iftools import (
+    GROUP_MEMBERS_TOOL_SCHEMA,
     RECALL_TOOL_SCHEMA,
     REPLY_TOOL_SCHEMA,
+    make_group_members_handler,
     make_recall_handler,
     make_reply_handler,
 )
@@ -1158,7 +1160,10 @@ def register(ctx: Any) -> None:
             "那是用户发出的消息，你无权撤回\n"
             "\n"
             "【引用回复】使用 `infoflow_reply` 引用某条消息并附带原文预览。"
-            "若省略 `reply_to`，自动引用触发本轮对话的那条用户消息。"
+            "若省略 `reply_to`，自动引用触发本轮对话的那条用户消息。\n"
+            "\n"
+            "【群成员】使用 `infoflow_get_group_members` 查询群成员列表（人类与机器人），"
+            "便于在 @ 提及前确认 uuapName、agentId 或机器人显示名。"
         ),
     )
 
@@ -1191,6 +1196,22 @@ def register(ctx: Any) -> None:
             )
         except Exception as exc:
             gw_log().warning("[infoflow] failed to register reply tool: %s", exc)
+        try:
+            register_tool(
+                name="infoflow_get_group_members",
+                toolset="hermes-infoflow",
+                schema=GROUP_MEMBERS_TOOL_SCHEMA,
+                handler=make_group_members_handler(),
+                is_async=True,
+                description=(
+                    "Fetch Infoflow group chat member list (humans and bots)."
+                ),
+                emoji="👥",
+            )
+        except Exception as exc:
+            gw_log().warning(
+                "[infoflow] failed to register group members tool: %s", exc,
+            )
 
     from .dashboard import make_plugin_hooks
 

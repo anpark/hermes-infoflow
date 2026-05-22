@@ -6,7 +6,7 @@
 # Mirrors openclaw-infoflow/scripts/deploy.sh.
 #
 # Usage:
-#   bash scripts/deploy.sh [--dry-run]
+#   bash scripts/deploy.sh [--dry-run] [--port PORT]
 set -euo pipefail
 
 PLUGIN_ID="${HERMES_INFOFLOW_PLUGIN_ID:-infoflow}"
@@ -17,8 +17,38 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 COMMON_SCRIPT="$SCRIPT_DIR/lib/deploy-common.sh"
 
 DRY_RUN="false"
-if [[ "${1:-}" == "--dry-run" ]]; then
-  DRY_RUN="true"
+PORT=""
+validate_port() {
+  local value="$1"
+  if [[ ! "$value" =~ ^[0-9]{1,5}$ ]] || (( 10#$value < 1 || 10#$value > 65535 )); then
+    echo "✗ --port must be an integer 1-65535 (got: $value)" >&2
+    exit 1
+  fi
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run)
+      DRY_RUN="true"
+      shift
+      ;;
+    --port)
+      if [[ $# -lt 2 ]]; then
+        echo "✗ --port requires a value" >&2
+        exit 1
+      fi
+      PORT="$2"
+      shift 2
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      echo "Usage: bash scripts/deploy.sh [--dry-run] [--port PORT]" >&2
+      exit 1
+      ;;
+  esac
+done
+if [[ -n "$PORT" ]]; then
+  validate_port "$PORT"
 fi
 
 run_cmd() {
@@ -143,6 +173,9 @@ COMMON_ARGS=(
   --plugin-id "$PLUGIN_ID"
   --config-file "$CONFIG_FILE"
 )
+if [[ -n "$PORT" ]]; then
+  COMMON_ARGS+=(--port "$PORT")
+fi
 if [[ "$DRY_RUN" == "true" ]]; then
   COMMON_ARGS+=(--dry-run)
 fi

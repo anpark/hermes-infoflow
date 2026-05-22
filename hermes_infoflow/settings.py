@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 # Defaults / constants
 # ---------------------------------------------------------------------------
 
-DEFAULT_PORT = 8646
+DEFAULT_PORT = 26521
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_WEBHOOK_PATH = "/webhook/infoflow"
 MAX_MESSAGE_LENGTH = 2048  # matches OpenClaw textChunkLimit

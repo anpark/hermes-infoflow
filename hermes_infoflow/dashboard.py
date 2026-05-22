@@ -269,9 +269,7 @@ class SessionTracker:
             return False
         if normalize_chat_id(meta.chat_id) == canonical:
             return True
-        if meta.user_id and normalize_chat_id(meta.user_id) == canonical:
-            return True
-        return False
+        return bool(meta.user_id and normalize_chat_id(meta.user_id) == canonical)
 
     def _session_payload_matches(self, session_id: str, canonical: str) -> bool:
         for ev in self.snapshot(session_id, cursor=0):
@@ -298,9 +296,11 @@ class SessionTracker:
         for sid, meta in self._meta.items():
             if sid.startswith("pending:"):
                 continue
-            if not self.meta_matches_canonical(meta, canonical):
-                if not self._session_payload_matches(sid, canonical):
-                    continue
+            if (
+                not self.meta_matches_canonical(meta, canonical)
+                and not self._session_payload_matches(sid, canonical)
+            ):
+                continue
             n_lines = count_terminal_lines(self, sid)
             if meta.status == "active":
                 rank = (1, meta.last_event_at, n_lines)

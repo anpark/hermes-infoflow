@@ -53,6 +53,14 @@ def test_register_registers_platform_and_tool() -> None:
     assert tool["is_async"] is True
     assert tool["schema"]["parameters"]["required"] == ["target"]
 
+    assert any(t["name"] == "infoflow_get_group_members" for t in ctx.tools)
+    members_tool = next(
+        t for t in ctx.tools if t["name"] == "infoflow_get_group_members"
+    )
+    assert members_tool["toolset"] == "hermes-infoflow"
+    assert members_tool["is_async"] is True
+    assert members_tool["schema"]["parameters"]["required"] == ["group_id"]
+
 
 def test_plugin_name_consistency() -> None:
     """plugin.yaml.name, register(name=...), and entry-point key must align."""
