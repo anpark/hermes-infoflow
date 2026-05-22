@@ -155,7 +155,8 @@ def test_pre_gateway_dispatch_peek_without_create(tracker: SessionTracker) -> No
 
     assert created["called"] is False
     assert tracker.lookup_session_id("bob") == "pending:bob"
-    assert len(tracker.snapshot("pending:bob")) == 1
+    kinds = [e.kind for e in tracker.snapshot("pending:bob")]
+    assert kinds == ["inbound", "display.user"]
 
 
 def test_pre_llm_call_binds_from_meta_chat_id(tracker: SessionTracker) -> None:
@@ -229,6 +230,141 @@ def test_lookup_prefers_session_with_terminal_lines(tracker: SessionTracker) -> 
     meta_rich.last_event_at = 500.0
 
     assert tracker.lookup_session_id("bob") == "rich-ended"
+
+
+def test_on_stream_delta_pushes_hermes_stream(tracker: SessionTracker) -> None:
+    hooks = make_plugin_hooks(tracker)
+    hooks["on_stream_delta"](
+        session_id="sess-s1",
+        platform="infoflow",
+        model="gpt-x",
+        delta_text="Hel",
+        content_type="text",
+        message_so_far="Hel",
+        stream_id="stream-1",
+    )
+    hooks["on_stream_delta"](
+        session_id="sess-s1",
+        platform="infoflow",
+        model="gpt-x",
+        delta_text="lo",
+        content_type="text",
+        message_so_far="Hello",
+        stream_id="stream-1",
+    )
+    snap = [e for e in tracker.snapshot("sess-s1") if e.kind == "display.hermes_stream"]
+    assert len(snap) == 2
+    assert snap[-1].payload["text"] == "Hello"
+    assert snap[-1].payload["stream_id"] == "stream-1"
+    assert snap[-1].payload["final"] is False
+
+
+def test_on_stream_delta_ignores_thinking(tracker: SessionTracker) -> None:
+    hooks = make_plugin_hooks(tracker)
+    hooks["on_stream_delta"](
+        session_id="sess-th",
+        platform="infoflow",
+        model="m",
+        delta_text="<think>",
+        content_type="thinking",
+        message_so_far="",
+        stream_id="thinking-1",
+    )
+    assert all(
+        e.kind != "display.hermes_stream"
+        for e in tracker.snapshot("sess-th")
+    )
+
+
+def test_post_llm_call_finalizes_stream_box_when_streaming(tracker: SessionTracker) -> None:
+    hooks = make_plugin_hooks(tracker)
+    hooks["on_stream_delta"](
+        session_id="sess-s2",
+        platform="infoflow",
+        model="m",
+        delta_text="Hi",
+        content_type="text",
+        message_so_far="Hi",
+        stream_id="stream-2",
+    )
+    hooks["post_llm_call"](
+        session_id="sess-s2",
+        user_message="ping",
+        assistant_response="Hi there",
+        conversation_history=[],
+        model="m",
+        platform="infoflow",
+    )
+    kinds = [e.kind for e in tracker.snapshot("sess-s2")]
+    # No raw display.hermes when streaming finalizes the stream box.
+    assert "display.hermes" not in kinds
+    finals = [
+        e for e in tracker.snapshot("sess-s2")
+        if e.kind == "display.hermes_stream" and e.payload.get("final")
+    ]
+    assert len(finals) == 1
+    assert finals[0].payload["text"] == "Hi there"
+    assert finals[0].payload["stream_id"] == "stream-2"
+
+
+def test_post_llm_call_falls_back_to_hermes_when_no_stream(tracker: SessionTracker) -> None:
+    hooks = make_plugin_hooks(tracker)
+    hooks["post_llm_call"](
+        session_id="sess-noS",
+        user_message="ping",
+        assistant_response="reply",
+        conversation_history=[],
+        model="m",
+        platform="infoflow",
+    )
+    kinds = [e.kind for e in tracker.snapshot("sess-noS")]
+    assert "display.hermes" in kinds
+    assert "display.hermes_stream" not in kinds
+
+
+def test_on_tool_progress_pushes_lines(tracker: SessionTracker) -> None:
+    hooks = make_plugin_hooks(tracker)
+    hooks["on_tool_progress"](
+        session_id="sess-tp",
+        task_id="",
+        tool_name="search_files",
+        tool_call_id="tc-1",
+        stage="start",
+        text="todos",
+        duration_ms=None,
+        is_error=False,
+    )
+    hooks["on_tool_progress"](
+        session_id="sess-tp",
+        task_id="",
+        tool_name="search_files",
+        tool_call_id="tc-1",
+        stage="end",
+        text="",
+        duration_ms=1234.0,
+        is_error=False,
+    )
+    events = [e for e in tracker.snapshot("sess-tp") if e.kind == "display.tool_progress"]
+    assert len(events) == 2
+    assert events[0].payload["stage"] == "start"
+    assert events[1].payload["stage"] == "end"
+    assert "1.2s" in events[1].payload["line"]
+
+
+def test_on_interim_assistant_pushes_interim_line(tracker: SessionTracker) -> None:
+    hooks = make_plugin_hooks(tracker)
+    hooks["on_interim_assistant"](
+        session_id="sess-ia",
+        platform="infoflow",
+        model="m",
+        message_text="let me check the file",
+        already_streamed=False,
+        reason="pre_tool",
+    )
+    events = [e for e in tracker.snapshot("sess-ia") if e.kind == "display.interim"]
+    assert len(events) == 1
+    assert events[0].payload["text"] == "let me check the file"
+    assert events[0].payload["reason"] == "pre_tool"
 
 
 def test_lookup_session_id_prefers_active_over_stale_map(tracker: SessionTracker) -> None:

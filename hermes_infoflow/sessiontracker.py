@@ -26,12 +26,14 @@ _SSE_RESPONSE_HEADERS = {
 }
 
 TERMINAL_EVENT_KINDS = frozenset({
+    "display.user",
     "display.tool_line",
+    "display.tool_progress",
     "display.hermes",
+    "display.hermes_stream",
     "display.status",
     "display.interim",
     "outbound.infoflow",
-    "llm.response",
     "tool.end",
     "session.start",
     "session.end",
@@ -112,9 +114,36 @@ def format_terminal_line(event: SessionEvent) -> dict[str, Any] | None:
         line = payload.get("line") or ""
         return {"line_kind": "tool", "text": str(line)}
 
+    if kind == "display.user":
+        text = payload.get("text") or ""
+        return {"line_kind": "user", "text": str(text)}
+
     if kind == "display.hermes":
         text = payload.get("text") or ""
-        return {"line_kind": "hermes", "text": str(text)}
+        return {"line_kind": "hermes", "text": str(text), "final": True}
+
+    if kind == "display.hermes_stream":
+        text = payload.get("text") or ""
+        stream_id = payload.get("stream_id") or ""
+        return {
+            "line_kind": "hermes",
+            "text": str(text),
+            "stream_id": str(stream_id),
+            "final": bool(payload.get("final")),
+        }
+
+    if kind == "display.interim":
+        text = payload.get("text") or ""
+        return {"line_kind": "interim", "text": str(text)}
+
+    if kind == "display.tool_progress":
+        text = payload.get("line") or payload.get("text") or ""
+        return {
+            "line_kind": "tool_progress",
+            "text": str(text),
+            "tool_call_id": str(payload.get("tool_call_id") or ""),
+            "stage": str(payload.get("stage") or ""),
+        }
 
     if kind == "display.status":
         return {"line_kind": "status", "text": str(payload.get("line") or "")}
@@ -124,11 +153,6 @@ def format_terminal_line(event: SessionEvent) -> dict[str, Any] | None:
             return None
         preview = payload.get("preview") or payload.get("chars")
         return {"line_kind": "tool", "text": f"┊ {preview}" if preview else "┊ …"}
-
-    if kind == "llm.response":
-        text = payload.get("assistant_response") or ""
-        if text:
-            return {"line_kind": "hermes", "text": str(text)}
 
     if kind == "tool.end" and not payload.get("_skip_fallback"):
         name = payload.get("tool_name") or "tool"
@@ -346,22 +370,32 @@ def _require_sessiontracker_params(handler: Callable[..., Any]) -> Callable[...,
 
 _SESSIONTRACKER_CSS = """
 :root { --bg: #0c0c0c; --text: #d4d4d4; --muted: #6a737d; --accent: #58a6ff;
-  --hermes-border: #3d5a80; --ok: #3dd68c; }
+  --user: #f0b67f; --hermes-border: #3d5a80; --ok: #3dd68c; --interim: #b48ead; }
 * { box-sizing: border-box; }
 html, body { height: 100%; margin: 0; }
 body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--bg);
-  color: var(--text); font-size: 13px; line-height: 1.5; }
+  color: var(--text); font-size: 13px; line-height: 1.55; }
 header { padding: 10px 14px; border-bottom: 1px solid #222; background: #111; flex-shrink: 0; }
 h1 { margin: 0; font-size: 14px; font-weight: 600; }
 #meta-line { color: var(--muted); font-size: 12px; margin-top: 4px; }
 #viewport { position: relative; flex: 1; min-height: 0; overflow: hidden; display: flex;
   flex-direction: column; }
 #terminal-wrap { flex: 1; overflow-y: auto; padding: 12px 14px 48px; }
+.user-line { color: var(--user); margin: 14px 0 6px; white-space: pre-wrap; word-break: break-word; }
+.user-line .bullet { color: var(--user); font-weight: 600; margin-right: 6px; }
 .tool-line { color: #9cdcfe; white-space: pre-wrap; word-break: break-word; margin: 2px 0; }
-.hermes-box { border: 1px solid var(--hermes-border); border-radius: 4px; margin: 12px 0;
+.tool-progress { color: #9cdcfe; opacity: 0.7; white-space: pre-wrap; word-break: break-word;
+  margin: 2px 0; }
+.tool-progress.is-done { opacity: 1; }
+.hermes-box { border: 1px solid var(--hermes-border); border-radius: 4px; margin: 10px 0;
   padding: 8px 10px; background: #141820; }
+.hermes-box.streaming { border-color: #4f7cb0; }
 .hermes-title { color: #7eb8ff; font-size: 12px; margin-bottom: 6px; }
 .hermes-body { white-space: pre-wrap; word-break: break-word; }
+.hermes-body .caret { color: #7eb8ff; opacity: 0.6; animation: blink 1s steps(2, start) infinite; }
+@keyframes blink { to { visibility: hidden; } }
+.interim-line { color: var(--interim); font-style: italic; margin: 6px 0; white-space: pre-wrap;
+  word-break: break-word; }
 .status-line { color: var(--muted); margin: 8px 0 4px; font-size: 12px; }
 .divider { color: var(--muted); margin: 10px 0; }
 #scroll-bottom { display: none; position: fixed; right: 20px; bottom: 20px; width: 44px;
@@ -433,17 +467,96 @@ function esc(s) {
   return d.innerHTML;
 }
 
+const streamBoxes = new Map();
+const progressLines = new Map();
+
+function ensureEmptyHintRemoved() {
+  const el = document.getElementById('empty-hint');
+  if (el) el.remove();
+}
+
+function renderHermesBox(text, { streaming = false, withCaret = false } = {}) {
+  const box = document.createElement('div');
+  box.className = 'hermes-box' + (streaming ? ' streaming' : '');
+  const body = document.createElement('div');
+  body.className = 'hermes-body';
+  body.textContent = text || '';
+  if (withCaret) {
+    const caret = document.createElement('span');
+    caret.className = 'caret';
+    caret.textContent = '▍';
+    body.appendChild(caret);
+  }
+  const head = document.createElement('div');
+  head.className = 'hermes-title';
+  head.textContent = '╭─ ⚕ Hermes ─────────────────';
+  const foot = document.createElement('div');
+  foot.className = 'hermes-title';
+  foot.textContent = '╰────────────────────────────────';
+  box.appendChild(head);
+  box.appendChild(body);
+  box.appendChild(foot);
+  return { box, body };
+}
+
 function appendBlock(block) {
   gotTerminalLines = true;
-  if (emptyHint) emptyHint.remove();
-  if (block.line_kind === 'hermes') {
-    const box = document.createElement('div');
-    box.className = 'hermes-box';
-    box.innerHTML = '<div class="hermes-title">╭─ ⚕ Hermes ─────────────────</div>'
-      + '<div class="hermes-body">' + esc(block.text || '') + '</div>'
-      + '<div class="hermes-title">╰────────────────────────────────</div>';
-    terminal.appendChild(box);
-  } else if (block.line_kind === 'status') {
+  ensureEmptyHintRemoved();
+  const kind = block.line_kind;
+
+  if (kind === 'user') {
+    const p = document.createElement('div');
+    p.className = 'user-line';
+    const dot = document.createElement('span');
+    dot.className = 'bullet';
+    dot.textContent = '●';
+    p.appendChild(dot);
+    const txt = document.createElement('span');
+    txt.textContent = block.text || '';
+    p.appendChild(txt);
+    terminal.appendChild(p);
+  } else if (kind === 'hermes' && block.stream_id) {
+    let entry = streamBoxes.get(block.stream_id);
+    if (!entry) {
+      const made = renderHermesBox(block.text || '', { streaming: !block.final, withCaret: !block.final });
+      terminal.appendChild(made.box);
+      entry = made;
+      streamBoxes.set(block.stream_id, entry);
+    } else {
+      entry.body.textContent = block.text || '';
+      if (block.final) {
+        entry.box.classList.remove('streaming');
+      } else {
+        const caret = document.createElement('span');
+        caret.className = 'caret';
+        caret.textContent = '▍';
+        entry.body.appendChild(caret);
+      }
+    }
+    if (block.final) streamBoxes.delete(block.stream_id);
+  } else if (kind === 'hermes') {
+    const made = renderHermesBox(block.text || '', { streaming: false, withCaret: false });
+    terminal.appendChild(made.box);
+  } else if (kind === 'interim') {
+    const p = document.createElement('div');
+    p.className = 'interim-line';
+    p.textContent = block.text || '';
+    terminal.appendChild(p);
+  } else if (kind === 'tool_progress') {
+    const key = block.tool_call_id || ('tp:' + (block.seq || 0));
+    let p = progressLines.get(key);
+    if (!p) {
+      p = document.createElement('div');
+      p.className = 'tool-progress';
+      terminal.appendChild(p);
+      progressLines.set(key, p);
+    }
+    p.textContent = block.text || '';
+    if (block.stage === 'end') {
+      p.classList.add('is-done');
+      progressLines.delete(key);
+    }
+  } else if (kind === 'status') {
     const p = document.createElement('div');
     p.className = 'status-line';
     p.textContent = block.text || '';
@@ -458,6 +571,11 @@ function appendBlock(block) {
     terminal.scrollTop = terminal.scrollHeight;
   }
   updateScrollButton();
+}
+
+function resetRenderState() {
+  streamBoxes.clear();
+  progressLines.clear();
 }
 
 function connectStream() {
@@ -532,6 +650,7 @@ async function applyResolve(info) {
     sessionId = info.session_id;
     lineCursor = 0;
     gotTerminalLines = false;
+    resetRenderState();
     document.getElementById('terminal-wrap').innerHTML =
       '<p class="empty" id="empty-hint">Loading…</p>';
     connectStream();

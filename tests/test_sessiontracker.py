@@ -54,10 +54,10 @@ def test_normalize_chat_id() -> None:
     assert normalize_chat_id("alice") == "alice"
 
 
-def test_format_terminal_line_llm_response_fallback() -> None:
+def test_format_terminal_line_llm_response_is_metadata() -> None:
+    """llm.response is dashboard metadata, not a terminal line (avoids duplicate)."""
     ev = SessionEvent(1, 0.0, "llm.response", {"assistant_response": "Hello back"})
-    block = format_terminal_line(ev)
-    assert block == {"line_kind": "hermes", "text": "Hello back"}
+    assert format_terminal_line(ev) is None
 
 
 def test_format_terminal_line_display_kinds() -> None:
@@ -65,10 +65,45 @@ def test_format_terminal_line_display_kinds() -> None:
     assert format_terminal_line(tool_ev) == {"line_kind": "tool", "text": "┊ 💻 $ ls"}
 
     hermes_ev = SessionEvent(2, 0.0, "display.hermes", {"text": "Hello"})
-    assert format_terminal_line(hermes_ev) == {"line_kind": "hermes", "text": "Hello"}
+    assert format_terminal_line(hermes_ev) == {
+        "line_kind": "hermes",
+        "text": "Hello",
+        "final": True,
+    }
 
     status_ev = SessionEvent(3, 0.0, "display.status", {"line": "⚕ gpt-4"})
     assert format_terminal_line(status_ev) == {"line_kind": "status", "text": "⚕ gpt-4"}
+
+    user_ev = SessionEvent(4, 0.0, "display.user", {"text": "ping"})
+    assert format_terminal_line(user_ev) == {"line_kind": "user", "text": "ping"}
+
+    stream_ev = SessionEvent(
+        5, 0.0, "display.hermes_stream",
+        {"text": "Hel", "stream_id": "s1", "final": False},
+    )
+    assert format_terminal_line(stream_ev) == {
+        "line_kind": "hermes",
+        "text": "Hel",
+        "stream_id": "s1",
+        "final": False,
+    }
+
+    interim_ev = SessionEvent(6, 0.0, "display.interim", {"text": "thinking…"})
+    assert format_terminal_line(interim_ev) == {
+        "line_kind": "interim",
+        "text": "thinking…",
+    }
+
+    progress_ev = SessionEvent(
+        7, 0.0, "display.tool_progress",
+        {"line": "┊ ⚡ search", "tool_call_id": "c1", "stage": "start"},
+    )
+    assert format_terminal_line(progress_ev) == {
+        "line_kind": "tool_progress",
+        "text": "┊ ⚡ search",
+        "tool_call_id": "c1",
+        "stage": "start",
+    }
 
 
 def test_format_terminal_line_outbound_progress() -> None:

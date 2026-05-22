@@ -441,6 +441,8 @@ def _peek_gateway_session(
 def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
     """Build hermes-agent plugin hook callbacks for the tracker."""
 
+    _stream_state: dict[str, dict[str, Any]] = {}
+
     def _safe(fn: Callable[..., Any]) -> Callable[..., Any]:
         def wrapper(**kwargs: Any) -> None:
             try:
@@ -521,13 +523,28 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
         sid = kw.get("session_id") or ""
         plat = _platform_str(kw.get("platform"))
         text = kw.get("assistant_response") or ""
-        tracker.push_event(
-            sid,
-            "display.hermes",
-            {"text": _trunc(text, MAX_TEXT_PREVIEW)},
-            platform=plat,
-            model=str(kw.get("model") or ""),
-        )
+        active = _stream_state.pop(sid, None)
+        if active and text:
+            tracker.push_event(
+                sid,
+                "display.hermes_stream",
+                {
+                    "text": _trunc(text, MAX_TEXT_PREVIEW),
+                    "stream_id": active.get("stream_id", ""),
+                    "model": kw.get("model"),
+                    "final": True,
+                },
+                platform=plat,
+                model=str(kw.get("model") or ""),
+            )
+        else:
+            tracker.push_event(
+                sid,
+                "display.hermes",
+                {"text": _trunc(text, MAX_TEXT_PREVIEW)},
+                platform=plat,
+                model=str(kw.get("model") or ""),
+            )
         tracker.push_event(
             sid,
             "llm.response",
@@ -655,8 +672,9 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
                 meta.user_id = user_id or ""
                 meta.platform = plat or meta.platform
         text = getattr(event, "text", "") or ""
+        target_sid = session_id or tracker.resolve_session_id(chat_id=chat_id)
         tracker.push_event(
-            session_id or tracker.resolve_session_id(chat_id=chat_id),
+            target_sid,
             "inbound",
             {
                 "platform": plat,
@@ -670,6 +688,107 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
             platform=plat,
             chat_id=chat_id,
         )
+        if text:
+            tracker.push_event(
+                target_sid,
+                "display.user",
+                {
+                    "text": _trunc(text, MAX_TEXT_PREVIEW),
+                    "user_id": user_id,
+                    "user_name": getattr(source, "user_name", None),
+                    "chat_id": chat_id,
+                },
+                platform=plat,
+                chat_id=chat_id,
+            )
+
+    @_safe
+    def on_stream_delta(**kw: Any) -> None:
+        sid = kw.get("session_id") or ""
+        if not sid:
+            return
+        content_type = str(kw.get("content_type") or "text")
+        if content_type != "text":
+            return
+        text = kw.get("message_so_far") or kw.get("delta_text") or ""
+        if not text:
+            return
+        stream_id = str(kw.get("stream_id") or "")
+        plat = _platform_str(kw.get("platform"))
+        _stream_state[sid] = {"stream_id": stream_id, "text": text}
+        tracker.push_event(
+            sid,
+            "display.hermes_stream",
+            {
+                "text": _trunc(text, MAX_TEXT_PREVIEW),
+                "stream_id": stream_id,
+                "model": kw.get("model"),
+                "final": False,
+            },
+            platform=plat,
+            model=str(kw.get("model") or ""),
+        )
+
+    @_safe
+    def on_tool_progress(**kw: Any) -> None:
+        sid = kw.get("session_id") or ""
+        if not sid:
+            return
+        stage = str(kw.get("stage") or "")
+        tool_name = str(kw.get("tool_name") or "tool")
+        text = kw.get("text") or ""
+        if stage == "start":
+            try:
+                from agent.display import get_tool_emoji
+
+                emoji = get_tool_emoji(tool_name)
+            except Exception:
+                emoji = "⚙️"
+            preview = f"┊ {emoji} {tool_name}"
+            if text:
+                preview += f"  {text}"
+            line_text = preview
+        elif stage == "end":
+            dur_ms = kw.get("duration_ms")
+            dur_s = f" {float(dur_ms) / 1000.0:.1f}s" if dur_ms else ""
+            err_tag = " [error]" if kw.get("is_error") else ""
+            line_text = f"┊ ✓ {tool_name}{dur_s}{err_tag}"
+        else:
+            line_text = text or f"┊ … {tool_name}"
+        tracker.push_event(
+            sid,
+            "display.tool_progress",
+            {
+                "line": line_text,
+                "stage": stage,
+                "tool_name": tool_name,
+                "tool_call_id": kw.get("tool_call_id") or "",
+                "duration_ms": kw.get("duration_ms"),
+                "is_error": bool(kw.get("is_error")),
+            },
+        )
+
+    @_safe
+    def on_interim_assistant(**kw: Any) -> None:
+        sid = kw.get("session_id") or ""
+        if not sid:
+            return
+        text = kw.get("message_text") or ""
+        if not text:
+            return
+        plat = _platform_str(kw.get("platform"))
+        tracker.push_event(
+            sid,
+            "display.interim",
+            {
+                "text": _trunc(text, MAX_TEXT_PREVIEW),
+                "reason": kw.get("reason") or "",
+                "already_streamed": bool(kw.get("already_streamed")),
+                "model": kw.get("model"),
+            },
+            platform=plat,
+            model=str(kw.get("model") or ""),
+        )
 
     return {
         "on_session_start": on_session_start,
@@ -681,6 +800,9 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
         "post_tool_call": post_tool_call,
         "post_api_request": post_api_request,
         "pre_gateway_dispatch": pre_gateway_dispatch,
+        "on_stream_delta": on_stream_delta,
+        "on_tool_progress": on_tool_progress,
+        "on_interim_assistant": on_interim_assistant,
     }
 
 
