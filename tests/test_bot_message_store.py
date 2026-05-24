@@ -11,6 +11,7 @@ from hermes_infoflow.bot import Bot
 from hermes_infoflow.itypes import BodyItem, IncomingMessage, SentResult
 from hermes_infoflow.message_store import MessageStore
 from hermes_infoflow.policy import GroupPolicy
+from hermes_infoflow.recall import get_inbound_body
 from hermes_infoflow.sent_store import SentMessageStore
 
 
@@ -154,6 +155,33 @@ async def test_group_at_all_is_recorded_separately_from_direct_mention(
     assert found is not None
     assert found.mentions_you is False
     assert found.mentions_everyone is True
+
+
+@pytest.mark.asyncio
+async def test_at_only_message_registers_rendered_reply_preview(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot, store, _sent_store = _bot(tmp_path, monkeypatch)
+
+    result = await bot.process_inbound(
+        IncomingMessage(
+            message_id="at-only-reply-context",
+            dedupe_key="at-only-reply-context",
+            text="",
+            group_id="1",
+            sender_id="alice",
+            bot_was_mentioned=True,
+            is_at_only=True,
+            body_items=[BodyItem(type="AT", name="helper", robot_id="999")],
+            raw_data={"message": {"body": [{"type": "AT", "robotid": "999"}]}},
+        )
+    )
+
+    assert result.should_dispatch is False
+    found = store.find_group("at-only-reply-context")
+    assert found is not None
+    assert found.content.startswith("（仅@了以下对象，无正文：@helper")
+    assert get_inbound_body("at-only-reply-context") == found.content
 
 
 @pytest.mark.asyncio

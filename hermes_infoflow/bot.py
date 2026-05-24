@@ -730,6 +730,9 @@ class Bot:
                 reply_to_bot_id = tgt.message_id or None
                 break
 
+        self._upsert_participants_from_message(msg)
+        content = self._render_message_content(msg)
+
         if register_recall:
             _register_inbound_context(
                 _InboundContext(
@@ -738,7 +741,7 @@ class Bot:
                     inbound_message_id=msg.message_id,
                     reply_to_bot_message_id=reply_to_bot_id,
                     reply_targets=[reply_target_to_dict(t) for t in reply_targets],
-                    inbound_body=msg.text or "",
+                    inbound_body=content or msg.text or "",
                     sender_imid=msg.sender_imid or "",
                     sender_id=msg.sender_id if not msg.sender_is_bot else "",
                     sender_agent_id=str(getattr(msg, "sender_agent_id", "") or ""),
@@ -752,8 +755,6 @@ class Bot:
         raw_json = json.dumps(msg.raw_data, ensure_ascii=False) if msg.raw_data else ""
         msg_time = self._msg_time_ms(msg)
         self_id = self_key(self._settings)
-        self._upsert_participants_from_message(msg)
-        content = self._render_message_content(msg)
         if msg.dm_user_id is not None:
             peer = private_peer_key(msg.dm_user_id)
             sender = self_id if is_outgoing_hint else user_key(msg.sender_id)
