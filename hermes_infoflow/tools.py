@@ -87,8 +87,9 @@ RECALL_TOOL_SCHEMA = {
         "撤回该会话中你(机器人)最近的 N 条消息\n\n"
         "**message_id 来源：**\n"
         "- ✅ 你发送消息后返回的 ID\n"
-        "- ✅ 用户 reply 你的消息时，文本中 `<引用 message_id:xxx>` 里的 xxx"
-        "（这是被引用消息的 ID，即你的消息）\n"
+        "- ✅ 用户 reply 你的消息时，文本中 "
+        "`<Quote message_id:'xxx'; sender:'bot:...'>...</Quote>` 里的 xxx"
+        "（这是被引用消息的 ID，即你的消息；传参时不要带引号）\n"
         "- ❌ 用户当前消息本身的 inbound ID（那是用户的消息，传入会失败）\n\n"
         "典型场景：用户 reply 了你的一条消息说\"撤回这个\"，"
         "直接从引用标签中取出 message_id 传入即可。"
@@ -205,7 +206,7 @@ HISTORY_TOOL_SCHEMA = {
         "获取当前如流会话或指定如流会话的历史消息。"
         "成功和失败都返回 JSON 字符串；成功时是 JSON 数组字符串，"
         "每项包含 `time` 和 `content`。`content` 与当前 User Message 的"
-        "结构化 envelope 一致，但不包含 Hidden History / Handling Strategy。"
+        "结构化 envelope 一致，但不包含 Unread Message Context / Handling Strategy。"
     ),
     "parameters": {
         "type": "object",
@@ -237,18 +238,22 @@ HISTORY_TOOL_SCHEMA = {
                 "description": (
                     "可选。按消息 ID 查询单条消息，或作为窗口查询锚点。"
                     "提供后优先使用 message_id 模式，忽略 start_time/end_time。"
+                    "只提供 message_id 时返回锚点消息本身；配合 before_count/after_count "
+                    "使用时返回窗口：before_count 条锚点前消息 + 锚点消息本身 + "
+                    "after_count 条锚点后消息。before_count/after_count 的计数"
+                    "不包含锚点，但返回结果包含锚点消息。"
                 ),
             },
             "before_count": {
                 "type": "integer",
-                "description": "配合 message_id 使用，返回锚点之前的消息条数。",
+                "description": "配合 message_id 使用，返回锚点之前的消息条数；计数不包含锚点，但结果包含锚点。",
                 "minimum": 0,
                 "maximum": 100,
                 "default": 0,
             },
             "after_count": {
                 "type": "integer",
-                "description": "配合 message_id 使用，返回锚点之后的消息条数。",
+                "description": "配合 message_id 使用，返回锚点之后的消息条数；计数不包含锚点，但结果包含锚点。",
                 "minimum": 0,
                 "maximum": 100,
                 "default": 0,

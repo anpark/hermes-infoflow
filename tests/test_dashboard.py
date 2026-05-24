@@ -11,11 +11,13 @@ import types
 import pytest
 
 from hermes_infoflow.dashboard import (
+    MAX_TEXT_PREVIEW,
     SessionTracker,
     dashboard_enabled,
     get_tracker,
     make_plugin_hooks,
     register_routes,
+    sessiontracker_full_user_message_enabled,
 )
 
 
@@ -206,6 +208,68 @@ def test_pre_gateway_dispatch_display_user_filters_injected_prompt(
     display = next(e for e in events if e.kind == "display.user")
     assert inbound.payload["text"] == full_text
     assert display.payload["text"] == "  真实用户消息\n第二行  "
+    assert "full_text" not in display.payload
+
+
+def test_pre_gateway_dispatch_display_user_records_full_prompt_for_admin_view(
+    tracker: SessionTracker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("INFOFLOW_SESSIONTRACKER_FULL_USER_MESSAGE", "true")
+
+    class _Platform:
+        value = "infoflow"
+
+    source = SimpleNamespace(
+        platform=_Platform(),
+        chat_id="alice",
+        chat_type="dm",
+        user_id="alice",
+        user_name="Alice",
+    )
+    user_body = "真实用户消息\n" + ("x" * (MAX_TEXT_PREVIEW + 1))
+    full_text = (
+        "Infoflow injected prompt\n\n"
+        "[Sender: alice | human]\n"
+        "[message_id: mid-1]\n"
+        "[Message]\n"
+        + user_body
+    )
+    event = SimpleNamespace(source=source, text=full_text)
+    entry = SimpleNamespace(session_id="gw-sess-1", session_key="agent:main:infoflow:dm:alice")
+
+    session_store = SimpleNamespace(_entries={"agent:main:infoflow:dm:alice": entry})
+    session_store._ensure_loaded = lambda: None  # type: ignore[method-assign]
+    gateway = SimpleNamespace(
+        _session_key_for_source=lambda src: "agent:main:infoflow:dm:alice",
+    )
+
+    hooks = make_plugin_hooks(tracker)
+    hooks["pre_gateway_dispatch"](
+        event=event,
+        gateway=gateway,
+        session_store=session_store,
+    )
+
+    display = next(e for e in tracker.snapshot("gw-sess-1") if e.kind == "display.user")
+    assert display.payload["text"].startswith("真实用户消息\n")
+    assert display.payload["text"].endswith(
+        f"... ({len(user_body)} chars total)"
+    )
+    assert display.payload["full_text"] == full_text
+
+
+def test_sessiontracker_full_user_message_enabled_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("INFOFLOW_SESSIONTRACKER_FULL_USER_MESSAGE", raising=False)
+    assert sessiontracker_full_user_message_enabled() is False
+    monkeypatch.setenv("INFOFLOW_SESSIONTRACKER_FULL_USER_MESSAGE", "true")
+    assert sessiontracker_full_user_message_enabled() is True
+    monkeypatch.setenv("INFOFLOW_SESSIONTRACKER_FULL_USER_MESSAGE", "false")
+    assert sessiontracker_full_user_message_enabled() is False
 
 
 def test_pre_gateway_dispatch_display_user_keeps_non_infoflow_message_marker(

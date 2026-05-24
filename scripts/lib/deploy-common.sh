@@ -682,6 +682,16 @@ if [[ "$DRY_RUN" == "true" ]]; then
 fi
 run_cmd "$PY" "$EDIT_ENV_SCRIPT" "${ENV_ARGS[@]}"
 
+echo "==> Configuring INFOFLOW_SESSIONTRACKER_FULL_USER_MESSAGE in $HERMES_ENV_FILE"
+ENV_ARGS=(
+  --env-file "$HERMES_ENV_FILE"
+  --ensure "INFOFLOW_SESSIONTRACKER_FULL_USER_MESSAGE=false"
+)
+if [[ "$DRY_RUN" == "true" ]]; then
+  ENV_ARGS+=(--dry-run)
+fi
+run_cmd "$PY" "$EDIT_ENV_SCRIPT" "${ENV_ARGS[@]}"
+
 gateway_status_indicates_running() {
   local text="$1"
   if printf '%s\n' "$text" | grep -Eiq "not[[:space:]-]+running|stopped|inactive"; then

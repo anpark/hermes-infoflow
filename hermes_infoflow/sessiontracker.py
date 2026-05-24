@@ -13,7 +13,13 @@ from collections.abc import Callable
 from typing import Any
 
 from .api import InfoflowAccountAPI, InfoflowAPIError, get_user_info_by_code
-from .dashboard import SessionEvent, SessionTracker, normalize_chat_id, sessiontracker_enabled
+from .dashboard import (
+    SessionEvent,
+    SessionTracker,
+    normalize_chat_id,
+    sessiontracker_enabled,
+    sessiontracker_full_user_message_enabled,
+)
 from .settings import DEFAULT_API_HOST
 
 logger = logging.getLogger(__name__)
@@ -106,7 +112,11 @@ async def resolve_user_id_by_code_cached(
     return user_id
 
 
-def format_terminal_line(event: SessionEvent) -> dict[str, Any] | None:
+def format_terminal_line(
+    event: SessionEvent,
+    *,
+    show_full_user_message: bool = False,
+) -> dict[str, Any] | None:
     """Map a tracker event to a terminal render unit for the Web UI."""
     kind = event.kind
     payload = event.payload or {}
@@ -116,7 +126,11 @@ def format_terminal_line(event: SessionEvent) -> dict[str, Any] | None:
         return {"line_kind": "tool", "text": str(line)}
 
     if kind == "display.user":
-        text = payload.get("text") or ""
+        text = (
+            payload.get("full_text")
+            if show_full_user_message and payload.get("full_text") is not None
+            else payload.get("text")
+        ) or ""
         return {"line_kind": "user", "text": str(text)}
 
     if kind == "display.hermes":
@@ -150,6 +164,9 @@ def format_terminal_line(event: SessionEvent) -> dict[str, Any] | None:
         return {"line_kind": "status", "text": str(payload.get("line") or "")}
 
     if kind == "outbound.infoflow":
+        if payload.get("suppressed_group_status"):
+            preview = payload.get("preview") or payload.get("chars") or ""
+            return {"line_kind": "status", "text": str(preview)}
         if not payload.get("is_progress_hint"):
             return None
         preview = payload.get("preview") or payload.get("chars")
@@ -174,20 +191,31 @@ def collect_terminal_blocks(
     session_id: str,
     *,
     cursor: int = 0,
+    show_full_user_message: bool = False,
 ) -> list[dict[str, Any]]:
     """Build renderable terminal blocks for a session snapshot."""
     blocks: list[dict[str, Any]] = []
     for ev in tracker.snapshot(session_id, cursor=cursor):
         if ev.kind not in TERMINAL_EVENT_KINDS:
             continue
-        block = event_to_terminal_dict(ev)
+        block = event_to_terminal_dict(
+            ev,
+            show_full_user_message=show_full_user_message,
+        )
         if block is not None:
             blocks.append(block)
     return blocks
 
 
-def event_to_terminal_dict(event: SessionEvent) -> dict[str, Any] | None:
-    block = format_terminal_line(event)
+def event_to_terminal_dict(
+    event: SessionEvent,
+    *,
+    show_full_user_message: bool = False,
+) -> dict[str, Any] | None:
+    block = format_terminal_line(
+        event,
+        show_full_user_message=show_full_user_message,
+    )
     if block is None:
         return None
     return {
@@ -337,6 +365,44 @@ def _read_infoflow_account() -> InfoflowAccountAPI:
         app_secret=app_secret,
         app_agent_id=int(agent_raw),
     )
+
+
+async def _viewer_can_see_full_user_message(
+    *,
+    code: str,
+    account: InfoflowAccountAPI | None,
+) -> bool:
+    if not sessiontracker_full_user_message_enabled():
+        return False
+    admin = os.getenv("INFOFLOW_ADMIN_USER", "").strip().lower()
+    if not admin or not (code or "").strip() or account is None:
+        return False
+    try:
+        viewer_user_id = await resolve_user_id_by_code_cached(account, code)
+    except (InfoflowAPIError, ValueError):
+        return False
+    return viewer_user_id.strip().lower() == admin
+
+
+def _account_for_sessiontracker_request(
+    chat_type: int,
+    code: str,
+) -> tuple[InfoflowAccountAPI | None, str | None]:
+    if chat_type == 7:
+        try:
+            return _read_infoflow_account(), None
+        except ValueError as exc:
+            return None, str(exc)
+    if (
+        (code or "").strip()
+        and sessiontracker_full_user_message_enabled()
+        and os.getenv("INFOFLOW_ADMIN_USER", "").strip()
+    ):
+        try:
+            return _read_infoflow_account(), None
+        except ValueError:
+            return None, None
+    return None, None
 
 
 def _parse_query(request: Any) -> tuple[int, str, str]:
@@ -752,12 +818,9 @@ def register_sessiontracker_routes(
         chat_type = kw["chat_type"]
         chat_id = kw["chat_id"]
         code = kw["code"]
-        account = None
-        if chat_type == 7:
-            try:
-                account = _read_infoflow_account()
-            except ValueError as exc:
-                return web.Response(status=500, text=str(exc))
+        account, account_error = _account_for_sessiontracker_request(chat_type, code)
+        if account_error:
+            return web.Response(status=500, text=account_error)
         try:
             info = await resolve_target(
                 tracker,
@@ -785,12 +848,9 @@ def register_sessiontracker_routes(
         chat_type = kw["chat_type"]
         chat_id = kw["chat_id"]
         code = kw["code"]
-        account = None
-        if chat_type == 7:
-            try:
-                account = _read_infoflow_account()
-            except ValueError as exc:
-                return web.Response(status=500, text=str(exc))
+        account, account_error = _account_for_sessiontracker_request(chat_type, code)
+        if account_error:
+            return web.Response(status=500, text=account_error)
         try:
             canonical = await canonical_for_stream_access(
                 tracker,
@@ -808,6 +868,11 @@ def register_sessiontracker_routes(
         if not session_matches_target(tracker, sid, canonical):
             return web.Response(status=403, text="session_id does not match target")
 
+        show_full_user_message = await _viewer_can_see_full_user_message(
+            code=code,
+            account=account,
+        )
+
         try:
             cursor = _parse_cursor(request.rel_url.query.get("cursor", "0"))
         except ValueError as exc:
@@ -822,7 +887,12 @@ def register_sessiontracker_routes(
         q = tracker.subscribe(sid)
         try:
             seq_cursor = cursor
-            for block in collect_terminal_blocks(tracker, sid, cursor=cursor):
+            for block in collect_terminal_blocks(
+                tracker,
+                sid,
+                cursor=cursor,
+                show_full_user_message=show_full_user_message,
+            ):
                 seq_cursor = max(seq_cursor, int(block.get("seq", 0)))
                 payload = json.dumps(block, ensure_ascii=False, default=str)
                 await response.write(f"data: {payload}\n\n".encode())
@@ -839,7 +909,10 @@ def register_sessiontracker_routes(
                     continue
                 if ev.seq <= seq_cursor:
                     continue
-                block = event_to_terminal_dict(ev)
+                block = event_to_terminal_dict(
+                    ev,
+                    show_full_user_message=show_full_user_message,
+                )
                 if block is None:
                     continue
                 seq_cursor = ev.seq
@@ -862,12 +935,9 @@ def register_sessiontracker_routes(
         chat_type = kw["chat_type"]
         chat_id = kw["chat_id"]
         code = kw["code"]
-        account = None
-        if chat_type == 7:
-            try:
-                account = _read_infoflow_account()
-            except ValueError as exc:
-                return web.Response(status=500, text=str(exc))
+        account, account_error = _account_for_sessiontracker_request(chat_type, code)
+        if account_error:
+            return web.Response(status=500, text=account_error)
         try:
             canonical = await canonical_for_stream_access(
                 tracker,
@@ -885,6 +955,11 @@ def register_sessiontracker_routes(
         if not session_matches_target(tracker, sid, canonical):
             return web.Response(status=403, text="session_id does not match target")
 
+        show_full_user_message = await _viewer_can_see_full_user_message(
+            code=code,
+            account=account,
+        )
+
         try:
             cursor = _parse_cursor(request.rel_url.query.get("cursor", "0"))
         except ValueError as exc:
@@ -892,7 +967,12 @@ def register_sessiontracker_routes(
 
         return web.json_response({
             "session_id": sid,
-            "lines": collect_terminal_blocks(tracker, sid, cursor=cursor),
+            "lines": collect_terminal_blocks(
+                tracker,
+                sid,
+                cursor=cursor,
+                show_full_user_message=show_full_user_message,
+            ),
         })
 
     app.router.add_get(root, page)

@@ -152,7 +152,7 @@ def test_build_message_event_uses_settings_agent_id_for_bot_identity(
     event = asyncio.run(_go())
     assert "agent_id=6471" in event.channel_prompt
     assert (
-        f"[Message: message_id=mid-1; created_time={format_created_time_ms(created_time)}]"
+        f"[Message: message_id:'mid-1'; created_time:'{format_created_time_ms(created_time)}']"
         in event.text
     )
 
@@ -276,7 +276,7 @@ def test_processing_context_binding_replaces_inherited_values(configured_env) ->
     asyncio.run(_go())
 
 
-def test_hidden_history_line_injected_and_context_state_updated(
+def test_unread_message_context_line_injected_and_context_state_updated(
     configured_env, monkeypatch, tmp_path,
 ) -> None:
     monkeypatch.setattr(ms, "_STATE_BASE_DIR", tmp_path)
@@ -314,8 +314,8 @@ def test_hidden_history_line_injected_and_context_state_updated(
         message_id="M3",
     )
     event = MessageEvent(
-        text="[Attention: mentions_you=true]\n[Sender: type=human; user_id=carol]\n"
-        "[Message: message_id=M3]\ncurrent",
+        text="[Attention: mentions_you=true]\n[Sender: type:'human'; user_id:'carol']\n"
+        "[Message: message_id:'M3']\ncurrent",
         message_type=MessageType.TEXT,
         source=source,
         raw_message={"infoflow_standard_message": True},
@@ -336,9 +336,9 @@ def test_hidden_history_line_injected_and_context_state_updated(
     asyncio.run(_go())
 
     assert event.text.startswith(
-        "[Hidden History: count=1; tool=infoflow_get_message_history]\n"
+        "[Unread Message Context: 有 1 条未展示历史消息。请优先调用 infoflow_get_message_history"
     )
-    assert event.raw_message["infoflow_hidden_history_count"] == 1
+    assert event.raw_message["infoflow_unread_message_context_count"] == 1
     state = store.get_llm_context_state(context_key)
     assert state is not None
     assert state.last_llm_visible_message_id == "M3"
@@ -433,6 +433,11 @@ def test_outbound_send_records_dedup_id(configured_env, monkeypatch) -> None:
     assert "MSG-1" in adapter._dedup_set
     assert "MSG-1" in adapter._sent_message_ids
     assert adapter._sent_store.find("alice", "MSG-1") is not None
+    fresh_store = SentMessageStore(
+        db_path=adapter._sent_store.db_path,
+        account_id=adapter._settings["app_key"],
+    )
+    assert fresh_store.find("alice", "MSG-1") is not None
 
 
 def test_send_image_rejects_path_traversal(configured_env) -> None:
@@ -696,6 +701,47 @@ def test_group_runtime_status_suppression_survives_admin_redirect_exception(
         item["chat_id"] == "group:42"
         and item["extra"]["suppressed_group_status"] is True
         and item["extra"]["redirected_to_admin"] is False
+        for item in pushed
+    )
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "📦 Preflight compression: ~109,133 tokens >= 102,400 threshold. This may take a moment.",
+        "��� Preflight compression: ~109,133 tokens >= 102,400 threshold. This may take a moment.",
+        "🗜️ Compacting context — summarizing earlier conversation so I can continue...",
+        "���️ Compacting context — summarizing earlier conversation so I can continue...",
+        "⚠ Compression summary failed: <!doctype html>",
+    ],
+)
+def test_group_compression_status_is_suppressed_without_admin_redirect(
+    configured_env, monkeypatch, content
+) -> None:
+    monkeypatch.setenv("INFOFLOW_ADMIN_USER", "admin01")
+    adapter = InfoflowAdapter(_make_config())
+    adapter._bot.send_message = AsyncMock()
+    adapter._push_infoflow_event = MagicMock()
+
+    async def fake_send_group(*args, **kwargs):
+        raise AssertionError("group send must not be called for compression status")
+
+    monkeypatch.setattr(_api, "send_group_message", fake_send_group)
+
+    async def _go():
+        return await adapter.send("group:4507088", content)
+
+    result = asyncio.run(_go())
+
+    assert result.success is True
+    adapter._bot.send_message.assert_not_awaited()
+    pushed = [call.kwargs for call in adapter._push_infoflow_event.call_args_list]
+    assert any(
+        item["chat_id"] == "group:4507088"
+        and item["extra"]["suppressed_group_status"] is True
+        and item["extra"]["sessiontracker_only_status"] is True
+        and item["extra"]["redirected_to_admin"] is False
+        and item["extra"]["preview"] == content[:200]
         for item in pushed
     )
 

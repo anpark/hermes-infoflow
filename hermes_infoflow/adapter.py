@@ -33,12 +33,27 @@ import logging
 import os
 import re
 import socket as _socket
+from pathlib import Path
 from typing import Any
 
 _PROGRESS_LINE_RE = re.compile(r"^[┊\s]*[🔍⚙️💻🌐📁📝🧠✨]")
 _GROUP_STATUS_REDIRECT_PREFIXES = (
     "⚡ Interrupting current task",
     "💾 Self-improvement review:",
+)
+_GROUP_STATUS_TRACKER_ONLY_PREFIXES = (
+    "📦 Preflight compression:",
+    "🗜️ Compacting context",
+    "⚠ Compression summary failed:",
+    "⚠ Compression aborted:",
+    "ℹ Configured compression model",
+)
+_GROUP_STATUS_TRACKER_ONLY_TEXT_PREFIXES = (
+    "Preflight compression:",
+    "Compacting context",
+    "Compression summary failed:",
+    "Compression aborted:",
+    "Configured compression model",
 )
 GATEWAY_STARTED_NOTICE = "gateway started"
 
@@ -56,6 +71,25 @@ def _group_status_redirect_kind(text: str) -> str:
         if t.startswith(prefix):
             return prefix
     return ""
+
+
+def _group_status_tracker_only_kind(text: str) -> str:
+    t = (text or "").lstrip()
+    for prefix in _GROUP_STATUS_TRACKER_ONLY_PREFIXES:
+        if t.startswith(prefix):
+            return prefix
+    normalized = _drop_leading_status_glyphs(t)
+    for prefix in _GROUP_STATUS_TRACKER_ONLY_TEXT_PREFIXES:
+        if normalized.startswith(prefix):
+            return prefix
+    return ""
+
+
+def _drop_leading_status_glyphs(text: str) -> str:
+    t = str(text or "").lstrip()
+    while t and not t[0].isalnum():
+        t = t[1:].lstrip()
+    return t
 
 
 def _format_group_status_admin_notice(
@@ -138,8 +172,8 @@ from .llm_format import (
     dm_attention_line,
     format_message_envelope,
     group_attention_line,
-    hidden_history_line,
     sender_line,
+    unread_message_context_line,
 )
 from .message_content import render_message_content
 from .message_store import MessageStore
@@ -282,6 +316,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         self._sent_store = SentMessageStore(
             dedup_set=self._dedup_set,
             sent_message_ids=self._sent_message_ids,
+            db_path=Path(self._settings["state_dir"]) / "infoflow" / "sent-messages.db",
             account_id=self._settings.get("app_key") or "default",
         )
         self._message_store = MessageStore(
@@ -691,7 +726,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             return self._message_store.find_dm(message_id)
         return None
 
-    def _hidden_history_count_for_event(self, event: Any) -> int:
+    def _unread_message_context_count_for_event(self, event: Any) -> int:
         current = self._record_for_event(event)
         if current is None:
             return 0
@@ -1010,7 +1045,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             handling_strategy=_handling_strategy,
         )
 
-        # Log the base user message. Hidden-history context is injected in
+        # Log the base user message. Unread-message context is injected in
         # on_processing_start(), just before Hermes starts this event.
         gw_log().info(
             "[iflow:user_message:base] mid=%s len=%d text=\n%s",
@@ -1106,24 +1141,24 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             self._reset_processing_context(tokens)
 
     async def on_processing_start(self, event: Any) -> None:
-        """Inject per-event hidden-history metadata at actual LLM start time."""
+        """Inject per-event unread-message-context metadata at actual LLM start time."""
         raw_message = getattr(event, "raw_message", None)
         if not isinstance(raw_message, dict):
             return
         if not raw_message.get("infoflow_standard_message"):
             return
-        if raw_message.get("infoflow_hidden_history_applied"):
+        if raw_message.get("infoflow_unread_message_context_applied"):
             return
 
-        count = self._hidden_history_count_for_event(event)
-        raw_message["infoflow_hidden_history_count"] = count
-        raw_message["infoflow_hidden_history_applied"] = True
+        count = self._unread_message_context_count_for_event(event)
+        raw_message["infoflow_unread_message_context_count"] = count
+        raw_message["infoflow_unread_message_context_applied"] = True
         text = str(getattr(event, "text", "") or "")
         if count > 0:
-            text = f"{hidden_history_line(count)}\n{text}"
+            text = f"{unread_message_context_line(count)}\n{text}"
             event.text = text
         gw_log().info(
-            "[iflow:user_message] mid=%s hidden_count=%d len=%d text=\n%s",
+            "[iflow:user_message] mid=%s unread_context_count=%d len=%d text=\n%s",
             self._event_message_id(event) or "-",
             count,
             len(text),
@@ -1228,17 +1263,25 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             if kind == "group" and group_id is not None
             else ""
         )
-        if status_kind:
-            redirected = await self._redirect_group_status_to_admin(
-                group_id=str(group_id),
-                content=content,
-                status_kind=status_kind,
-                session=session,
-            )
+        tracker_only_status_kind = (
+            _group_status_tracker_only_kind(content)
+            if kind == "group" and group_id is not None
+            else ""
+        )
+        if status_kind or tracker_only_status_kind:
+            effective_status_kind = status_kind or tracker_only_status_kind
+            redirected = False
+            if status_kind:
+                redirected = await self._redirect_group_status_to_admin(
+                    group_id=str(group_id),
+                    content=content,
+                    status_kind=status_kind,
+                    session=session,
+                )
             gw_log().info(
                 "[iflow:send] suppressed group status target=%s kind=%s redirected_admin=%s",
                 chat_id,
-                status_kind,
+                effective_status_kind,
                 redirected,
             )
             self._push_infoflow_event(
@@ -1252,6 +1295,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     "message_id": "",
                     "error": "",
                     "suppressed_group_status": True,
+                    "sessiontracker_only_status": bool(tracker_only_status_kind),
                     "redirected_to_admin": redirected,
                     "preview": (content or "")[:200],
                 },
@@ -1661,24 +1705,27 @@ def register(ctx: Any) -> None:
             "\n"
             "【消息格式】每条消息使用结构化 envelope："
             "`[Attention: ...]`、`[Sender: ...]`、"
-            "`[Message: message_id=...; created_time=2025.05.21 19.56.59]`。"
+            "`[Message: message_id:'...'; created_time:'2025.05.21 19.56.59']`。"
             "`message_id` 是该消息的唯一 ID；`created_time` 是插件首次看到该消息的时间，"
             "也是历史查询和排序使用的时间（系统注入，可信）。"
+            "结构化标签内字符串值使用单引号，布尔/数字保持裸值。"
             "需要引用回复时将该 ID 传给 `infoflow_reply`。\n"
-            "当 `[Hidden History: count=N; tool=infoflow_get_message_history]` "
-            "出现且 N>0 时，说明本轮消息和上次你看到的消息之间还有 N 条"
-            "未展示历史，必要时调用该工具补足上下文。\n"
+            "当 `[Unread Message Context: ...]` 出现并提示有未展示历史消息时，"
+            "说明本轮消息和上次你看到的消息之间还有缺失历史。"
+            "除非当前消息显然无需上下文，否则应按提示优先调用 "
+            "`infoflow_get_message_history` 阅读缺失历史，再结合上下文判断和回复。\n"
             "\n"
             "【消息中的引用标签】\n"
             "当用户回复（reply）某条消息时，你收到的文本格式为：\n"
-            "`<引用 message_id:xxx>被引用消息的内容</引用> 用户的实际指令`\n"
-            "其中 `message_id:xxx` 是**被引用消息的 ID**——"
+            "`<Quote message_id:'xxx'; sender:'user:alice'>被引用消息的内容</Quote> 用户的实际指令`\n"
+            "其中 `message_id:'xxx'` 是**被引用消息的 ID**——"
             "可能是你(机器人)之前发的消息，也可能是其他人的消息。"
-            "这个 ID 不是用户当前消息本身的 ID。\n"
+            "这个 ID 不是用户当前消息本身的 ID。"
+            "`sender:'...'` 是被引用消息发送者的规范身份。\n"
             "\n"
             "【撤回消息】使用 `infoflow_recall_message` 撤回你(机器人)自己发出的消息。\n"
             "- 当用户 reply 了你的某条消息并说\"撤回\"时，"
-            "从 `<引用 message_id:xxx>` 中提取该 ID 作为撤回目标——"
+            "从 `<Quote message_id:'xxx'; sender:'bot:...'>` 中提取该 ID 作为撤回目标——"
             "它就是你那条消息的 ID\n"
             "- **不要**把用户当前消息本身的 inbound message_id 当作撤回目标——"
             "那是用户发出的消息，你无权撤回\n"

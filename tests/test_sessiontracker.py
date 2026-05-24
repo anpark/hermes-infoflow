@@ -74,8 +74,15 @@ def test_format_terminal_line_display_kinds() -> None:
     status_ev = SessionEvent(3, 0.0, "display.status", {"line": "⚕ gpt-4"})
     assert format_terminal_line(status_ev) == {"line_kind": "status", "text": "⚕ gpt-4"}
 
-    user_ev = SessionEvent(4, 0.0, "display.user", {"text": "ping"})
+    user_ev = SessionEvent(
+        4, 0.0, "display.user",
+        {"text": "ping", "full_text": "full ping"},
+    )
     assert format_terminal_line(user_ev) == {"line_kind": "user", "text": "ping"}
+    assert format_terminal_line(user_ev, show_full_user_message=True) == {
+        "line_kind": "user",
+        "text": "full ping",
+    }
 
     stream_ev = SessionEvent(
         5, 0.0, "display.hermes_stream",
@@ -114,6 +121,20 @@ def test_format_terminal_line_outbound_progress() -> None:
     block = format_terminal_line(ev)
     assert block is not None
     assert block["line_kind"] == "tool"
+
+
+def test_format_terminal_line_suppressed_group_status() -> None:
+    ev = SessionEvent(
+        4, 0.0, "outbound.infoflow",
+        {
+            "suppressed_group_status": True,
+            "preview": "📦 Preflight compression: ~109,133 tokens >= 102,400 threshold.",
+        },
+    )
+    block = format_terminal_line(ev)
+    assert block is not None
+    assert block["line_kind"] == "status"
+    assert block["text"].startswith("📦 Preflight compression:")
 
 
 @pytest.mark.asyncio
@@ -398,6 +419,76 @@ async def test_sessiontracker_routes_resolve_and_stream() -> None:
             "?session_id=st-sess&chatType=2&chatId=999",
         )
         assert resp.status == 403
+
+
+async def test_sessiontracker_history_full_user_message_requires_admin_viewer_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("aiohttp")
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    monkeypatch.setenv("INFOFLOW_SESSIONTRACKER_FULL_USER_MESSAGE", "true")
+    monkeypatch.setenv("INFOFLOW_ADMIN_USER", "admin")
+    monkeypatch.setenv("INFOFLOW_APP_KEY", "app-key")
+    monkeypatch.setenv("INFOFLOW_APP_SECRET", "app-secret")
+    monkeypatch.setenv("INFOFLOW_APP_AGENT_ID", "123")
+    _code_user_cache.clear()
+
+    async def _fake_get_user_info_by_code(
+        account: InfoflowAccountAPI,
+        code: str,
+        *,
+        session=None,
+    ) -> str:
+        del account, session
+        return "admin" if code == "admin-code" else "alice"
+
+    monkeypatch.setattr(
+        "hermes_infoflow.sessiontracker.get_user_info_by_code",
+        _fake_get_user_info_by_code,
+    )
+
+    tr = SessionTracker(buffer_size=50)
+    tr.bind_chat("group:1", "st-sess")
+    tr.push_event(
+        "st-sess",
+        "display.user",
+        {
+            "text": "safe message",
+            "full_text": "full injected message\n[Message]\nsafe message",
+            "chat_id": "group:1",
+        },
+        platform="infoflow",
+        chat_id="group:1",
+    )
+    app = web.Application()
+    register_sessiontracker_routes(app, tr, base_path="/webhook/infoflow")
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get(
+            "/webhook/infoflow/sessiontracker/api/history"
+            "?session_id=st-sess&chatType=2&chatId=1",
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["lines"][0]["text"] == "safe message"
+
+        resp = await client.get(
+            "/webhook/infoflow/sessiontracker/api/history"
+            "?session_id=st-sess&chatType=2&chatId=1&code=user-code",
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["lines"][0]["text"] == "safe message"
+
+        resp = await client.get(
+            "/webhook/infoflow/sessiontracker/api/history"
+            "?session_id=st-sess&chatType=2&chatId=1&code=admin-code",
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["lines"][0]["text"] == "full injected message\n[Message]\nsafe message"
 
 
 def test_sessiontracker_enabled_env(monkeypatch: pytest.MonkeyPatch) -> None:

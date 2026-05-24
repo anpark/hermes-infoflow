@@ -356,6 +356,11 @@ def sessiontracker_enabled() -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
+def sessiontracker_full_user_message_enabled() -> bool:
+    raw = os.getenv("INFOFLOW_SESSIONTRACKER_FULL_USER_MESSAGE", "false").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 def normalize_chat_id(chat_id: str) -> str:
     """``infoflow:group:1`` -> ``group:1``; DM ids unchanged."""
     cid = (chat_id or "").strip()
@@ -751,15 +756,18 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
                 if plat == "infoflow"
                 else text
             )
+            payload = {
+                "text": _trunc(display_text, MAX_TEXT_PREVIEW),
+                "user_id": user_id,
+                "user_name": getattr(source, "user_name", None),
+                "chat_id": chat_id,
+            }
+            if plat == "infoflow" and sessiontracker_full_user_message_enabled():
+                payload["full_text"] = text
             tracker.push_event(
                 target_sid,
                 "display.user",
-                {
-                    "text": _trunc(display_text, MAX_TEXT_PREVIEW),
-                    "user_id": user_id,
-                    "user_name": getattr(source, "user_name", None),
-                    "chat_id": chat_id,
-                },
+                payload,
                 platform=plat,
                 chat_id=chat_id,
             )
@@ -1270,6 +1278,7 @@ __all__ = [
     "SessionEvent",
     "get_tracker",
     "dashboard_enabled",
+    "sessiontracker_full_user_message_enabled",
     "make_plugin_hooks",
     "register_routes",
 ]

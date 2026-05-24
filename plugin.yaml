@@ -163,3 +163,7 @@ optional_env:
     description: "Enable Session Tracker Web UI at /webhook/infoflow/sessiontracker (default true)"
     prompt: "Session Tracker enabled? (true/false)"
     password: false
+  - name: INFOFLOW_SESSIONTRACKER_FULL_USER_MESSAGE
+    description: "Allow admin Session Tracker viewers (resolved from code) to see full Hermes user messages; non-admin viewers still see only text after [Message] (default false)"
+    prompt: "Admin Session Tracker full user message? (true/false)"
+    password: false

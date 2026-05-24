@@ -6,6 +6,7 @@ from collections.abc import Callable
 from typing import Any
 
 from .coerce import coerce_bool
+from .llm_tags import string_field
 
 _AT_ONLY_HINT = (
     "\n\n[注意] 用户 @ 了你但没有输入正文。请优先阅读并理解上下文，"
@@ -63,7 +64,11 @@ def _render_reply_target(target: Any) -> str:
     preview = _first_attr(target, "preview", "content")
     if not message_id:
         return ""
-    return f"<引用 message_id:{message_id}>{preview}</引用>"
+    sender = _first_attr(target, "sender_key", "sender")
+    fields = [string_field("message_id", message_id)]
+    if sender:
+        fields.append(string_field("sender", sender))
+    return f"<Quote {'; '.join(fields)}>{preview}</Quote>"
 
 
 def _body_has_reply_item(body_items: list[Any]) -> bool:
@@ -77,9 +82,15 @@ def _render_body_items(
     body_items: list[Any],
     *,
     robot_agent_id_lookup: RobotAgentLookup | None,
+    reply_targets: list[Any] | None = None,
 ) -> tuple[str, bool]:
     parts: list[str] = []
     has_image = False
+    reply_target_by_id = {
+        mid: target
+        for target in (reply_targets or [])
+        if (mid := _first_attr(target, "message_id", "messageid"))
+    }
     for item in body_items:
         item_type = _first_attr(item, "type").upper()
         if item_type in {"TEXT", "MD"}:
@@ -91,7 +102,8 @@ def _render_body_items(
             if label:
                 parts.append(f" {label} ")
         elif item_type in {"REPLYDATA", "REPLY"}:
-            rendered = _render_reply_target(item)
+            message_id = _first_attr(item, "message_id", "messageid")
+            rendered = _render_reply_target(reply_target_by_id.get(message_id, item))
             if rendered:
                 parts.append(rendered + "\n")
         elif item_type == "IMAGE":
@@ -138,6 +150,7 @@ def render_message_content(
         text, body_has_image = _render_body_items(
             body_items,
             robot_agent_id_lookup=robot_agent_id_lookup,
+            reply_targets=reply_targets,
         )
         if body_has_image and not image_urls:
             image_urls = ["<inline-image>"]

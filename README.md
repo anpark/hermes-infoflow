@@ -224,6 +224,8 @@ bash scripts/deploy.sh --port 9000 # 指定 webhook 端口并写入 ~/.hermes/.e
 | `HERMES_STATE_DIR` | `~/.hermes/state` | sent-messages.db 等状态目录 |
 | `INFOFLOW_DASHBOARD_ENABLED` | `true` | 是否启用 localhost session 仪表盘 |
 | `INFOFLOW_DASHBOARD_EVENT_BUFFER` | `2000` | 每个 session 在内存中保留的最大事件条数 |
+| `INFOFLOW_SESSIONTRACKER_ENABLED` | `true` | 是否启用 Session Tracker Web UI |
+| `INFOFLOW_SESSIONTRACKER_FULL_USER_MESSAGE` | `false` | Session Tracker 中通过 `code` 解析为 admin viewer 时，用户输入行是否显示完整 Hermes user message；非 admin 始终只显示 `[Message]` 后正文 |
 
 `INFOFLOW_ROBOT_NAME` 仍按可选配置处理：当本地还没有持久化的
 `INFOFLOW_ROBOT_ID`，且机器人显示名缺失或已过期时，fresh install
@@ -344,6 +346,8 @@ https://<your-domain>/webhook/infoflow/sessiontracker?chatType=7&chatId=39500876
 - `on_interim_assistant` —  interim 助手句
 
 注册后 Session Tracker 可接近 CLI/TUI 体验。
+
+调试注入到 Hermes 的完整 user message：`INFOFLOW_SESSIONTRACKER_FULL_USER_MESSAGE=true`。只有 Session Tracker URL 中的 `code` 解析为 `INFOFLOW_ADMIN_USER` 时才展示完整内容；非 admin 或未带 `code` 的群聊页面仍只展示 `[Message]` 后正文。
 
 关闭：`INFOFLOW_SESSIONTRACKER_ENABLED=false`。
 

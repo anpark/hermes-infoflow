@@ -259,6 +259,46 @@ def test_private_image_message_promotes_to_placeholder(account):
     assert res.inbound.text == "<media:image>"
 
 
+def test_private_message_reply_to_bot_marked_when_in_sent_set(account):
+    acct, raw_key = account
+    inner = json.dumps(
+        {
+            "FromUserId": "alice",
+            "MsgType": "text",
+            "Content": "\nwhat is this?",
+            "MsgId": "1866079248599605960",
+            "CreateTime": 1_700_000_000,
+            "Reply": [
+                {
+                    "ReplyContent": "gateway shutdown",
+                    "ReplyMsgId": "1866079196952042496",
+                }
+            ],
+        }
+    )
+    ct = aes_ecb_encrypt_b64url(inner, raw_key)
+    body = urlencode({"messageJson": json.dumps({"Encrypt": ct})})
+
+    res = parser.parse_webhook(
+        content_type="application/x-www-form-urlencoded",
+        raw_body=body,
+        account=acct,
+        sent_message_ids={"1866079196952042496"},
+    )
+
+    assert res.kind == "message"
+    inbound = res.inbound
+    assert inbound.text == "what is this?"
+    assert inbound.is_reply_to_bot is True
+    assert inbound.reply_targets == [
+        {
+            "messageid": "1866079196952042496",
+            "preview": "gateway shutdown",
+            "isBotMessage": True,
+        }
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Group text/plain
 # ---------------------------------------------------------------------------

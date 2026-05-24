@@ -194,12 +194,16 @@ def _install_fake_launchd_tools(fakebin: Path) -> tuple[Path, Path]:
     return launchctl_log, hermes_log
 
 
-def _read_env_port(env_file: Path) -> str | None:
+def _read_env_key(env_file: Path, key: str) -> str | None:
     spec = importlib.util.spec_from_file_location("edit_hermes_env", _EDIT_ENV_SCRIPT)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    return mod.read_key(env_file, "INFOFLOW_PORT")
+    return mod.read_key(env_file, key)
+
+
+def _read_env_port(env_file: Path) -> str | None:
+    return _read_env_key(env_file, "INFOFLOW_PORT")
 
 
 def _assert_deploy_succeeded(result: subprocess.CompletedProcess[str]) -> None:
@@ -508,6 +512,7 @@ def test_deploy_seeds_default_port_in_env(tmp_path: Path) -> None:
     env_file = home / ".hermes" / ".env"
     assert env_file.is_file()
     assert _read_env_port(env_file) == "26521"
+    assert _read_env_key(env_file, "INFOFLOW_SESSIONTRACKER_FULL_USER_MESSAGE") == "false"
 
 
 def test_deploy_preserves_existing_port(tmp_path: Path) -> None:
@@ -515,6 +520,21 @@ def test_deploy_preserves_existing_port(tmp_path: Path) -> None:
     result = _run_deploy(home, pre_env_lines="INFOFLOW_PORT=7777\n")
     assert result.returncode == 0, result.stderr
     assert _read_env_port(home / ".hermes" / ".env") == "7777"
+
+
+def test_deploy_preserves_existing_sessiontracker_full_user_message(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    result = _run_deploy(
+        home,
+        pre_env_lines="INFOFLOW_SESSIONTRACKER_FULL_USER_MESSAGE=true\n",
+    )
+    assert result.returncode == 0, result.stderr
+    assert (
+        _read_env_key(home / ".hermes" / ".env", "INFOFLOW_SESSIONTRACKER_FULL_USER_MESSAGE")
+        == "true"
+    )
 
 
 def test_deploy_port_flag_overrides_env(tmp_path: Path) -> None:

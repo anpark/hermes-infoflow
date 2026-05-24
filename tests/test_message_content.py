@@ -52,9 +52,13 @@ def test_render_reply_target_prefix_from_structured_data() -> None:
     class _Reply:
         message_id: str
         preview: str
+        sender_key: str = ""
 
-    msg = _Msg(text="hello", reply_targets=[_Reply("1", "old")])
-    assert render_message_content(msg) == "<引用 message_id:1>old</引用>\nhello"
+    msg = _Msg(text="hello", reply_targets=[_Reply("1", "old", "user:alice")])
+    assert (
+        render_message_content(msg)
+        == "<Quote message_id:'1'; sender:'user:alice'>old</Quote>\nhello"
+    )
 
 
 def test_render_reply_body_item_separates_following_text() -> None:
@@ -63,6 +67,7 @@ def test_render_reply_body_item_separates_following_text() -> None:
         type: str = "replyData"
         message_id: str = "1"
         preview: str = "old"
+        sender_key: str = "bot:6471"
 
     @dataclass
     class _Text:
@@ -70,7 +75,49 @@ def test_render_reply_body_item_separates_following_text() -> None:
         content: str = "thanks!"
 
     msg = _Msg(body_items=[_ReplyItem(), _Text()])
-    assert render_message_content(msg) == "<引用 message_id:1>old</引用>\nthanks!"
+    assert (
+        render_message_content(msg)
+        == "<Quote message_id:'1'; sender:'bot:6471'>old</Quote>\nthanks!"
+    )
+
+
+def test_render_reply_body_item_uses_enriched_reply_target_sender() -> None:
+    @dataclass
+    class _ReplyItem:
+        type: str = "replyData"
+        message_id: str = "1"
+        preview: str = "old"
+
+    @dataclass
+    class _ReplyTarget:
+        message_id: str = "1"
+        preview: str = "old"
+        sender_key: str = "user:alice"
+
+    @dataclass
+    class _Text:
+        type: str = "TEXT"
+        content: str = "thanks!"
+
+    msg = _Msg(body_items=[_ReplyItem(), _Text()], reply_targets=[_ReplyTarget()])
+    assert (
+        render_message_content(msg)
+        == "<Quote message_id:'1'; sender:'user:alice'>old</Quote>\nthanks!"
+    )
+
+
+def test_render_reply_target_quotes_structured_field_values() -> None:
+    @dataclass
+    class _Reply:
+        message_id: str = "mid'1"
+        preview: str = "old"
+        sender_key: str = "user:o'brien"
+
+    msg = _Msg(text="hello", reply_targets=[_Reply()])
+    assert (
+        render_message_content(msg)
+        == "<Quote message_id:'mid\\'1'; sender:'user:o\\'brien'>old</Quote>\nhello"
+    )
 
 
 def test_render_at_only_description_and_hint() -> None:

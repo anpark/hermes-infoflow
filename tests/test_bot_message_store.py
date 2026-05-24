@@ -8,7 +8,7 @@ import pytest
 
 from hermes_infoflow import message_store as ms
 from hermes_infoflow.bot import Bot
-from hermes_infoflow.itypes import BodyItem, IncomingMessage, SentResult
+from hermes_infoflow.itypes import BodyItem, IncomingMessage, ReplyTarget, SentResult
 from hermes_infoflow.message_store import MessageStore
 from hermes_infoflow.policy import GroupPolicy
 from hermes_infoflow.recall import get_inbound_body
@@ -283,6 +283,152 @@ async def test_external_private_bot_echo_is_recorded_without_dispatch(
     assert found.peer == "user:alice"
     assert found.sender == "bot:6471"
     assert found.is_outgoing is True
+
+
+@pytest.mark.asyncio
+async def test_dm_reply_to_persisted_outgoing_is_marked_as_quoting_bot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot, store, _sent_store = _bot(tmp_path, monkeypatch)
+    store.persist_dm(
+        message_id="bot-dm-1",
+        peer="user:alice",
+        self_id="bot:6471",
+        sender="bot:6471",
+        is_outgoing=True,
+        content="gateway shutdown",
+    )
+    msg = IncomingMessage(
+        message_id="human-dm-1",
+        dedupe_key="human-dm-1",
+        text="what does this mean?",
+        dm_user_id="alice",
+        sender_id="alice",
+        reply_targets=[
+            ReplyTarget(message_id="bot-dm-1", preview="gateway shutdown")
+        ],
+        raw_data={"Reply": [{"ReplyMsgId": "bot-dm-1"}]},
+    )
+
+    result = await bot.process_inbound(msg)
+
+    assert result.should_dispatch is True
+    assert msg.is_reply_to_bot is True
+    assert msg.reply_info is not None
+    assert msg.reply_info.message_id == "bot-dm-1"
+    found = store.find_dm("human-dm-1")
+    assert found is not None
+    assert found.quotes_your_message is True
+    assert found.content.startswith("<Quote message_id:'bot-dm-1'; sender:'bot:6471'>")
+
+
+@pytest.mark.asyncio
+async def test_group_reply_to_persisted_outgoing_is_marked_as_quoting_bot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot, store, _sent_store = _bot(tmp_path, monkeypatch)
+    store.persist_group(
+        message_id="bot-group-1",
+        group_id="1",
+        self_id="bot:6471",
+        sender="bot:6471",
+        is_outgoing=True,
+        content="previous bot reply",
+    )
+    msg = IncomingMessage(
+        message_id="human-group-1",
+        dedupe_key="human-group-1",
+        text="continue",
+        group_id="1",
+        sender_id="alice",
+        reply_targets=[
+            ReplyTarget(message_id="bot-group-1", preview="previous bot reply")
+        ],
+        raw_data={"message": {"body": [{"type": "replyData"}]}},
+    )
+
+    await bot.process_inbound(msg)
+
+    assert msg.is_reply_to_bot is True
+    assert msg.reply_info is not None
+    assert msg.reply_info.message_id == "bot-group-1"
+    found = store.find_group("human-group-1")
+    assert found is not None
+    assert found.quotes_your_message is True
+    assert found.quotes_other_peoples_message is False
+    assert found.content.startswith("<Quote message_id:'bot-group-1'; sender:'bot:6471'>")
+
+
+@pytest.mark.asyncio
+async def test_group_reply_to_persisted_human_message_keeps_sender_without_bot_quote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot, store, _sent_store = _bot(tmp_path, monkeypatch)
+    store.persist_group(
+        message_id="human-group-previous",
+        group_id="1",
+        self_id="bot:6471",
+        sender="user:bob",
+        is_outgoing=False,
+        content="previous human message",
+    )
+    msg = IncomingMessage(
+        message_id="human-group-next",
+        dedupe_key="human-group-next",
+        text="agree",
+        group_id="1",
+        sender_id="alice",
+        reply_targets=[
+            ReplyTarget(message_id="human-group-previous", preview="previous human message")
+        ],
+    )
+
+    result = await bot.process_inbound(msg)
+
+    assert result.should_dispatch is False
+    assert msg.is_reply_to_bot is False
+    assert msg.reply_info is None
+    found = store.find_group("human-group-next")
+    assert found is not None
+    assert found.quotes_your_message is False
+    assert found.quotes_other_peoples_message is True
+    assert found.content.startswith(
+        "<Quote message_id:'human-group-previous'; sender:'user:bob'>"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reply_to_outgoing_message_in_different_group_is_not_marked_as_bot_quote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot, store, _sent_store = _bot(tmp_path, monkeypatch)
+    store.persist_group(
+        message_id="bot-group-1",
+        group_id="2",
+        self_id="bot:6471",
+        sender="bot:6471",
+        is_outgoing=True,
+        content="different group",
+    )
+    msg = IncomingMessage(
+        message_id="human-group-1",
+        dedupe_key="human-group-1",
+        text="continue",
+        group_id="1",
+        sender_id="alice",
+        reply_targets=[
+            ReplyTarget(message_id="bot-group-1", preview="different group")
+        ],
+    )
+
+    await bot.process_inbound(msg)
+
+    assert msg.is_reply_to_bot is False
+    assert msg.reply_info is None
+    found = store.find_group("human-group-1")
+    assert found is not None
+    assert found.quotes_your_message is False
+    assert found.quotes_other_peoples_message is True
 
 
 @pytest.mark.asyncio

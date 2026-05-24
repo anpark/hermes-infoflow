@@ -89,12 +89,15 @@ def test_history_tool_message_window_returns_json_array(
     parsed = json.loads(result)
     assert isinstance(parsed, list)
     assert [item["content"].splitlines()[2] for item in parsed] == [
-        f"[Message: message_id=m1; created_time={_time_arg(created_times['m1'])}]",
-        f"[Message: message_id=m2; created_time={_time_arg(created_times['m2'])}]",
-        f"[Message: message_id=m3; created_time={_time_arg(created_times['m3'])}]",
+        f"[Message: message_id:'m1'; created_time:'{_time_arg(created_times['m1'])}']",
+        f"[Message: message_id:'m2'; created_time:'{_time_arg(created_times['m2'])}']",
+        f"[Message: message_id:'m3'; created_time:'{_time_arg(created_times['m3'])}']",
     ]
-    assert "[Sender: type=human; user_id=alice; name=Alice; permission=restricted]" in parsed[1]["content"]
-    assert "[Hidden History:" not in parsed[1]["content"]
+    assert (
+        "[Sender: type:'human'; user_id:'alice'; name:'Alice'; permission:'restricted']"
+        in parsed[1]["content"]
+    )
+    assert "[Unread Message Context:" not in parsed[1]["content"]
     assert "[Handling Strategy]" not in parsed[1]["content"]
 
 
@@ -162,7 +165,7 @@ def test_history_tool_allows_admin_explicit_target_time_query(
     parsed = json.loads(result)
     assert len(parsed) == 1
     assert parsed[0]["time"] == _time_arg(today)
-    assert f"[Message: message_id=other; created_time={_time_arg(today)}]" in parsed[0]["content"]
+    assert f"[Message: message_id:'other'; created_time:'{_time_arg(today)}']" in parsed[0]["content"]
 
 
 def test_history_tool_end_time_is_second_inclusive(
@@ -206,7 +209,7 @@ def test_history_tool_end_time_is_second_inclusive(
 
     parsed = json.loads(result)
     assert [item["content"].splitlines()[2] for item in parsed] == [
-        f"[Message: message_id=included; created_time={_time_arg(included)}]"
+        f"[Message: message_id:'included'; created_time:'{_time_arg(included)}']"
     ]
 
 
@@ -258,4 +261,4 @@ def test_history_tool_message_id_ignores_time_params(
 
     parsed = json.loads(result)
     assert len(parsed) == 1
-    assert f"[Message: message_id=current; created_time={_time_arg(created)}]" in parsed[0]["content"]
+    assert f"[Message: message_id:'current'; created_time:'{_time_arg(created)}']" in parsed[0]["content"]

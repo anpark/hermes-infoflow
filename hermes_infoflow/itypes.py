@@ -39,6 +39,7 @@ class ReplyTarget:
 
     message_id: str = ""
     preview: str = ""
+    sender_key: str = ""
     is_bot_message: bool = False
     platform_is_bot_message: bool = False
     sender_imid: str = ""
@@ -70,6 +71,12 @@ def coerce_reply_target(value: Any) -> ReplyTarget:
         return ReplyTarget(
             message_id=str(value.get("message_id") or value.get("messageid") or ""),
             preview=str(value.get("preview") or ""),
+            sender_key=str(
+                value.get("sender_key")
+                or value.get("sender")
+                or value.get("senderKey")
+                or ""
+            ),
             is_bot_message=coerce_bool(
                 first_present(value, "is_bot_message", "isBotMessage")
             ),
@@ -81,6 +88,11 @@ def coerce_reply_target(value: Any) -> ReplyTarget:
     return ReplyTarget(
         message_id=str(getattr(value, "message_id", "") or ""),
         preview=str(getattr(value, "preview", "") or ""),
+        sender_key=str(
+            getattr(value, "sender_key", "")
+            or getattr(value, "sender", "")
+            or ""
+        ),
         is_bot_message=coerce_bool(getattr(value, "is_bot_message", False)),
         platform_is_bot_message=coerce_bool(
             getattr(value, "platform_is_bot_message", False)
@@ -95,6 +107,7 @@ def reply_target_to_dict(value: Any) -> dict[str, Any]:
     return {
         "message_id": target.message_id,
         "preview": target.preview,
+        "sender_key": target.sender_key,
         "is_bot_message": target.is_bot_message,
         "platform_is_bot_message": target.platform_is_bot_message,
         "sender_imid": target.sender_imid,

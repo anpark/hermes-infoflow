@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
+from .llm_tags import string_field
+
 
 def _bool_text(value: bool) -> str:
     return "true" if bool(value) else "false"
@@ -79,7 +81,7 @@ def group_attention_line(attention: GroupAttention) -> str:
         f"matches_attention_regex={_bool_text(bool(pattern))}",
     ]
     if pattern:
-        parts.append(f"matched_regex_pattern={pattern}")
+        parts.append(string_field("matched_regex_pattern", pattern))
     parts.extend([
         f"mentions_everyone={_bool_text(attention.mentions_everyone)}",
         f"quotes_your_message={_bool_text(attention.quotes_your_message)}",
@@ -111,26 +113,43 @@ def sender_line(
     raw_id = participant_id_from_key(sender_key) or "unknown"
     parts: list[str]
     if kind == "bot":
-        parts = ["type=bot", f"agent_id={raw_id}"]
+        parts = [string_field("type", "bot"), string_field("agent_id", raw_id)]
     else:
-        parts = ["type=human", f"user_id={raw_id}"]
+        parts = [string_field("type", "human"), string_field("user_id", raw_id)]
     if name:
-        parts.append(f"name={name}")
-    parts.append(f"permission={permission_for_sender(sender_key, admin_uid)}")
+        parts.append(string_field("name", name))
+    parts.append(string_field("permission", permission_for_sender(sender_key, admin_uid)))
     return f"[Sender: {'; '.join(parts)}]"
 
 
 def message_line(message_id: str, *, created_time_ms: int = 0) -> str:
     mid = _clean(message_id) or "unknown"
-    parts = [f"message_id={mid}"]
+    parts = [string_field("message_id", mid)]
     created = format_created_time_ms(created_time_ms)
     if created:
-        parts.append(f"created_time={created}")
+        parts.append(string_field("created_time", created))
     return f"[Message: {'; '.join(parts)}]"
 
 
-def hidden_history_line(count: int) -> str:
-    return f"[Hidden History: count={max(0, int(count))}; tool=infoflow_get_message_history]"
+UNREAD_MESSAGE_CONTEXT_REQUIRED_READ_LIMIT = 7
+
+
+def unread_message_context_line(count: int) -> str:
+    n = max(0, int(count))
+    read_count = min(n, UNREAD_MESSAGE_CONTEXT_REQUIRED_READ_LIMIT)
+    if n <= UNREAD_MESSAGE_CONTEXT_REQUIRED_READ_LIMIT:
+        read_rule = f"请完整阅读锚点前的 {n} 条未展示历史"
+    else:
+        read_rule = (
+            f"请至少阅读锚点前最近 {read_count} 条未展示历史；"
+            "如问题明显依赖更早上下文，请继续扩大查询范围"
+        )
+    return (
+        f"[Unread Message Context: 有 {n} 条未展示历史消息。"
+        "请优先调用 infoflow_get_message_history，使用当前 Message 标签中的 "
+        f"message_id 作为锚点，设置 before_count={read_count}、after_count=0；"
+        f"返回结果会包含锚点消息本身，{read_rule}，再结合上下文判断和回复。]"
+    )
 
 
 def format_message_envelope(
@@ -141,11 +160,11 @@ def format_message_envelope(
     content: str,
     created_time_ms: int = 0,
     handling_strategy: str = "",
-    hidden_history_count: int = 0,
+    unread_message_context_count: int = 0,
 ) -> str:
     lines: list[str] = []
-    if hidden_history_count > 0:
-        lines.append(hidden_history_line(hidden_history_count))
+    if unread_message_context_count > 0:
+        lines.append(unread_message_context_line(unread_message_context_count))
     if handling_strategy:
         lines.extend([
             "[Handling Strategy]",

@@ -304,6 +304,7 @@ class Bot:
             )
             _persist_robot_id(self._robot_id)
         self._normalize_mention_targets_from_participants(msg)
+        self._normalize_reply_targets_from_message_store(msg)
 
         # --- [iflow:event] — enriched message event fields ---
         try:
@@ -647,6 +648,89 @@ class Bot:
 
         msg.mention_robot_ids = robot_ids
         msg.mention_agent_ids = mapped_agent_ids
+
+    def _normalize_reply_targets_from_message_store(self, msg: IncomingMessage) -> None:
+        """Mark quoted targets as ours when the persistent store proves it.
+
+        Parser-level detection relies on in-process sent IDs or platform
+        reply metadata. System notices and messages quoted after a gateway
+        restart can miss both signals, while MessageStore still has the
+        durable outbound row for the same chat.
+        """
+        if not msg.reply_targets:
+            return
+
+        reply_targets = [coerce_reply_target(t) for t in msg.reply_targets]
+        changed = False
+        first_bot_target = None
+        for target in reply_targets:
+            rec = self._message_record_in_chat(msg, target.message_id)
+            if rec is not None and not target.sender_key:
+                target.sender_key = str(getattr(rec, "sender", "") or "")
+                changed = True
+            if (
+                not target.is_bot_message
+                and self._is_own_outgoing_record(rec)
+            ):
+                target.is_bot_message = True
+                changed = True
+            if target.is_bot_message:
+                if not target.sender_key:
+                    target.sender_key = self_key(self._settings)
+                    changed = True
+                first_bot_target = first_bot_target or target
+
+        if not changed and first_bot_target is None:
+            return
+
+        if changed:
+            msg.reply_targets = reply_targets
+        if first_bot_target is None:
+            return
+        msg.is_reply_to_bot = True
+        if msg.reply_info is None:
+            msg.reply_info = ReplyInfo(
+                message_id=first_bot_target.message_id,
+                preview=first_bot_target.preview,
+                sender_imid=first_bot_target.sender_imid,
+            )
+
+    def _message_record_in_chat(
+        self,
+        msg: IncomingMessage,
+        message_id: str,
+    ) -> Any | None:
+        mid = str(message_id or "").strip()
+        if not mid:
+            return None
+
+        if msg.is_group and msg.group_id is not None:
+            rec = self._message_store.find_group(mid)
+            if rec is not None and rec.group_id == str(msg.group_id):
+                return rec
+            return None
+
+        if msg.is_dm and msg.dm_user_id is not None:
+            rec = self._message_store.find_dm(mid)
+            peer = private_peer_key(msg.dm_user_id)
+            if rec is not None and rec.peer == peer:
+                return rec
+            return None
+
+        return None
+
+    def _is_own_outgoing_record(self, rec: Any | None) -> bool:
+        if rec is None:
+            return False
+        me = self_key(self._settings)
+        return bool(
+            getattr(rec, "is_outgoing", False)
+            and (
+                not me
+                or getattr(rec, "sender", "") == me
+                or getattr(rec, "self_id", "") == me
+            )
+        )
 
     def _sender_key_for_store(self, msg: IncomingMessage) -> str:
         sender = sender_key(msg)
