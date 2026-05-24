@@ -433,6 +433,7 @@ python scripts/sync_readme_install_version.py
 # 4) 发布前校验
 ruff check hermes_infoflow tools tests
 pytest -q
+pytest -q -m integration
 
 # 5) 提交、打 tag、push
 git add pyproject.toml tools/hermes-infoflow-tools/pyproject.toml README.md CHANGELOG.md
@@ -497,11 +498,15 @@ cd hermes-infoflow
 # 安装开发依赖
 pip install -e ".[dev]"
 
-# 运行单元测试（无需 hermes-agent）
+# 运行快速单元测试（默认跳过 deploy 集成测试，无需 hermes-agent）
 pytest -q
 
-# 运行所有测试（包括 adapter / registration，需要 hermes-agent 在 PYTHONPATH）
+# 单独运行 deploy 集成测试（真实执行 deploy 脚本）
+pytest -q -m integration
+
+# 如需 adapter / registration 等依赖 hermes-agent 的覆盖，额外提供 hermes-agent 路径
 PYTHONPATH=/path/to/hermes-agent pytest -q
+PYTHONPATH=/path/to/hermes-agent pytest -q -m integration
 ```
 
 Linting / typecheck：

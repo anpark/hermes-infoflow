@@ -19,17 +19,22 @@ from __future__ import annotations
 import importlib.util
 import os
 import shutil
+import site
 import subprocess
 import sys
+import sysconfig
 import types
 from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.integration
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _DEPLOY_SCRIPT = _REPO_ROOT / "scripts" / "deploy.sh"
 _DEPLOY_COMMON_SCRIPT = _REPO_ROOT / "scripts" / "lib" / "deploy-common.sh"
 _EDIT_ENV_SCRIPT = _REPO_ROOT / "scripts" / "lib" / "edit_hermes_env.py"
+
 
 def _expected_package_files() -> set[str]:
     """Files directly under hermes_infoflow/ must flatten to the plugin root."""
@@ -48,11 +53,49 @@ if shutil.which("rsync") is None or shutil.which("bash") is None:
     )
 
 
+def _deploy_pythonpath() -> str:
+    """Expose dependency paths that become hidden when deploy tests override $HOME."""
+    paths: list[str] = []
+
+    def add(path: str | None) -> None:
+        if not path:
+            return
+        candidate = Path(path)
+        if not candidate.exists():
+            return
+        path_str = str(candidate)
+        if path_str not in paths:
+            paths.append(path_str)
+
+    user_site = site.getusersitepackages()
+    if isinstance(user_site, str):
+        add(user_site)
+    else:
+        for path in user_site:
+            add(path)
+
+    for path in site.getsitepackages():
+        add(path)
+
+    sysconfig_paths = sysconfig.get_paths()
+    add(sysconfig_paths.get("purelib"))
+    add(sysconfig_paths.get("platlib"))
+
+    for path in os.environ.get("PYTHONPATH", "").split(os.pathsep):
+        add(path)
+
+    return os.pathsep.join(paths)
+
+
 def _deploy_env(home: Path) -> dict[str, str]:
     env = os.environ.copy()
     env["HOME"] = str(home)
     env["PYTHON"] = sys.executable
     env["PATH"] = "/usr/bin:/bin"
+    env["HERMES_DEPLOY_AUTO_PIP"] = "0"
+    pythonpath = _deploy_pythonpath()
+    if pythonpath:
+        env["PYTHONPATH"] = pythonpath
     return env
 
 
@@ -159,17 +202,30 @@ def _read_env_port(env_file: Path) -> str | None:
     return mod.read_key(env_file, "INFOFLOW_PORT")
 
 
-@pytest.fixture
-def deployed(tmp_path: Path) -> Path:
-    """Run ``scripts/deploy.sh`` against an isolated $HOME and return the plugin dir."""
-    home = tmp_path / "home"
-    result = _run_deploy(home)
+def _assert_deploy_succeeded(result: subprocess.CompletedProcess[str]) -> None:
     if result.returncode != 0:
         pytest.fail(
             f"scripts/deploy.sh failed (rc={result.returncode})\n"
             f"---- stdout ----\n{result.stdout}\n"
             f"---- stderr ----\n{result.stderr}"
         )
+
+
+@pytest.fixture
+def deployed(tmp_path: Path) -> Path:
+    """Run ``scripts/deploy.sh`` against an isolated $HOME and return the plugin dir."""
+    home = tmp_path / "home"
+    result = _run_deploy(home)
+    _assert_deploy_succeeded(result)
+    return home / ".hermes" / "plugins" / "infoflow"
+
+
+@pytest.fixture(scope="module")
+def readonly_deployed(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Run deploy once for read-only layout assertions in this module."""
+    home = tmp_path_factory.mktemp("deploy-layout-home") / "home"
+    result = _run_deploy(home)
+    _assert_deploy_succeeded(result)
     return home / ".hermes" / "plugins" / "infoflow"
 
 
@@ -180,11 +236,11 @@ def _tree(root: Path) -> str:
     )
 
 
-def test_init_py_at_plugin_root(deployed: Path) -> None:
-    init_py = deployed / "__init__.py"
+def test_init_py_at_plugin_root(readonly_deployed: Path) -> None:
+    init_py = readonly_deployed / "__init__.py"
     assert init_py.is_file(), (
         "hermes-agent's directory loader requires __init__.py at the plugin "
-        f"dir root. Deployed layout was:\n{_tree(deployed)}"
+        f"dir root. Deployed layout was:\n{_tree(readonly_deployed)}"
     )
 
 
@@ -214,6 +270,10 @@ def test_tools_extract_overwrites_deploy_layout(tmp_path: Path, monkeypatch) -> 
     monkeypatch.setenv("HERMES_HOME", str(home / ".hermes"))
     monkeypatch.setenv("PYTHON", sys.executable)
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("HERMES_DEPLOY_AUTO_PIP", "0")
+    pythonpath = _deploy_pythonpath()
+    if pythonpath:
+        monkeypatch.setenv("PYTHONPATH", pythonpath)
 
     from hermes_infoflow_tools import cli
 
@@ -371,18 +431,28 @@ def test_normalize_restores_existing_plugin_when_deploy_common_fails(tmp_path: P
     assert not list(plugin_dir.parent.glob(".infoflow.normalize-backup-*"))
 
 
-def test_package_files_flattened_at_root(deployed: Path) -> None:
+def test_deploy_tests_do_not_auto_install_dependencies(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    result = _run_deploy(home)
+    _assert_deploy_succeeded(result)
+
+    combined_output = f"{result.stdout}\n{result.stderr}"
+    assert "Auto-installing plugin dependencies" not in combined_output
+    assert "pip install" not in combined_output
+
+
+def test_package_files_flattened_at_root(readonly_deployed: Path) -> None:
     for name in _expected_package_files():
-        assert (deployed / name).is_file(), (
+        assert (readonly_deployed / name).is_file(), (
             f"expected {name} at the plugin dir root after flattening; got:\n"
-            f"{_tree(deployed)}"
+            f"{_tree(readonly_deployed)}"
         )
 
 
-def test_plugin_yaml_at_root(deployed: Path) -> None:
-    assert (deployed / "plugin.yaml").is_file(), (
+def test_plugin_yaml_at_root(readonly_deployed: Path) -> None:
+    assert (readonly_deployed / "plugin.yaml").is_file(), (
         f"plugin.yaml must be re-synced to the plugin dir root; got:\n"
-        f"{_tree(deployed)}"
+        f"{_tree(readonly_deployed)}"
     )
 
 
@@ -407,19 +477,19 @@ def test_root_and_package_manifests_list_same_env_vars() -> None:
     )
 
 
-def test_scripts_synced_for_extract_mode_reruns(deployed: Path) -> None:
+def test_scripts_synced_for_extract_mode_reruns(readonly_deployed: Path) -> None:
     # `hermes-infoflow-tools update --mode extract` falls back to
     # plugin_dir/scripts/lib/deploy-common.sh on re-runs (the sdist
     # tarball it just extracted is already gone). Keep the script tree
     # in the deployed layout so that path keeps working.
-    assert (deployed / "scripts" / "lib" / "deploy-common.sh").is_file()
-    assert (deployed / "scripts" / "lib" / "edit_hermes_config.py").is_file()
-    assert (deployed / "scripts" / "lib" / "edit_hermes_env.py").is_file()
+    assert (readonly_deployed / "scripts" / "lib" / "deploy-common.sh").is_file()
+    assert (readonly_deployed / "scripts" / "lib" / "edit_hermes_config.py").is_file()
+    assert (readonly_deployed / "scripts" / "lib" / "edit_hermes_env.py").is_file()
 
 
-def test_flat_layout_config_script_loads_shared_editor(deployed: Path) -> None:
+def test_flat_layout_config_script_loads_shared_editor(readonly_deployed: Path) -> None:
     pytest.importorskip("yaml")
-    script = deployed / "scripts" / "lib" / "edit_hermes_config.py"
+    script = readonly_deployed / "scripts" / "lib" / "edit_hermes_config.py"
     spec = importlib.util.spec_from_file_location(
         "deployed_edit_hermes_config",
         script,
@@ -583,18 +653,18 @@ def test_deploy_common_dry_run_rejects_invalid_port(tmp_path: Path) -> None:
     assert "--port must be an integer 1-65535" in result.stderr
 
 
-def test_no_nested_package_dir(deployed: Path) -> None:
-    nested = deployed / "hermes_infoflow"
+def test_no_nested_package_dir(readonly_deployed: Path) -> None:
+    nested = readonly_deployed / "hermes_infoflow"
     assert not nested.exists(), (
         "deploy must flatten hermes_infoflow/ into the plugin dir root; "
-        f"found nested package dir at {nested}.\nLayout was:\n{_tree(deployed)}"
+        f"found nested package dir at {nested}.\nLayout was:\n{_tree(readonly_deployed)}"
     )
 
 
-def test_config_yaml_enabled_plugin(deployed: Path) -> None:
+def test_config_yaml_enabled_plugin(readonly_deployed: Path) -> None:
     """edit_hermes_config.py should have appended 'infoflow' to plugins.enabled."""
     yaml = pytest.importorskip("yaml")
-    config_path = deployed.parent.parent / "config.yaml"
+    config_path = readonly_deployed.parent.parent / "config.yaml"
     assert config_path.is_file(), f"config.yaml not written at {config_path}"
     data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     enabled = data.get("plugins", {}).get("enabled", [])
@@ -603,10 +673,10 @@ def test_config_yaml_enabled_plugin(deployed: Path) -> None:
     )
 
 
-def test_config_yaml_infoflow_platform_toolsets(deployed: Path) -> None:
+def test_config_yaml_infoflow_platform_toolsets(readonly_deployed: Path) -> None:
     """Deploy should grant infoflow the same baseline tools as CLI sessions."""
     yaml = pytest.importorskip("yaml")
-    config_path = deployed.parent.parent / "config.yaml"
+    config_path = readonly_deployed.parent.parent / "config.yaml"
     data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     infoflow_toolsets = data.get("platform_toolsets", {}).get("infoflow", [])
 
@@ -656,14 +726,14 @@ def test_deploy_preserves_custom_infoflow_toolsets(tmp_path: Path) -> None:
     assert "hermes-infoflow" in infoflow_toolsets
 
 
-def test_flat_layout_loads_like_hermes_agent_does(deployed: Path) -> None:
+def test_flat_layout_loads_like_hermes_agent_does(readonly_deployed: Path) -> None:
     """Mimic ``hermes_cli/plugins.py::_load_directory_module`` end-to-end.
 
     This proves the flattened layout produces a module hermes-agent can
     import and find ``register()`` on. Calling ``register()`` itself still
     requires hermes-agent runtime symbols.
     """
-    init_file = deployed / "__init__.py"
+    init_file = readonly_deployed / "__init__.py"
     ns_parent = "hermes_plugins_test_layout"
     module_name = f"{ns_parent}.infoflow"
 
@@ -676,13 +746,13 @@ def test_flat_layout_loads_like_hermes_agent_does(deployed: Path) -> None:
     spec = importlib.util.spec_from_file_location(
         module_name,
         init_file,
-        submodule_search_locations=[str(deployed)],
+        submodule_search_locations=[str(readonly_deployed)],
     )
     assert spec is not None and spec.loader is not None
 
     module = importlib.util.module_from_spec(spec)
     module.__package__ = module_name
-    module.__path__ = [str(deployed)]  # type: ignore[attr-defined]
+    module.__path__ = [str(readonly_deployed)]  # type: ignore[attr-defined]
     sys.modules[module_name] = module
     try:
         spec.loader.exec_module(module)

@@ -112,8 +112,15 @@ ignore = [
 "hermes_infoflow/deploy.py" = ["E402"]
 
 [tool.pytest.ini_options]
+addopts = [
+    "-m",
+    "not integration",
+]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 filterwarnings = [
     "ignore::DeprecationWarning",
+]
+markers = [
+    "integration: tests that exercise deploy scripts and subprocess layout",
 ]
