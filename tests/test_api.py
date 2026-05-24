@@ -380,6 +380,26 @@ def test_build_emoji_reaction_body_dm_omits_chat_id() -> None:
     assert "chatId" not in parsed
 
 
+def test_build_emoji_reaction_body_can_omit_reply_desc_for_delete() -> None:
+    body = api._build_emoji_reaction_body(
+        chat_type=7,
+        from_uid="chengbo05",
+        base_msg_id="1865798223458853292",
+        msgid2="300016044",
+        emoji_code="d135",
+        emoji_desc="(qjp)",
+        include_reply_desc=False,
+    )
+    parsed = json.loads(body)
+    assert parsed == {
+        "fromUid": "chengbo05",
+        "chatType": 7,
+        "baseMsgId": "1865798223458853292",
+        "msgId2": 300016044,
+        "replyContent": "d135",
+    }
+
+
 def test_build_emoji_reaction_body_omits_empty_msgid2() -> None:
     """``msgId2`` is optional and must be skipped when not provided."""
     body = api._build_emoji_reaction_body(
@@ -395,9 +415,73 @@ def test_build_emoji_reaction_body_omits_empty_msgid2() -> None:
     assert parsed["chatType"] == 7
 
 
+def test_delete_emoji_reaction_omits_reply_desc(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    class _Resp:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        async def text(self):
+            return '{"code":"ok","data":{"bizCode":200,"bizMsg":"ok","bizData":null}}'
+
+    class _Sess:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        def post(self, url, *, data, headers, timeout):
+            del url, headers, timeout
+            captured["data"] = data.decode("utf-8")
+            return _Resp()
+
+        async def close(self):
+            return None
+
+    async def fake_token(*a, **k):
+        return "TOK"
+
+    monkeypatch.setattr(api, "get_app_access_token", fake_token)
+
+    async def _go():
+        return await api.delete_message_reaction(
+            api.InfoflowAccountAPI(
+                api_host="https://api.example.com",
+                app_key="k",
+                app_secret="s",
+            ),
+            chat_type="dm",
+            from_uid="chengbo05",
+            base_msg_id="1865798223458853292",
+            msgid2="300016044",
+            session=_Sess(),
+        )
+
+    result = asyncio.run(_go())
+    assert result["ok"] is True
+    parsed = json.loads(captured["data"])
+    assert parsed["replyContent"] == "d135"
+    assert "replyDesc" not in parsed
+
+
 def test_parse_recall_response_accepts_emoji_bizcode_success() -> None:
     res = api._parse_recall_response(
         '{"code":"ok","data":{"bizCode":200,"bizMsg":"ok","bizData":null}}',
+        kind="emoji_del",
+    )
+    assert res == {"ok": True}
+
+
+def test_parse_recall_response_accepts_emoji_bizcode_zero() -> None:
+    res = api._parse_recall_response(
+        '{"code":"ok","data":{"bizCode":0,"bizMsg":"ok","bizData":null}}',
         kind="emoji_del",
     )
     assert res == {"ok": True}

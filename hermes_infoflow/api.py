@@ -904,6 +904,7 @@ def _build_emoji_reaction_body(
     emoji_code: str,
     emoji_desc: str,
     group_id: int | None = None,
+    include_reply_desc: bool = True,
 ) -> str:
     """Hand-build JSON for emoji API so large numeric IDs stay precise.
 
@@ -921,7 +922,8 @@ def _build_emoji_reaction_body(
         with contextlib.suppress(TypeError, ValueError):
             parts.append(f'"msgId2":{int(msgid2)}')
     parts.append(f'"replyContent":{json.dumps(emoji_code)}')
-    parts.append(f'"replyDesc":{json.dumps(emoji_desc)}')
+    if include_reply_desc:
+        parts.append(f'"replyDesc":{json.dumps(emoji_desc)}')
     return "{" + ",".join(parts) + "}"
 
 
@@ -949,6 +951,7 @@ async def _send_emoji_request(
     group_id: int | None,
     emoji_code: str,
     emoji_desc: str,
+    include_reply_desc: bool,
     session: aiohttp.ClientSession | None,
     timeout: float,
 ) -> dict[str, Any]:
@@ -993,12 +996,14 @@ async def _send_emoji_request(
         emoji_code=emoji_code,
         emoji_desc=emoji_desc,
         group_id=gid,
+        include_reply_desc=include_reply_desc,
     )
     gw_log().info(
-        "[infoflow:%s] chatType=%s chatId=%s baseMsgId=%s msgId2=%s",
+        "[infoflow:%s] chatType=%s chatId=%s fromUid=%s baseMsgId=%s msgId2=%s",
         kind,
         chat_type_int,
         gid if gid is not None else "-",
+        from_uid,
         base_msg_id,
         msgid2_str or "-",
     )
@@ -1011,6 +1016,12 @@ async def _send_emoji_request(
         timeout=aiohttp.ClientTimeout(total=timeout),
     ) as resp:
         text = await resp.text()
+    gw_log().info(
+        "[infoflow:%s_response] status=%s body=%s",
+        kind,
+        getattr(resp, "status", "-"),
+        text[:500],
+    )
     return _parse_recall_response(text, kind=kind)
 
 
@@ -1039,6 +1050,7 @@ async def add_message_reaction(
         group_id=group_id,
         emoji_code=emoji_code,
         emoji_desc=emoji_desc,
+        include_reply_desc=True,
         session=session,
         timeout=timeout,
     )
@@ -1069,6 +1081,7 @@ async def delete_message_reaction(
         group_id=group_id,
         emoji_code=emoji_code,
         emoji_desc=emoji_desc,
+        include_reply_desc=False,
         session=session,
         timeout=timeout,
     )
@@ -1089,7 +1102,7 @@ def _parse_recall_response(response_text: str, *, kind: str) -> dict[str, Any]:
         err = inner.get("errmsg") or f"errcode {inner.get('errcode')}"
         logger.error("[infoflow:recall%s] failed: %s", kind.title(), err)
         return {"ok": False, "error": str(err)}
-    if inner is not None and inner.get("bizCode") not in (None, 200):
+    if inner is not None and inner.get("bizCode") not in (None, 0, 200):
         err = inner.get("bizMsg") or f"bizCode {inner.get('bizCode')}"
         logger.error("[infoflow:recall%s] failed: %s", kind.title(), err)
         return {"ok": False, "error": str(err)}

@@ -78,6 +78,10 @@ def _body_has_reply_item(body_items: list[Any]) -> bool:
     )
 
 
+def _has_media_image_marker(text: str) -> bool:
+    return any(line.strip().startswith("<media:image>") for line in text.splitlines())
+
+
 def _render_body_items(
     body_items: list[Any],
     *,
@@ -179,6 +183,9 @@ def render_message_content(
                 body_items,
                 robot_agent_id_lookup=robot_agent_id_lookup,
             )
+    elif image_urls and not _has_media_image_marker(text):
+        marker = "<media:image>" if len(image_urls) == 1 else f"<media:image> ({len(image_urls)} images)"
+        text = f"{text}\n{marker}"
     if is_at_only:
         text = (text or "") + _AT_ONLY_HINT
     return text

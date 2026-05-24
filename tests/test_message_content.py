@@ -143,3 +143,33 @@ def test_render_string_false_boolean_fields_are_not_truthy() -> None:
 def test_render_image_placeholder_when_no_text() -> None:
     msg = _Msg(image_urls=["https://example.test/a.png"])
     assert render_message_content(msg) == "<media:image>"
+
+
+def test_render_image_placeholder_with_text() -> None:
+    msg = _Msg(text="please inspect", image_urls=["https://example.test/a.png"])
+    assert render_message_content(msg) == "please inspect\n<media:image>"
+
+
+def test_render_image_placeholder_does_not_duplicate_existing_marker() -> None:
+    msg = _Msg(text="<media:image>", image_urls=["https://example.test/a.png"])
+    assert render_message_content(msg) == "<media:image>"
+
+
+def test_render_image_placeholder_when_literal_marker_is_plain_text() -> None:
+    msg = _Msg(
+        text="what does <media:image> mean?",
+        image_urls=["https://example.test/a.png"],
+    )
+    assert render_message_content(msg) == "what does <media:image> mean?\n<media:image>"
+
+
+def test_render_image_placeholder_with_group_mention_body() -> None:
+    @dataclass
+    class _Image:
+        type: str = "IMAGE"
+
+    msg = _Msg(
+        body_items=[_At(name="chengbo5.1", robot_id="6471"), _Image()],
+        image_urls=["https://example.test/a.png"],
+    )
+    assert render_message_content(msg) == "@chengbo5.1\n<media:image>"
