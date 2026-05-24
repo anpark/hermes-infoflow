@@ -913,14 +913,16 @@ class Bot:
                 "emoji_desc": _EMOJI_PROCESSING[1],
             }
 
-        # Group path: only react when the message is directly addressed to the
-        # bot or part of an engaged follow-up window.
+        # Group path: react when the message is directly addressed to the bot,
+        # hits an explicit watch rule, or is part of an engaged follow-up window.
         if not msg.is_group or not msg.group_id or not msg.msgid2:
             return None
 
         trig = decision.trigger_reason or ""
         eligible = False
         if trig == "bot-mentioned":
+            eligible = True
+        elif trig.startswith("watchMentions:") or trig.startswith("watchRegex#"):
             eligible = True
         elif trig == "followUp":
             if msg.is_reply_to_bot:

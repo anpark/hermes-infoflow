@@ -94,6 +94,42 @@ def test_reaction_handle_bot_mentioned() -> None:
     assert h["group_id"] == "4507088"
 
 
+def test_reaction_handle_watch_mentions() -> None:
+    bot = _bot()
+    msg = _group_msg(bot_was_mentioned=False)
+    decision = PolicyDecision(
+        should_dispatch=True,
+        action=Action.DISPATCH,
+        trigger_reason="watchMentions:chengbo05",
+    )
+    h = bot._build_reaction_handle(msg, decision)
+    assert h is not None
+    assert h["chat_type"] == "group"
+    assert h["from_uid"] == "bob"
+    assert h["msgid2"] == "300014580"
+    assert h["base_msg_id"] == "1865794273048386548"
+    assert h["emoji_code"] == "d135"
+    assert h["group_id"] == "4507088"
+
+
+def test_reaction_handle_watch_regex() -> None:
+    bot = _bot()
+    msg = _group_msg(bot_was_mentioned=False)
+    decision = PolicyDecision(
+        should_dispatch=True,
+        action=Action.DISPATCH,
+        trigger_reason=r"watchRegex#0(\bdeploy\b)",
+    )
+    h = bot._build_reaction_handle(msg, decision)
+    assert h is not None
+    assert h["chat_type"] == "group"
+    assert h["from_uid"] == "bob"
+    assert h["msgid2"] == "300014580"
+    assert h["base_msg_id"] == "1865794273048386548"
+    assert h["emoji_code"] == "d135"
+    assert h["group_id"] == "4507088"
+
+
 def test_reaction_handle_followup_engaged() -> None:
     bot = _bot()
     bot._policy.record_sender_mention("4507088", "bob")
@@ -117,6 +153,18 @@ def test_reaction_handle_followup_reply_to_bot() -> None:
     )
     h = bot._build_reaction_handle(msg, decision)
     assert h is not None
+
+
+@pytest.mark.parametrize("trigger_reason", ["proactive", "require_mention=false"])
+def test_reaction_handle_broad_group_triggers_skipped(trigger_reason: str) -> None:
+    bot = _bot()
+    msg = _group_msg(bot_was_mentioned=False)
+    decision = PolicyDecision(
+        should_dispatch=True,
+        action=Action.DISPATCH,
+        trigger_reason=trigger_reason,
+    )
+    assert bot._build_reaction_handle(msg, decision) is None
 
 
 def test_reaction_handle_followup_passive_skipped() -> None:
