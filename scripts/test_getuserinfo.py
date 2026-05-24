@@ -2,7 +2,6 @@
 """Test Infoflow getuserinfo API (code -> UserId).
 
 Usage:
-  export INFOFLOW_API_HOST=http://apiin.im.baidu.com
   export INFOFLOW_APP_KEY=...
   export INFOFLOW_APP_SECRET=...
   export INFOFLOW_APP_AGENT_ID=6471
@@ -28,6 +27,7 @@ from hermes_infoflow.api import (  # noqa: E402
     InfoflowAPIError,
     get_user_info_by_code,
 )
+from hermes_infoflow.settings import DEFAULT_API_HOST  # noqa: E402
 
 
 def _md5_secret(raw: str) -> str:
@@ -62,14 +62,13 @@ async def main() -> int:
     parser.add_argument("--code", required=True, help="Private-chat code from sessiontracker URL")
     args = parser.parse_args()
 
-    api_host = os.environ.get("INFOFLOW_API_HOST", "").strip()
+    api_host = os.environ.get("INFOFLOW_API_HOST", "").strip() or DEFAULT_API_HOST
     app_key = os.environ.get("INFOFLOW_APP_KEY", "").strip()
     app_secret = os.environ.get("INFOFLOW_APP_SECRET", "").strip()
     agent_id_raw = os.environ.get("INFOFLOW_APP_AGENT_ID", "").strip()
 
     missing = [
         name for name, val in (
-            ("INFOFLOW_API_HOST", api_host),
             ("INFOFLOW_APP_KEY", app_key),
             ("INFOFLOW_APP_SECRET", app_secret),
             ("INFOFLOW_APP_AGENT_ID", agent_id_raw),

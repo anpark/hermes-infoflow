@@ -656,6 +656,8 @@ async def send_group_message(
 
     last_messageid: str | None = None
     last_msgseqid: str | None = None
+    messageids: list[str] = []
+    msgseqids: list[str] = []
     first_error: str | None = None
     reply_applied = False
 
@@ -668,8 +670,13 @@ async def send_group_message(
         )
         reply_applied = True
         if res.get("ok"):
-            last_messageid = res.get("messageid") or last_messageid
-            last_msgseqid = res.get("msgseqid") or last_msgseqid
+            mid = res.get("messageid")
+            seq = res.get("msgseqid")
+            last_messageid = mid or last_messageid
+            last_msgseqid = seq or last_msgseqid
+            if mid:
+                messageids.append(str(mid))
+                msgseqids.append(str(seq or ""))
         else:
             first_error = first_error or res.get("error")
 
@@ -677,8 +684,13 @@ async def send_group_message(
         res = await _post([link], "TEXT", reply_to if not reply_applied else None)
         reply_applied = True
         if res.get("ok"):
-            last_messageid = res.get("messageid") or last_messageid
-            last_msgseqid = res.get("msgseqid") or last_msgseqid
+            mid = res.get("messageid")
+            seq = res.get("msgseqid")
+            last_messageid = mid or last_messageid
+            last_msgseqid = seq or last_msgseqid
+            if mid:
+                messageids.append(str(mid))
+                msgseqids.append(str(seq or ""))
         else:
             first_error = first_error or res.get("error")
 
@@ -686,8 +698,13 @@ async def send_group_message(
         res = await _post([img], "IMAGE", reply_to if not reply_applied else None)
         reply_applied = True
         if res.get("ok"):
-            last_messageid = res.get("messageid") or last_messageid
-            last_msgseqid = res.get("msgseqid") or last_msgseqid
+            mid = res.get("messageid")
+            seq = res.get("msgseqid")
+            last_messageid = mid or last_messageid
+            last_msgseqid = seq or last_msgseqid
+            if mid:
+                messageids.append(str(mid))
+                msgseqids.append(str(seq or ""))
         else:
             first_error = first_error or res.get("error")
 
@@ -697,8 +714,16 @@ async def send_group_message(
             "error": first_error,
             "messageid": last_messageid,
             "msgseqid": last_msgseqid,
+            "messageids": messageids,
+            "msgseqids": msgseqids,
         }
-    return {"ok": True, "messageid": last_messageid, "msgseqid": last_msgseqid}
+    return {
+        "ok": True,
+        "messageid": last_messageid,
+        "msgseqid": last_msgseqid,
+        "messageids": messageids,
+        "msgseqids": msgseqids,
+    }
 
 
 # ---------------------------------------------------------------------------

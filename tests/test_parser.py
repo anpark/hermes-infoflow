@@ -92,6 +92,9 @@ def test_private_message_decrypts_and_extracts_msg_id(account):
     assert inbound.text == "hello bot"
     assert inbound.message_id == "1859713223686736431"
     assert isinstance(inbound.message_id, str)
+    assert inbound.sender_name == ""
+    assert inbound.fromid == ""
+    assert inbound.is_bot_sender is False
     assert inbound.was_mentioned is True
 
 
@@ -121,6 +124,84 @@ def test_private_message_extracts_msgid2(account):
     assert inbound.chat_type == "dm"
     assert inbound.msgid2 == "300016044"
     assert inbound.message_id == "1865798223458853292"
+
+
+def test_private_bot_echo_preserves_fromid_and_sender_agent(account):
+    acct, raw_key = account
+    acct = replace(acct, robot_id="4105000875", app_agent_id=42)
+    inner = json.dumps(
+        {
+            "ToUserId": "alice",
+            "FromId": "4105000875",
+            "MsgType": "text",
+            "Content": "bot echo",
+            "MsgId": "1865798223458853293",
+            "CreateTime": 1_700_000_000,
+        }
+    )
+    ct = aes_ecb_encrypt_b64url(inner, raw_key)
+    body = urlencode({"messageJson": json.dumps({"Encrypt": ct})})
+    res = parser.parse_webhook(
+        content_type="application/x-www-form-urlencoded",
+        raw_body=body,
+        account=acct,
+    )
+
+    assert res.kind == "message"
+    inbound = res.inbound
+    assert inbound.chat_type == "dm"
+    assert inbound.from_user == "alice"
+    assert inbound.fromid == "4105000875"
+    assert inbound.sender_agent_id == "42"
+    assert inbound.is_bot_sender is True
+
+
+def test_private_message_without_from_user_is_not_treated_as_bot_echo(account):
+    acct, raw_key = account
+    acct = replace(acct, robot_id="4105000875", app_agent_id=42)
+    inner = json.dumps(
+        {
+            "ToUserId": "alice",
+            "FromId": "1744775667",
+            "MsgType": "text",
+            "Content": "ambiguous sender",
+            "MsgId": "1865798223458853294",
+            "CreateTime": 1_700_000_000,
+        }
+    )
+    ct = aes_ecb_encrypt_b64url(inner, raw_key)
+    body = urlencode({"messageJson": json.dumps({"Encrypt": ct})})
+    res = parser.parse_webhook(
+        content_type="application/x-www-form-urlencoded",
+        raw_body=body,
+        account=acct,
+    )
+
+    assert res.kind == "ignored"
+
+
+def test_private_bot_echo_requires_known_robot_id_match(account):
+    acct, raw_key = account
+    acct = replace(acct, robot_id="", app_agent_id=42)
+    inner = json.dumps(
+        {
+            "ToUserId": "alice",
+            "FromId": "4105000875",
+            "MsgType": "text",
+            "Content": "bot echo but robot unknown",
+            "MsgId": "1865798223458853295",
+            "CreateTime": 1_700_000_000,
+        }
+    )
+    ct = aes_ecb_encrypt_b64url(inner, raw_key)
+    body = urlencode({"messageJson": json.dumps({"Encrypt": ct})})
+    res = parser.parse_webhook(
+        content_type="application/x-www-form-urlencoded",
+        raw_body=body,
+        account=acct,
+    )
+
+    assert res.kind == "ignored"
 
 
 def test_private_message_without_msgid2_defaults_empty(account):
@@ -195,7 +276,7 @@ def test_group_message_extracts_mention_and_msgseqid(account):
                 "servertime": 1_700_000_000_000,
             },
             "body": [
-                {"type": "AT", "name": "hermes", "robotid": "42"},
+                {"type": "AT", "name": "hermes", "robotid": "4105000875"},
                 {"type": "TEXT", "content": "ping"},
                 {
                     "type": "IMAGE",
@@ -218,13 +299,107 @@ def test_group_message_extracts_mention_and_msgseqid(account):
     # large-integer IDs round-tripped to str
     assert inbound.message_id == "1859713223686736432"
     assert inbound.msgseqid == "1859713223686736433"
-    # OpenClaw render: "@<name> (robotid:<N>) " when the AT carries a robotid,
-    # plus the trailing TEXT content.
-    assert "@hermes" in inbound.body_for_agent
-    assert "(robotid:42)" in inbound.body_for_agent
-    assert "ping" in inbound.body_for_agent
-    assert inbound.discovered_robot_id == "42"
+    # Parser preserves service ids structurally but does not build LLM-facing
+    # mention text with robotid embedded.
+    assert inbound.body_for_agent == ""
+    assert inbound.body_items[0].robotid == "4105000875"
+    assert inbound.text == "ping"
+    assert inbound.discovered_robot_id == "4105000875"
+    assert inbound.mention_robot_ids == []
+    assert inbound.mention_agent_ids == []
     assert inbound.image_urls == ["https://media.infoflow/img.jpg"]
+
+
+def test_group_message_does_not_match_robotid_to_app_agent_id(account):
+    acct, raw_key = account
+    payload = {
+        "message": {
+            "header": {
+                "fromuserid": "bob",
+                "groupid": 123456,
+                "messageid": "mid-app-agent-id",
+            },
+            "body": [
+                {"type": "AT", "name": "other bot", "robotid": "42"},
+                {"type": "TEXT", "content": "ping"},
+            ],
+        }
+    }
+    ct = aes_ecb_encrypt_b64url(json.dumps(payload), raw_key)
+    res = parser.parse_webhook(
+        content_type="text/plain",
+        raw_body=ct,
+        account=acct,
+    )
+
+    assert res.kind == "message"
+    inbound = res.inbound
+    assert inbound.was_mentioned is False
+    assert inbound.discovered_robot_id == ""
+    assert inbound.mention_robot_ids == ["42"]
+    assert inbound.mention_agent_ids == []
+
+
+def test_group_message_receive_at_all_is_not_direct_bot_mention(account):
+    acct, raw_key = account
+    payload = {
+        "eventtype": "MESSAGE_RECEIVE",
+        "message": {
+            "header": {
+                "fromuserid": "bob",
+                "groupid": 123456,
+                "messageid": "1865794273048386548",
+            },
+            "body": [
+                {"type": "AT", "atall": True},
+                {"type": "TEXT", "content": "announcement"},
+            ],
+        },
+    }
+    ct = aes_ecb_encrypt_b64url(json.dumps(payload), raw_key)
+    res = parser.parse_webhook(
+        content_type="text/plain",
+        raw_body=ct,
+        account=acct,
+    )
+
+    assert res.kind == "message"
+    inbound = res.inbound
+    assert inbound.was_mentioned is False
+    assert inbound.body_for_agent == ""
+    assert inbound.body_items[0].atall is True
+    assert inbound.mention_user_ids == []
+    assert inbound.mention_robot_ids == []
+    assert inbound.mention_agent_ids == []
+
+
+def test_group_message_string_false_at_all_is_not_truthy(account):
+    acct, raw_key = account
+    payload = {
+        "eventtype": "MESSAGE_RECEIVE",
+        "message": {
+            "header": {
+                "fromuserid": "bob",
+                "groupid": 123456,
+                "messageid": "1865794273048386548",
+            },
+            "body": [
+                {"type": "AT", "atall": "false", "userid": "alice", "name": "Alice"},
+                {"type": "TEXT", "content": "hello"},
+            ],
+        },
+    }
+    ct = aes_ecb_encrypt_b64url(json.dumps(payload), raw_key)
+    res = parser.parse_webhook(
+        content_type="text/plain",
+        raw_body=ct,
+        account=acct,
+    )
+
+    assert res.kind == "message"
+    inbound = res.inbound
+    assert inbound.body_items[0].atall is False
+    assert inbound.mention_user_ids == ["alice"]
 
 
 def test_group_message_reply_to_bot_marked_when_in_sent_set(account):
@@ -282,6 +457,34 @@ def test_group_message_reply_to_seen_inbound_is_not_reply_to_bot(account):
     assert res.kind == "message"
     assert res.inbound.is_reply_to_bot is False
     assert res.inbound.reply_targets[0]["isBotMessage"] is False
+
+
+def test_group_message_string_false_reply_bot_flag_is_not_truthy(account):
+    acct, raw_key = account
+    payload = {
+        "message": {
+            "header": {"fromuserid": "carol", "groupid": 999, "messageid": 1},
+            "body": [
+                {
+                    "type": "replyData",
+                    "messageid": "77777777777777777",
+                    "preview": "earlier human message",
+                    "isBotMessage": "false",
+                },
+                {"type": "TEXT", "content": "thanks!"},
+            ],
+        }
+    }
+    ct = aes_ecb_encrypt_b64url(json.dumps(payload), raw_key)
+    res = parser.parse_webhook(
+        content_type="text/plain",
+        raw_body=ct,
+        account=acct,
+        sent_message_ids=set(),
+    )
+
+    assert res.kind == "message"
+    assert res.inbound.reply_targets[0]["platformIsBotMessage"] is False
 
 
 def test_group_message_reply_to_other_bot_is_not_reply_to_current_bot(account):

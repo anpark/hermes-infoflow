@@ -28,7 +28,7 @@ from hermes_infoflow.adapter import (  # noqa: E402
     MessageType,
     _inbound_mid,
 )
-from hermes_infoflow.itypes import RecallResult, SentResult  # noqa: E402
+from hermes_infoflow.itypes import IncomingMessage, RecallResult, SentResult  # noqa: E402
 from hermes_infoflow.sent_store import SentMessageStore  # noqa: E402
 from tests._aes_helpers import aes_ecb_encrypt_b64url, aes_key_b64url  # noqa: E402
 
@@ -100,6 +100,29 @@ def test_adapter_construction_reads_env(configured_env, monkeypatch) -> None:
     assert adapter._api_account.app_key == "k"
     assert adapter._policy.reply_mode == "mention-and-watch"
     assert adapter._policy.require_mention is True
+
+
+def test_build_message_event_uses_settings_agent_id_for_bot_identity(
+    configured_env,
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("INFOFLOW_APP_AGENT_ID", raising=False)
+    cfg = _make_config()
+    cfg.extra = {"app_agent_id": "6471"}
+    adapter = InfoflowAdapter(cfg)
+
+    async def _go():
+        return await adapter.build_message_event(
+            IncomingMessage(
+                message_id="mid-1",
+                text="hello",
+                group_id="4507088",
+                sender_id="alice",
+            )
+        )
+
+    event = asyncio.run(_go())
+    assert "agentId: 6471" in event.channel_prompt
 
 
 def test_hermes_background_processor_signature_matches_context_override() -> None:

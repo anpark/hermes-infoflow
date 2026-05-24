@@ -43,7 +43,6 @@ def test_register_registers_platform_and_tool() -> None:
         "INFOFLOW_ENCODING_AES_KEY",
         "INFOFLOW_APP_KEY",
         "INFOFLOW_APP_SECRET",
-        "INFOFLOW_API_HOST",
     }
 
     # The recall tool must be registered too.

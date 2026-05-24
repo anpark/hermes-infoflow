@@ -36,7 +36,7 @@ async def standalone_send(
 
     settings = _read_account_settings(pconfig)
     if not (settings["api_host"] and settings["app_key"] and settings["app_secret"]):
-        return {"error": "Infoflow standalone send: INFOFLOW_API_HOST/APP_KEY/APP_SECRET are required"}
+        return {"error": "Infoflow standalone send: INFOFLOW_APP_KEY/APP_SECRET are required"}
 
     serverapi = ServerAPI(settings=settings)
     kind, group_id, dm_user = InfoflowAdapter._parse_target(chat_id)

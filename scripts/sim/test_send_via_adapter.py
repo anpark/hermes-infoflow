@@ -116,7 +116,7 @@ def main() -> int:
             "[sim:adapter] hermes-agent checkout not found at "
             f"{status['hermes_agent_path']}; this script needs it on sys.path."
         )
-    required_env("INFOFLOW_API_HOST", "INFOFLOW_APP_KEY", "INFOFLOW_APP_SECRET")
+    required_env("INFOFLOW_APP_KEY", "INFOFLOW_APP_SECRET")
 
     parser = _build_parser()
     args = parser.parse_args()

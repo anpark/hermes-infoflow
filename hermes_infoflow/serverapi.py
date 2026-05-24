@@ -26,18 +26,22 @@ import threading
 import time
 from dataclasses import dataclass
 from enum import Enum, StrEnum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 import aiohttp
 
 from . import api as _api
+from .coerce import coerce_bool
 from .itypes import (
+    BodyItem,
     GroupMember,
     IncomingMessage,
     RecallResult,
     ReplyInfo,
+    ReplyTarget,
     SendOptions,
     SentResult,
+    coerce_reply_target,
 )
 
 if TYPE_CHECKING:
@@ -89,6 +93,73 @@ def _api_members_to_group_members(api_members: list[Any]) -> list[GroupMember]:
         )
         for m in api_members
     ]
+
+
+def _continuation_fields(
+    res: dict[str, Any],
+    *,
+    primary_field: str = "messageid",
+    seq_field: str = "msgseqid",
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    primary = str(res.get(primary_field) or "")
+    ids = list(res.get("messageids") or [])
+    seqs = list(res.get("msgseqids") or [])
+    continuation_ids: list[str] = []
+    continuation_seqs: list[str] = []
+    for idx, mid in enumerate(ids):
+        mid = str(mid or "")
+        if not mid or mid == primary:
+            continue
+        continuation_ids.append(mid)
+        seq = seqs[idx] if idx < len(seqs) else ""
+        continuation_seqs.append(str(seq or ""))
+    return tuple(continuation_ids), tuple(continuation_seqs)
+
+
+def _sent_result_from_api_response(
+    res: dict[str, Any],
+    *,
+    success: bool,
+    default_error: str,
+    primary_field: str = "messageid",
+    seq_field: str = "msgseqid",
+) -> SentResult:
+    continuation_ids, continuation_seqs = _continuation_fields(
+        res,
+        primary_field=primary_field,
+        seq_field=seq_field,
+    )
+    return SentResult(
+        success=success,
+        message_id=str(res.get(primary_field) or res.get("msgkey") or ""),
+        msgseqid=str(res.get(seq_field) or ""),
+        continuation_message_ids=continuation_ids,
+        continuation_msgseqids=continuation_seqs,
+        raw_response=res,
+        error="" if success else str(res.get("error") or default_error),
+    )
+
+
+def _normalize_body_item(item: Any) -> BodyItem:
+    """Convert parser/raw body item fields to internal snake_case fields."""
+    return BodyItem(
+        type=str(getattr(item, "type", "") or ""),
+        content=str(getattr(item, "content", "") or ""),
+        label=str(getattr(item, "label", "") or ""),
+        name=str(getattr(item, "name", "") or ""),
+        user_id=str(getattr(item, "userid", "") or ""),
+        robot_id=str(getattr(item, "robotid", "") or ""),
+        at_all=coerce_bool(getattr(item, "atall", False)),
+        download_url=str(getattr(item, "downloadurl", "") or ""),
+        message_id=str(getattr(item, "messageid", "") or ""),
+        preview=str(getattr(item, "preview", "") or ""),
+        sender_imid=str(getattr(item, "sender_imid", "") or ""),
+        is_bot_message=coerce_bool(getattr(item, "is_bot_message", False)),
+    )
+
+
+def _normalize_reply_targets(targets: list[Any]) -> list[ReplyTarget]:
+    return [coerce_reply_target(target) for target in targets]
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +290,7 @@ class ServerAPI:
         if not api_host or "baidu" not in api_host:
             logger.warning(
                 "[serverapi] api_host looks invalid: %r — "
-                "INFOFLOW_API_HOST should be like http://apiin.im.baidu.com",
+                "INFOFLOW_API_HOST should be like https://api.im.baidu.com",
                 api_host,
             )
         self._api_account = _api.InfoflowAccountAPI(
@@ -237,6 +308,7 @@ class ServerAPI:
             robot_id=self._robot_id,
         )
         self._http_session: aiohttp.ClientSession | None = None
+        self._group_members_observer: Callable[[str, list[GroupMember]], None] | None = None
 
     # ------------------------------------------------------------------
     # Properties
@@ -263,6 +335,12 @@ class ServerAPI:
     @http_session.setter
     def http_session(self, session: aiohttp.ClientSession | None) -> None:
         self._http_session = session
+
+    def set_group_members_observer(
+        self,
+        observer: Callable[[str, list[GroupMember]], None] | None,
+    ) -> None:
+        self._group_members_observer = observer
 
     # ------------------------------------------------------------------
     # Session helpers
@@ -306,16 +384,14 @@ class ServerAPI:
         format is produced from whatever ``parser.py`` returns.
         """
         # Extract bot-layer ReplyInfo (only for bot-sent targets)
+        reply_targets = _normalize_reply_targets(list(parser_inbound.reply_targets))
         reply_info: ReplyInfo | None = None
-        if parser_inbound.reply_targets:
-            bot_target = next(
-                (t for t in parser_inbound.reply_targets if t.get("isBotMessage")),
-                None,
-            )
+        if reply_targets:
+            bot_target = next((t for t in reply_targets if t.is_bot_message), None)
             if bot_target:
                 reply_info = ReplyInfo(
-                    messageid=str(bot_target.get("messageid") or ""),
-                    preview=str(bot_target.get("preview") or ""),
+                    message_id=bot_target.message_id,
+                    preview=bot_target.preview,
                 )
 
         return IncomingMessage(
@@ -331,19 +407,21 @@ class ServerAPI:
                 if parser_inbound.chat_type != "group"
                 else None
             ),
-            sender_id=parser_inbound.from_user or "",
+            sender_id="" if parser_inbound.is_bot_sender else (parser_inbound.from_user or ""),
             sender_name=parser_inbound.sender_name or "",
             sender_imid=parser_inbound.fromid or "",
             sender_is_bot=parser_inbound.is_bot_sender,
+            sender_agent_id=parser_inbound.sender_agent_id or "",
             bot_was_mentioned=parser_inbound.was_mentioned,
             mention_user_ids=list(parser_inbound.mention_user_ids),
+            mention_robot_ids=list(getattr(parser_inbound, "mention_robot_ids", [])),
             mention_agent_ids=[int(x) for x in parser_inbound.mention_agent_ids if str(x).isdigit()],
             reply_info=reply_info,
-            reply_targets=list(parser_inbound.reply_targets),
+            reply_targets=reply_targets,
             is_reply_to_bot=parser_inbound.is_reply_to_bot,
             body_for_agent=parser_inbound.body_for_agent or "",
             image_urls=list(parser_inbound.image_urls),
-            body_items=list(parser_inbound.body_items),
+            body_items=[_normalize_body_item(item) for item in parser_inbound.body_items],
             dedupe_key=parser_inbound.dedupe_key() or "",
             msgseqid=str(parser_inbound.msgseqid or ""),
             msgid2=parser_inbound.msgid2 or "",
@@ -417,7 +495,7 @@ class ServerAPI:
         reply_ctx = None
         if reply_info:
             reply_ctx = _api.ReplyContext(
-                messageid=reply_info.messageid,
+                messageid=reply_info.message_id,
                 preview=reply_info.preview[:_MAX_PREVIEW_LENGTH],
                 replytype=reply_info.replytype,
                 imid=reply_info.sender_imid or self._robot_id,
@@ -436,13 +514,16 @@ class ServerAPI:
                 return SentResult(success=False, error=str(exc))
 
             if res.get("ok"):
-                return SentResult(
+                return _sent_result_from_api_response(
+                    res,
                     success=True,
-                    message_id=str(res.get("messageid") or ""),
-                    msgseqid=str(res.get("msgseqid") or ""),
-                    raw_response=res,
+                    default_error="send failed",
                 )
-            return SentResult(success=False, error=res.get("error") or "send failed", raw_response=res)
+            return _sent_result_from_api_response(
+                res,
+                success=False,
+                default_error="send failed",
+            )
 
     # ------------------------------------------------------------------
     # Send — DM
@@ -512,7 +593,7 @@ class ServerAPI:
         reply_ctx = None
         if reply_info:
             reply_ctx = _api.ReplyContext(
-                messageid=reply_info.messageid,
+                messageid=reply_info.message_id,
                 preview=reply_info.preview[:_MAX_PREVIEW_LENGTH],
                 replytype=reply_info.replytype,
                 imid=reply_info.sender_imid or self._robot_id,
@@ -531,13 +612,16 @@ class ServerAPI:
                 return SentResult(success=False, error=str(exc))
 
             if res.get("ok"):
-                return SentResult(
+                return _sent_result_from_api_response(
+                    res,
                     success=True,
-                    message_id=str(res.get("messageid") or ""),
-                    msgseqid=str(res.get("msgseqid") or ""),
-                    raw_response=res,
+                    default_error="image send failed",
                 )
-            return SentResult(success=False, error=res.get("error") or "image send failed", raw_response=res)
+            return _sent_result_from_api_response(
+                res,
+                success=False,
+                default_error="image send failed",
+            )
 
     # ------------------------------------------------------------------
     # Send image — DM
@@ -570,20 +654,48 @@ class ServerAPI:
                 res = await _api.send_private_message(
                     self._api_account, to_user=user_id, contents=image_items, session=sess,
                 )
-                # Surface caption error if image succeeded.
-                if not res_caption.get("ok") and res.get("ok"):
-                    res = {"ok": False, "error": res_caption.get("error"), **{k: v for k, v in res.items() if k != "ok"}}
             except Exception as exc:
                 return SentResult(success=False, error=str(exc))
 
+            caption_mid = str(res_caption.get("messageid") or res_caption.get("msgkey") or "")
+            caption_seq = str(res_caption.get("msgseqid") or "")
+            raw_response = dict(res)
+            if caption_items:
+                raw_response["caption_response"] = res_caption
+
             if res.get("ok"):
+                primary = str(res.get("messageid") or res.get("msgkey") or "")
+                continuation_ids = (caption_mid,) if caption_mid and caption_mid != primary else ()
+                continuation_seqs = (caption_seq,) if continuation_ids else ()
+                if not res_caption.get("ok"):
+                    return SentResult(
+                        success=False,
+                        message_id=primary,
+                        msgseqid=str(res.get("msgseqid") or ""),
+                        raw_response=raw_response,
+                        error=str(res_caption.get("error") or "image caption send failed"),
+                    )
                 return SentResult(
                     success=True,
-                    message_id=str(res.get("messageid") or res.get("msgkey") or ""),
+                    message_id=primary,
                     msgseqid=str(res.get("msgseqid") or ""),
-                    raw_response=res,
+                    continuation_message_ids=continuation_ids,
+                    continuation_msgseqids=continuation_seqs,
+                    raw_response=raw_response,
                 )
-            return SentResult(success=False, error=res.get("error") or "image send failed", raw_response=res)
+            if caption_mid:
+                return SentResult(
+                    success=False,
+                    message_id=caption_mid,
+                    msgseqid=caption_seq,
+                    raw_response=raw_response,
+                    error=str(res.get("error") or "image send failed"),
+                )
+            return SentResult(
+                success=False,
+                error=str(res.get("error") or "image send failed"),
+                raw_response=raw_response,
+            )
 
     # ------------------------------------------------------------------
     # Recall — group
@@ -762,6 +874,11 @@ class ServerAPI:
                 timeout=6.0,
             )
             members = _api_members_to_group_members(api_members)
+            if self._group_members_observer is not None:
+                try:
+                    self._group_members_observer(gid, members)
+                except Exception:
+                    logger.debug("[serverapi] group member observer failed", exc_info=True)
             now = time.time()
             _MEMBERS_CACHE[gid] = (members, now)
             logger.debug(

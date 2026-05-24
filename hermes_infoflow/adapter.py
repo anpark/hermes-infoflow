@@ -73,6 +73,23 @@ def _format_group_status_admin_notice(
 
 import aiohttp
 
+
+def _make_send_result(*, success: bool, message_id: str = "", error: str = "", retryable: bool | None = None, continuation_message_ids: tuple[str, ...] = ()):
+    kwargs: dict[str, Any] = {"success": success}
+    if message_id:
+        kwargs["message_id"] = message_id
+    if error:
+        kwargs["error"] = error
+    if retryable is not None:
+        kwargs["retryable"] = retryable
+    if continuation_message_ids:
+        kwargs["continuation_message_ids"] = list(continuation_message_ids)
+    try:
+        return SendResult(**kwargs)
+    except TypeError:
+        kwargs.pop("continuation_message_ids", None)
+        return SendResult(**kwargs)
+
 # ── Context var: propagate inbound mid → send() for tracing ────
 _inbound_mid: contextvars.ContextVar[str] = contextvars.ContextVar("inbound_mid", default="")
 
@@ -111,7 +128,9 @@ from .iftools import (
     make_recall_handler,
     make_reply_handler,
 )
-from .itypes import IncomingMessage, ReplyInfo
+from .itypes import IncomingMessage, ReplyInfo, reply_target_to_dict
+from .identity import raw_id_from_key, sender_key
+from .message_content import render_message_content
 from .message_store import MessageStore
 from .outbound import prepare_outbound_message
 from .policy import (
@@ -155,22 +174,30 @@ from .webhook import WebhookServer
 # ---------------------------------------------------------------------------
 
 
-def _build_sender_tag(msg: Any, admin_uid: str = "") -> str:
-    """Build ``[Sender: name | type](permission)`` tag.
-
-    * Human:  ``[Sender: uuapName | human](admin|restricted — ...)``
-    * Bot:    ``[Sender: botName | bot: agentId](admin|restricted — ...)``
-    """
-    if getattr(msg, "sender_agent_id", ""):
-        _name = msg.sender_name or "unknown"
-        tag = f"[Sender: {_name} | bot: {msg.sender_agent_id}]"
+def _build_sender_tag(
+    msg: Any,
+    admin_uid: str = "",
+    *,
+    participant_name: str = "",
+) -> str:
+    """Build the trusted sender envelope shown before ``[Message]``."""
+    if getattr(msg, "sender_is_bot", False):
+        _aid = str(getattr(msg, "sender_agent_id", "") or "").strip()
+        if _aid.startswith("IMID:"):
+            _aid = ""
+        _name = participant_name or msg.sender_name or ""
+        parts = [f"agent_id={_aid or 'unknown'}"]
+        if _name:
+            parts.append(f"name={_name}")
+        tag = f"[Sender: {'; '.join(parts)} | bot]"
     else:
-        # Human: prefer uuapName; skip IMID: fallback (unreliable)
         _uid = msg.sender_id or ""
         if _uid.startswith("IMID:"):
             _uid = ""
-        _name = _uid or msg.sender_name or "unknown"
-        tag = f"[Sender: {_name} | human]"
+        parts = [f"user_id={_uid or 'unknown'}"]
+        if participant_name:
+            parts.append(f"name={participant_name}")
+        tag = f"[Sender: {'; '.join(parts)} | human]"
 
     if not admin_uid:
         return tag
@@ -291,6 +318,9 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         self._message_store = MessageStore(
             account_id=str(self._settings.get("app_agent_id") or "default"),
         )
+        self._serverapi.set_group_members_observer(
+            self._message_store.upsert_group_members
+        )
 
         # ── Bot (business logic) ──────────────────────────────────────
         self._bot = Bot(
@@ -347,7 +377,6 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
     def _missing_required(self) -> list[str]:
         missing = []
         for key, label in (
-            ("api_host", "INFOFLOW_API_HOST"),
             ("app_key", "INFOFLOW_APP_KEY"),
             ("app_secret", "INFOFLOW_APP_SECRET"),
             ("check_token", "INFOFLOW_CHECK_TOKEN"),
@@ -532,6 +561,33 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             return f"group:{msg.group_id}"
         return msg.dm_user_id or msg.sender_id or ""
 
+    def _participant_name_for_sender(self, msg: IncomingMessage) -> str:
+        if msg.sender_is_bot:
+            aid = str(getattr(msg, "sender_agent_id", "") or "").strip()
+            if aid and not aid.startswith("IMID:"):
+                rec = self._message_store.find_bot_by_agent_id(aid)
+                if rec and rec.name:
+                    return rec.name
+                return msg.sender_name or ""
+            return ""
+        uid = msg.sender_id or ""
+        if uid and not uid.startswith("IMID:"):
+            rec = self._message_store.find_user_by_user_id(uid)
+            if rec and rec.name:
+                return rec.name
+        return ""
+
+    def _agent_id_for_robot_id(self, robot_id: str) -> str | None:
+        rid = str(robot_id or "").strip()
+        if not rid:
+            return None
+        rec = self._message_store.find_participant_by_imid(rid)
+        if rec and rec.participant_type == "bot" and rec.agent_id:
+            return rec.agent_id
+        if rid == str(getattr(self._serverapi, "robot_id", "") or "").strip():
+            return str(self._settings.get("app_agent_id") or "").strip() or None
+        return None
+
     def _push_infoflow_event(
         self,
         msg: IncomingMessage | None,
@@ -555,7 +611,10 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 "sender_name": msg.sender_name,
                 "group_id": msg.group_id,
                 "is_group": msg.is_group,
-                "preview": (msg.body_for_agent or msg.text or "")[:500],
+                "preview": render_message_content(
+                    msg,
+                    robot_agent_id_lookup=self._agent_id_for_robot_id,
+                )[:500],
             })
         if extra:
             payload.update(extra)
@@ -620,21 +679,18 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
 
         chat_id = f"group:{msg.group_id}" if msg.is_group else (msg.dm_user_id or "")
         chat_type = "group" if msg.is_group else "dm"
-
-        # Encode sender identity into user_name for gateway's [sender] prefix.
-        # Human:  [chengbo05]          — uid is the unique identifier
-        # Bot:    [chengbo5.1 🤖:6471] — agentId is the unique identifier + bot name
-        if msg.sender_is_bot:
-            _aid = getattr(msg, "sender_agent_id", "") or msg.sender_id
-            _user_display = f"{msg.sender_name} 🤖:{_aid}"
-        else:
-            _user_display = msg.sender_id  # uid IS the human identity
+        participant_name = self._participant_name_for_sender(msg)
+        canonical_sender = sender_key(msg)
+        source_user_id = raw_id_from_key(canonical_sender)
+        if not source_user_id and not msg.sender_is_bot:
+            source_user_id = msg.sender_id if not (msg.sender_id or "").startswith("IMID:") else ""
+        _user_display = participant_name or source_user_id or "unknown"
 
         source = self.build_source(
             chat_id=chat_id,
             chat_name=chat_id,
             chat_type=chat_type,
-            user_id=msg.sender_id,
+            user_id=source_user_id,
             user_name=_user_display,
             message_id=msg.message_id,
         )
@@ -654,43 +710,26 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             )
             return event
 
-        text_for_agent = msg.body_for_agent or msg.text or ""
-        # Pure-AT message (no TEXT/MD body): build a description for the LLM
-        # so it knows who was @mentioned and can decide whether to respond.
-        if not text_for_agent.strip() and not local_media:
-            _mention_parts: list[str] = []
-            if msg.body_items:
-                _atall = any(
-                    (b.type or "").upper() == "AT" and b.atall
-                    for b in msg.body_items
-                )
-                if _atall:
-                    _mention_parts.append("@所有人")
-                for b in msg.body_items:
-                    bt = (b.type or "").upper()
-                    if bt == "AT" and not b.atall:
-                        name = b.name or b.userid or b.robotid or "?"
-                        if b.robotid or b.userid:
-                            _mention_parts.append(f"@{name}")
-            if _mention_parts:
-                text_for_agent = f"（仅@了以下对象，无正文：{' '.join(_mention_parts)}）"
-            else:
-                text_for_agent = "<空消息>"
+        text_for_agent = render_message_content(
+            msg,
+            robot_agent_id_lookup=self._agent_id_for_robot_id,
+        )
 
         raw_message: dict[str, Any] = {
             "raw_text": msg.text,
             "mention_user_ids": list(msg.mention_user_ids),
+            "mention_robot_ids": list(getattr(msg, "mention_robot_ids", [])),
             "mention_agent_ids": list(msg.mention_agent_ids),
-            "reply_targets": list(msg.reply_targets),
+            "reply_targets": [reply_target_to_dict(t) for t in msg.reply_targets],
             "is_reply_to_bot": msg.is_reply_to_bot,
             "was_mentioned": msg.bot_was_mentioned,
             "image_urls": list(msg.image_urls),
             "msgseqid": msg.msgseqid,
             "raw_msgdata": msg.raw_data,
             "event_type": msg.event_type,
-            "fromid": msg.sender_imid,
             "is_bot_sender": msg.sender_is_bot,
-            "sender_name": msg.sender_name,
+            "sender_key": canonical_sender,
+            "sender_name": participant_name,
             "sender_agent_id": getattr(msg, "sender_agent_id", ""),
         }
         _prefix = ""
@@ -729,7 +768,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                             msg.group_id, _engaged_key,
                         )
                     _prefix = build_follow_up_prompt(
-                        fromid=msg.sender_imid,
+                        sender_imid=msg.sender_imid,
                         sender_name=msg.sender_name or msg.sender_id,
                         is_bot=msg.sender_is_bot,
                         agent_id=getattr(msg, "sender_agent_id", ""),
@@ -768,13 +807,12 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     msg.message_id or "-", len(_per_msg),
                 )
 
-        # AT-only message: append explicit guidance so LLM doesn't output NO_REPLY
-        if getattr(msg, "is_at_only", False):
-            _at_hint = "\n\n[注意] 用户 @ 了你但没有输入正文。如果上下文中没有与你相关的事项或待办任务，请主动询问用户有什么需要帮忙的。"
-            text_for_agent = (text_for_agent or "") + _at_hint
-
         # Build envelope (Sender tag + [Message] separator) — unified for DM and group.
-        _sender_tag = _build_sender_tag(msg, admin_uid=self._admin_uid)
+        _sender_tag = _build_sender_tag(
+            msg,
+            admin_uid=self._admin_uid,
+            participant_name=participant_name,
+        )
         _mid_line = f"\n[message_id: {msg.message_id}]" if msg.message_id else ""
         _envelope = f"{_sender_tag}{_mid_line}\n[Message]\n"
 
@@ -801,7 +839,11 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         )
         # Inject bot identity + security rules into channel_prompt.
         _bot_name = self._settings.get("robot_name") or ""
-        _bot_agent_id = os.getenv("INFOFLOW_APP_AGENT_ID", "")
+        _bot_agent_id = str(
+            self._settings.get("app_agent_id")
+            or os.getenv("INFOFLOW_APP_AGENT_ID", "")
+            or ""
+        )
         _bot_identity = f"Your name is {_bot_name} (agentId: {_bot_agent_id})." if _bot_name else ""
 
         # Bridge group_system_prompt → channel_prompt for gateway injection
@@ -880,7 +922,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             gw_log().info("[iflow:debug] channel_prompt len=%d FULL=\n%s", len(_full_prompt), _full_prompt)
         # Quote-reply: only surface bot message ids
         if msg.reply_info:
-            event.reply_to_message_id = msg.reply_info.messageid or None
+            event.reply_to_message_id = msg.reply_info.message_id or None
             event.reply_to_text = msg.reply_info.preview or None
         return event
 
@@ -1075,7 +1117,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             body = get_inbound_body(reply_to)
             if body:
                 reply_info = ReplyInfo(
-                    messageid=reply_to,
+                    message_id=reply_to,
                     preview=body[:MAX_PREVIEW_LENGTH],
                     sender_imid=get_inbound_sender_imid(reply_to),
                     sender_id=get_inbound_sender_id(reply_to),
@@ -1128,9 +1170,19 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         )
 
         if bot_result.success:
-            return SendResult(success=True, message_id=bot_result.message_id)
-        return SendResult(
+            return _make_send_result(
+                success=True,
+                message_id=bot_result.message_id,
+                continuation_message_ids=tuple(
+                    getattr(bot_result, "continuation_message_ids", ()) or ()
+                ),
+            )
+        return _make_send_result(
             success=False,
+            message_id=bot_result.message_id,
+            continuation_message_ids=tuple(
+                getattr(bot_result, "continuation_message_ids", ()) or ()
+            ),
             error=bot_result.error,
             retryable=False,
         )
@@ -1237,7 +1289,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             body = get_inbound_body(reply_to)
             if body:
                 reply_info = ReplyInfo(
-                    messageid=reply_to,
+                    message_id=reply_to,
                     preview=body[:MAX_PREVIEW_LENGTH],
                     sender_imid=get_inbound_sender_imid(reply_to),
                     sender_id=get_inbound_sender_id(reply_to),
@@ -1274,8 +1326,22 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         )
 
         if bot_result.success:
-            return SendResult(success=True, message_id=bot_result.message_id)
-        return SendResult(success=False, error=bot_result.error, retryable=False)
+            return _make_send_result(
+                success=True,
+                message_id=bot_result.message_id,
+                continuation_message_ids=tuple(
+                    getattr(bot_result, "continuation_message_ids", ()) or ()
+                ),
+            )
+        return _make_send_result(
+            success=False,
+            message_id=bot_result.message_id,
+            continuation_message_ids=tuple(
+                getattr(bot_result, "continuation_message_ids", ()) or ()
+            ),
+            error=bot_result.error,
+            retryable=False,
+        )
 
     # ------------------------------------------------------------------
     # Outbound: recall (delete_message)
@@ -1413,7 +1479,6 @@ def register(ctx: Any) -> None:
             "INFOFLOW_ENCODING_AES_KEY",
             "INFOFLOW_APP_KEY",
             "INFOFLOW_APP_SECRET",
-            "INFOFLOW_API_HOST",
         ],
         install_hint=(
             "pip install hermes-infoflow  # or: hermes plugins install <git-url>"

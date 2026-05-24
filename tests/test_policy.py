@@ -5,8 +5,7 @@ from __future__ import annotations
 import pytest
 
 from hermes_infoflow import policy
-from hermes_infoflow.itypes import IncomingMessage
-from hermes_infoflow.parser import BodyItem
+from hermes_infoflow.itypes import BodyItem, IncomingMessage
 
 
 # Back-compat alias: old fixture used parser.InboundMessage's
@@ -88,7 +87,7 @@ def test_mention_and_watch_hits_watch_list() -> None:
     )
     msg = _group(
         was_mentioned=False,
-        body_items=[BodyItem(type="AT", name="Alice", userid="alice")],
+        body_items=[BodyItem(type="AT", name="Alice", user_id="alice")],
     )
     assert policy.evaluate_inbound(msg, p).should_dispatch is True
 
@@ -104,7 +103,7 @@ def test_watch_list_with_empty_entries_aligns_indices() -> None:
     )
     msg = _group(
         was_mentioned=False,
-        body_items=[BodyItem(type="AT", name="Alice", userid="alice")],
+        body_items=[BodyItem(type="AT", name="Alice", user_id="alice")],
     )
     d = policy.evaluate_inbound(msg, p)
     assert d.should_dispatch is True
@@ -112,8 +111,8 @@ def test_watch_list_with_empty_entries_aligns_indices() -> None:
     assert d.trigger_reason == "watchMentions:Alice"
 
 
-def test_watch_list_numeric_robotid_match() -> None:
-    """Numeric watch entries match against AT items' robotid."""
+def test_watch_list_numeric_robot_id_match() -> None:
+    """Numeric watch entries match against normalized AT robot_id."""
     p = policy.GroupPolicy(
         reply_mode="mention-and-watch",
         require_mention=True,
@@ -121,7 +120,7 @@ def test_watch_list_numeric_robotid_match() -> None:
     )
     msg = _group(
         was_mentioned=False,
-        body_items=[BodyItem(type="AT", name="Some Bot", robotid="12345")],
+        body_items=[BodyItem(type="AT", name="Some Bot", robot_id="12345")],
     )
     d = policy.evaluate_inbound(msg, p)
     assert d.should_dispatch is True
@@ -239,6 +238,15 @@ def test_follow_up_window_admits_recent_followup() -> None:
     d = policy.evaluate_inbound(msg, p, now=1_100.0)
     assert d.should_dispatch is True
     assert d.trigger_reason == "followUp"
+
+
+def test_follow_up_window_rejects_other_robot_mention_by_robot_id() -> None:
+    p = policy.GroupPolicy(reply_mode="mention-only", follow_up=True, follow_up_window=300)
+    p.record_bot_reply("g1", now=1_000.0)
+    msg = _group(group_id="g1", was_mentioned=False, mention_robot_ids=["12345"])
+    d = policy.evaluate_inbound(msg, p, now=1_100.0)
+    assert d.should_dispatch is False
+    assert d.reason == "mention-only: follow-up but @-ing others"
 
 
 def test_follow_up_window_rejects_after_window() -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -175,10 +176,10 @@ GROUP_MEMBERS_TOOL_SCHEMA = {
         "结果最多每 3 秒刷新一次（并发请求会合并为同一次远端拉取）。\n\n"
         "字段用途：\n"
         "- 人类 `user_id`（uuapName）：文本 `@uuapName` 或 "
-        "`metadata.mention_user_ids`\n"
+        "`metadata.mention_user_ids`；只有本地 participants 中已有可信真名时才返回 `name`\n"
         "- 机器人 `agent_id` + `name`：文本 `@显示名` / `@agentId` 或 "
         "`metadata.mention_agent_ids`\n"
-        "- `imid` 一般不需要用于 @ 提及"
+        "- 不返回 Infoflow `imid` 等内部服务 ID"
     ),
     "parameters": {
         "type": "object",
@@ -199,23 +200,26 @@ def _serialize_group_members_payload(
     *,
     source: str | None = None,
     stale: bool = False,
+    trusted_user_name_lookup: Callable[[str], str | None] | None = None,
 ) -> dict[str, Any]:
     """Build the tool JSON payload from normalized GroupMember objects."""
     users: list[dict[str, Any]] = []
     bots: list[dict[str, Any]] = []
     for m in members:
         if m.is_bot:
-            bots.append({
+            bot: dict[str, Any] = {
                 "agent_id": int(m.agent_id or 0),
                 "name": m.name or "",
-                "imid": str(m.imid or ""),
-            })
+            }
+            bots.append(bot)
         else:
             uid = str(m.uid or "")
-            users.append({
-                "user_id": uid,
-                "name": m.name or uid,
-            })
+            user = {"user_id": uid}
+            if trusted_user_name_lookup is not None and uid:
+                name = str(trusted_user_name_lookup(uid) or "").strip()
+                if name:
+                    user["name"] = name
+            users.append(user)
     payload: dict[str, Any] = {
         "success": True,
         "group_id": str(group_id),
@@ -393,7 +397,22 @@ def make_group_members_handler():
             str(group_id),
             source=fetch_result.status.value,
             stale=fetch_result.status == GroupMembersFetchStatus.OK_STALE,
+            trusted_user_name_lookup=_trusted_user_name_lookup(adapter),
         )
         return tool_result_json(payload)
 
     return _handler
+
+
+def _trusted_user_name_lookup(adapter: Any) -> Callable[[str], str | None] | None:
+    """Return a participants-backed human name lookup, if the live adapter has one."""
+    store = getattr(adapter, "_message_store", None)
+    finder = getattr(store, "find_user_by_user_id", None)
+    if not callable(finder):
+        return None
+
+    def _lookup(user_id: str) -> str | None:
+        rec = finder(user_id)
+        return str(getattr(rec, "name", "") or "").strip() or None
+
+    return _lookup

@@ -22,7 +22,7 @@ import time
 
 import requests
 
-API_HOST = os.environ.get("INFOFLOW_API_HOST", "http://apiin.im.baidu.com")
+API_HOST = os.environ.get("INFOFLOW_API_HOST", "https://api.im.baidu.com")
 APP_KEY = os.environ.get("INFOFLOW_APP_KEY", "")
 APP_SECRET = os.environ.get("INFOFLOW_APP_SECRET", "")
 

@@ -15,11 +15,10 @@ from __future__ import annotations
 import os
 import sys
 
-# When this file is executed directly as
-# ``python hermes_infoflow/deploy.py``, Python prepends the package directory to
-# sys.path. That makes hermes_infoflow/types.py shadow the stdlib ``types``
-# module while argparse/dataclasses import, so remove that direct script path
-# before importing the rest of the standard library.
+# When this file is executed directly as ``python hermes_infoflow/deploy.py``,
+# Python prepends the package directory to sys.path.  Remove that direct script
+# path before importing the rest of the standard library so flattened plugin
+# files can never shadow stdlib modules during bootstrap.
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path = [
     p for p in sys.path if os.path.abspath(p or os.curdir) != _THIS_DIR

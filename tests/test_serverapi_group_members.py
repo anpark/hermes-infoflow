@@ -20,7 +20,7 @@ from hermes_infoflow.serverapi import (
 
 @pytest.fixture
 def serverapi(monkeypatch) -> ServerAPI:
-    monkeypatch.setenv("INFOFLOW_API_HOST", "http://apiin.im.baidu.com")
+    monkeypatch.setenv("INFOFLOW_API_HOST", "https://api.im.baidu.com")
     monkeypatch.setenv("INFOFLOW_APP_KEY", "test-key")
     monkeypatch.setenv("INFOFLOW_APP_SECRET", "test-secret")
     from hermes_infoflow.settings import _read_account_settings

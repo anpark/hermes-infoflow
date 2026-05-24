@@ -108,7 +108,7 @@ ignore = [
 # Late imports after optional hermes-agent / gateway shims (see adapter module docstring).
 "hermes_infoflow/adapter.py" = ["E402"]
 # deploy.py must clean sys.path before stdlib imports when executed directly
-# from a flattened plugin dir that also contains types.py.
+# from a flattened plugin dir.
 "hermes_infoflow/deploy.py" = ["E402"]
 
 [tool.pytest.ini_options]

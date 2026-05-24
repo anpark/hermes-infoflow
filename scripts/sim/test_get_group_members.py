@@ -46,7 +46,7 @@ async def _run(group_id: str) -> int:
 def main() -> int:
     status = bootstrap()
     print(f"[sim] bootstrap: {json.dumps(status, ensure_ascii=False)}")
-    required_env("INFOFLOW_API_HOST", "INFOFLOW_APP_KEY", "INFOFLOW_APP_SECRET")
+    required_env("INFOFLOW_APP_KEY", "INFOFLOW_APP_SECRET")
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(

@@ -81,6 +81,54 @@ def test_build_group_body_items_handles_all_types() -> None:
     assert any(42 in b.get("atagentids", []) for b in at_items)
 
 
+def test_send_group_message_keeps_msgseqids_aligned(monkeypatch) -> None:
+    """Each successful messageid must have a same-index msgseqid slot."""
+    responses = [
+        '{"code":"ok","data":{"errcode":0},"messageid":"1111111111111111111"}',
+        '{"code":"ok","data":{"errcode":0},"messageid":"2222222222222222222","msgseqid":"222"}',
+    ]
+
+    class _Resp:
+        def __init__(self, text):
+            self._text = text
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): return None
+        async def text(self): return self._text
+
+    class _Sess:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): return None
+        def post(self, url, *, data, headers, timeout):
+            del url, data, headers, timeout
+            return _Resp(responses.pop(0))
+        async def close(self): return None
+
+    async def fake_token(*a, **k):
+        return "TOK"
+
+    monkeypatch.setattr(api, "get_app_access_token", fake_token)
+    account = api.InfoflowAccountAPI(
+        api_host="https://api.example.com",
+        app_key="k",
+        app_secret="s",
+    )
+
+    async def _go():
+        return await api.send_group_message(
+            account,
+            group_id=4507088,
+            contents=[
+                api.ContentItem("markdown", "hello"),
+                api.ContentItem("image", "BASE64"),
+            ],
+            session=_Sess(),
+        )
+
+    result = asyncio.run(_go())
+    assert result["messageids"] == ["1111111111111111111", "2222222222222222222"]
+    assert result["msgseqids"] == ["", "222"]
+
+
 def test_extract_id_from_raw_json_handles_large_int_and_quoted() -> None:
     raw = '{"messageid":1859713223686736431,"msgkey":"abc-123"}'
     assert api._extract_id(raw, "messageid") == "1859713223686736431"

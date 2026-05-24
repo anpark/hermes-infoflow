@@ -30,7 +30,10 @@ from hermes_infoflow.recall import (
     _register_inbound_context,
 )
 from hermes_infoflow.settings import (
+    DEFAULT_API_HOST,
     DEFAULT_PORT,
+    _check_requirements,
+    _env_enablement,
     _parse_infoflow_target,
     _read_account_settings,
 )
@@ -141,6 +144,34 @@ def test_read_settings_default_port_without_env(monkeypatch) -> None:
     s = _read_account_settings(_cfg())
     assert s["port"] == DEFAULT_PORT
     assert DEFAULT_PORT == 26521
+
+
+def test_read_settings_defaults_api_host_without_env(monkeypatch) -> None:
+    monkeypatch.delenv("INFOFLOW_API_HOST", raising=False)
+    s = _read_account_settings(_cfg())
+    assert s["api_host"] == DEFAULT_API_HOST
+
+
+def test_env_enablement_uses_default_api_host(monkeypatch) -> None:
+    monkeypatch.delenv("INFOFLOW_API_HOST", raising=False)
+    monkeypatch.setenv("INFOFLOW_APP_KEY", "k")
+    monkeypatch.setenv("INFOFLOW_APP_SECRET", "s")
+    monkeypatch.setenv("INFOFLOW_CHECK_TOKEN", "tok")
+    monkeypatch.setenv("INFOFLOW_ENCODING_AES_KEY", "aes")
+
+    seed = _env_enablement()
+
+    assert seed is not None
+    assert seed["api_host"] == DEFAULT_API_HOST
+
+
+def test_requirements_do_not_require_api_host(monkeypatch) -> None:
+    monkeypatch.delenv("INFOFLOW_API_HOST", raising=False)
+    monkeypatch.setenv("INFOFLOW_APP_KEY", "k")
+    monkeypatch.setenv("INFOFLOW_APP_SECRET", "s")
+    monkeypatch.setenv("INFOFLOW_CHECK_TOKEN", "tok")
+    monkeypatch.setenv("INFOFLOW_ENCODING_AES_KEY", "aes")
+    assert _check_requirements() is True
 
 
 def test_read_settings_parses_watch_regex_via_separator(monkeypatch) -> None:

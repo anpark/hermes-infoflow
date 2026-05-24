@@ -68,12 +68,13 @@ requires_env:
     description: "Infoflow app secret (raw; will be MD5'd lowercase hex)"
     prompt: "Infoflow appSecret"
     password: true
-  - name: INFOFLOW_API_HOST
-    description: "Infoflow API host root, e.g. https://api.infoflow.example.com"
-    prompt: "Infoflow API host (https://...)"
-    password: false
 
 optional_env:
+  - name: INFOFLOW_API_HOST
+    description: "Infoflow API host root (default https://api.im.baidu.com)"
+    prompt: "Infoflow API host (default https://api.im.baidu.com)"
+    password: false
+
   - name: INFOFLOW_ADMIN_USER
     description: "Admin user's uuapName — only this user has full access to sensitive tools"
     prompt: "Admin user uuapName"
@@ -83,8 +84,12 @@ optional_env:
     prompt: "Infoflow appAgentId"
     password: false
   - name: INFOFLOW_ROBOT_NAME
-    description: "Bot display name used to detect @-mentions in groups"
+    description: "Optional bot display name used to detect early group @-mentions before robot_id is known"
     prompt: "Bot display name"
+    password: false
+  - name: INFOFLOW_ROBOT_ID
+    description: "Optional Infoflow IM robot_id / imid; normally auto-discovered and persisted"
+    prompt: "Infoflow robot_id"
     password: false
   - name: INFOFLOW_PORT
     description: "Webhook listen port (default 26521)"

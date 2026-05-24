@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_PORT = 26521
 DEFAULT_HOST = "0.0.0.0"
+DEFAULT_API_HOST = "https://api.im.baidu.com"
 DEFAULT_WEBHOOK_PATH = "/webhook/infoflow"
 MAX_MESSAGE_LENGTH = 2048  # matches OpenClaw textChunkLimit
 DEFAULT_BODY_LIMIT_BYTES = 20 * 1024 * 1024
@@ -59,7 +60,7 @@ def _read_account_settings(config: Any) -> dict[str, Any]:
         "encoding_aes_key": pick("INFOFLOW_ENCODING_AES_KEY", "encoding_aes_key", "") or "",
         "app_key": pick("INFOFLOW_APP_KEY", "app_key", "") or "",
         "app_secret": pick("INFOFLOW_APP_SECRET", "app_secret", "") or "",
-        "api_host": pick("INFOFLOW_API_HOST", "api_host", "") or "",
+        "api_host": pick("INFOFLOW_API_HOST", "api_host", DEFAULT_API_HOST) or DEFAULT_API_HOST,
         "robot_name": pick("INFOFLOW_ROBOT_NAME", "robot_name", "") or "",
         # robot_id is auto-discovered from inbound @-mention bodies on first
         # use; users normally don't set this explicitly, but if they do we
@@ -165,12 +166,12 @@ def _env_enablement() -> dict | None:
     becomes ``PlatformConfig.extra`` (the special key ``home_channel``
     becomes the structured ``HomeChannel`` field).
     """
-    api_host = os.getenv("INFOFLOW_API_HOST", "").strip()
+    api_host = os.getenv("INFOFLOW_API_HOST", "").strip() or DEFAULT_API_HOST
     app_key = os.getenv("INFOFLOW_APP_KEY", "").strip()
     app_secret = os.getenv("INFOFLOW_APP_SECRET", "").strip()
     check_token = os.getenv("INFOFLOW_CHECK_TOKEN", "").strip()
     encoding_aes_key = os.getenv("INFOFLOW_ENCODING_AES_KEY", "").strip()
-    if not (api_host and app_key and app_secret and check_token and encoding_aes_key):
+    if not (app_key and app_secret and check_token and encoding_aes_key):
         return None
     seed: dict[str, Any] = {
         "api_host": api_host,
@@ -217,7 +218,6 @@ def _check_requirements() -> bool:
     a clear "platform not configured" message instead of a crash.
     """
     required = (
-        "INFOFLOW_API_HOST",
         "INFOFLOW_APP_KEY",
         "INFOFLOW_APP_SECRET",
         "INFOFLOW_CHECK_TOKEN",
@@ -246,12 +246,12 @@ def _interactive_setup() -> None:  # pragma: no cover - manual flow
     """
     print(
         "Set these env vars (or hermes config set):\n"
-        "  INFOFLOW_API_HOST=https://api.infoflow.example.com\n"
         "  INFOFLOW_APP_KEY=<your appKey>\n"
         "  INFOFLOW_APP_SECRET=<your appSecret>\n"
         "  INFOFLOW_CHECK_TOKEN=<your checkToken>\n"
         "  INFOFLOW_ENCODING_AES_KEY=<your EncodingAESKey>\n"
-        "Optional: INFOFLOW_APP_AGENT_ID, INFOFLOW_ROBOT_NAME, INFOFLOW_PORT, "
+        "Optional: INFOFLOW_API_HOST=https://api.im.baidu.com, "
+        "INFOFLOW_APP_AGENT_ID, INFOFLOW_ROBOT_NAME, INFOFLOW_PORT, "
         "INFOFLOW_HOME_CHANNEL"
     )
 
@@ -294,6 +294,7 @@ def _parse_infoflow_target(
 
 __all__ = [
     "DEFAULT_BODY_LIMIT_BYTES",
+    "DEFAULT_API_HOST",
     "DEFAULT_HOST",
     "DEFAULT_PORT",
     "DEFAULT_WEBHOOK_PATH",

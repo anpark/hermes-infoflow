@@ -29,13 +29,19 @@ from .itypes import (
     ReplyInfo,
     SendOptions,
     SentResult,
+    coerce_reply_target,
+    reply_target_to_dict,
 )
+from .identity import bot_key, private_peer_key, self_key, sender_key, user_key
+from .message_content import render_message_content
 from .message_store import MessageStore
 from .policy import (
     Action,
     GroupPolicy,
     PolicyDecision,
     evaluate_inbound,
+    _resolve_for_group,
+    _watch_regex_match,
 )
 from .reactions import ReactionController, ReactionRunToken
 from .recall import (
@@ -222,6 +228,7 @@ class Bot:
             delete_reaction=self._try_delete_reaction,
         )
         gw_log().info("[infoflow] Bot init: robot_id=%s admin_uid=%s", self._robot_id, self._admin_uid)
+        self._upsert_self_participant()
 
     # -- robot_id management ------------------------------------------------
 
@@ -233,6 +240,7 @@ class Bot:
     def robot_id(self, value: str) -> None:
         if value and value != self._robot_id:
             self._robot_id = value
+            self._upsert_self_participant()
 
     # -- dedup set (shared with adapter for outbound recording) -------------
 
@@ -261,9 +269,9 @@ class Bot:
 
         Steps (mirrors openclaw bot.ts):
         1. Discover/update robot_id
-        2. Dedup check (plugin-sent echoes)
-        3. Own-message echo filter (external channel echoes → RECORD)
-        4. Register inbound context (for recall correction)
+        2. Persist normalized message facts before policy/echo decisions
+        3. Dedup check (plugin-sent echoes)
+        4. Own-message echo filter (external channel echoes → RECORD)
         5. Policy evaluation
         6. Return dispatch decision
         """
@@ -271,47 +279,51 @@ class Bot:
         _text_preview = (msg.text or "")[:120]
 
         # --- Slash command fast path: /new, /stop ---
-        raw_text = (msg.body_for_agent or msg.text or "").strip()
-        if raw_text in ("/new", "/stop"):
-            is_admin_cmd = self._check_slash_command_auth(msg)
-            if is_admin_cmd:
-                gw_log().info(
-                    "[iflow:decision] mid=%s action=DISPATCH trigger=slash_command "
-                    "reason=%s sender=%s",
-                    msg.message_id or "-", raw_text, msg.sender_id,
-                )
-                return ProcessResult(
-                    should_dispatch=True,
-                    decision=PolicyDecision(
-                        should_dispatch=True,
-                        action=Action.DISPATCH,
-                        reason=f"slash_command:{raw_text}",
-                        trigger_reason="slash_command",
-                        command_text=raw_text,
-                    ),
-                )
+        # Detection is early, but dispatch is delayed until after message facts
+        # have been persisted and dedup/own-echo checks have run.
+        raw_text = (msg.text or "").strip()
+        slash_command_text = raw_text if raw_text in self._SLASH_COMMANDS else ""
+        slash_is_admin_cmd = bool(
+            slash_command_text and self._check_slash_command_auth(msg)
+        )
 
         # --- Enrich sender info (group messages only) ---
         if msg.is_group and msg.sender_imid:
             await self._enrich_sender(msg)
+
+        # Step 1: Discover robot_id from @-mention body items, then normalize
+        # robot AT targets. Incoming body robot_id is an Infoflow robot_id /
+        # imid, never an app_agent_id, so agent IDs are only filled from
+        # participants mapping.
+        if msg.discovered_robot_id and msg.discovered_robot_id != self._robot_id:
+            self._robot_id = msg.discovered_robot_id
+            self._serverapi.robot_id = self._robot_id
+            gw_log().info(
+                "[infoflow] discovered robotId=%s for account %s",
+                self._robot_id, self._settings.get("app_agent_id"),
+            )
+            _persist_robot_id(self._robot_id)
+        self._normalize_mention_targets_from_participants(msg)
 
         # --- [iflow:event] — enriched message event fields ---
         try:
             gw_log().info(
                 "[iflow:event] mid=%s sender_id=%s sender_name=%s sender_imid=%s "
                 "sender_agent_id=%s is_bot=%s mentioned=%s "
-                "mention_users=%s mention_agents=%s reply_to_bot=%s body=%s",
+                "mention_users=%s mention_robots=%s mention_agents=%s reply_to_bot=%s body=%s",
                 msg.message_id, msg.sender_id, msg.sender_name, msg.sender_imid,
                 getattr(msg, "sender_agent_id", ""), msg.sender_is_bot,
                 msg.bot_was_mentioned,
-                msg.mention_user_ids, msg.mention_agent_ids,
-                msg.is_reply_to_bot, (msg.body_for_agent or "")[:200],
+                msg.mention_user_ids,
+                getattr(msg, "mention_robot_ids", []),
+                msg.mention_agent_ids,
+                msg.is_reply_to_bot, (msg.text or "")[:200],
             )
             for _i, _b in enumerate(msg.body_items or []):
                 if hasattr(_b, "type"):
                     gw_log().info(
-                        "[iflow:event] body_item[%d] type=%s name=%s userid=%s robotid=%s",
-                        _i, _b.type, _b.name, _b.userid, _b.robotid,
+                        "[iflow:event] body_item[%d] type=%s name=%s user_id=%s robot_id=%s",
+                        _i, _b.type, _b.name, _b.user_id, _b.robot_id,
                     )
         except Exception:
             pass
@@ -323,45 +335,73 @@ class Bot:
             msg.message_id or "-", _text_preview,
         )
 
-        # Step 1: Discover robot_id from @-mention body items
-        if msg.discovered_robot_id and msg.discovered_robot_id != self._robot_id:
-            self._robot_id = msg.discovered_robot_id
-            self._serverapi.robot_id = self._robot_id
-            gw_log().info(
-                "[infoflow] discovered robotId=%s for account %s",
-                self._robot_id, self._settings.get("app_agent_id"),
-            )
-            _persist_robot_id(self._robot_id)
-
-        # Step 2: Dedup check (before echo filter — plugin-sent echoes are already mark_seen)
+        # Step 2: Persist normalized DB facts before dedup / own-echo / policy.
         dedupe_key = msg.dedupe_key
-        if dedupe_key and self._sent_store.is_duplicate(dedupe_key):
+        already_seen = bool(dedupe_key and self._sent_store.is_duplicate(dedupe_key))
+        sent_echo = bool(
+            already_seen
+            and dedupe_key
+            and self._sent_store.find_any(dedupe_key) is not None
+        )
+        own_echo = self._is_own_echo(msg)
+        self._register_context(
+            msg,
+            is_outgoing_hint=sent_echo or own_echo,
+            register_recall=not (sent_echo or own_echo),
+        )
+
+        # Step 3: Dedup check (plugin-sent echoes are already mark_seen).
+        # The DB upsert above is idempotent and enriches provisional sent rows
+        # with the canonical echo payload without dispatching it to the model.
+        if already_seen:
+            reason = "own-echo:plugin-sent" if sent_echo else "duplicate"
             gw_log().info(
-                "[iflow:decision] mid=%s action=DROP reason=own-echo:plugin-sent text=%r",
-                msg.message_id or "-", _text_preview,
+                "[iflow:decision] mid=%s action=DROP reason=%s text=%r",
+                msg.message_id or "-", reason, _text_preview,
             )
-            return ProcessResult()
+            return ProcessResult(
+                decision=PolicyDecision(
+                    should_dispatch=False,
+                    action=Action.RECORD,
+                    reason=reason,
+                )
+            )
         if dedupe_key:
             self._sent_store.mark_seen(dedupe_key)
 
-        # Step 3: Own-message echo filter (ALL_MESSAGE_FORWARD)
-        # If dedup didn't catch it but fromid==robot_id, this echo came from
-        # an external channel (infoflow-cli, another tool, etc.) → persist but don't dispatch.
-        if (
-            self._robot_id
-            and msg.is_group
-            and msg.sender_imid
-            and msg.sender_imid == self._robot_id
-        ):
+        # Step 4: Own-message echo filter (ALL_MESSAGE_FORWARD)
+        # If dedup didn't catch it but sender_imid==robot_id, this echo came
+        # from an external channel (infoflow-cli, another tool, etc.) →
+        # persist but don't dispatch.
+        if own_echo:
             gw_log().info(
                 "[iflow:decision] mid=%s action=RECORD reason=own-echo:external text=%r",
                 msg.message_id or "-", _text_preview,
             )
-            self._register_context(msg)
-            return ProcessResult(decision=PolicyDecision(action=Action.RECORD, reason="own-echo:external"))
+            return ProcessResult(
+                decision=PolicyDecision(
+                    should_dispatch=False,
+                    action=Action.RECORD,
+                    reason="own-echo:external",
+                )
+            )
 
-        # Step 4: Register inbound context + record to message store
-        self._register_context(msg)
+        if slash_is_admin_cmd:
+            gw_log().info(
+                "[iflow:decision] mid=%s action=DISPATCH trigger=slash_command "
+                "reason=%s sender=%s",
+                msg.message_id or "-", slash_command_text, msg.sender_id,
+            )
+            return ProcessResult(
+                should_dispatch=True,
+                decision=PolicyDecision(
+                    should_dispatch=True,
+                    action=Action.DISPATCH,
+                    reason=f"slash_command:{slash_command_text}",
+                    trigger_reason="slash_command",
+                    command_text=slash_command_text,
+                ),
+            )
 
         # Step 4b: If this message @mentioned the bot, record sender mention
         # for follow-up engaged/passive template selection.
@@ -474,8 +514,209 @@ class Bot:
 
     # -- context registration + message store -------------------------------
 
-    def _register_context(self, msg: IncomingMessage) -> None:
+    def _is_own_echo(self, msg: IncomingMessage) -> bool:
+        """True when this inbound callback is a message from the current bot."""
+        me = self_key(self._settings)
+        sender = sender_key(msg)
+        if me and sender and sender == me:
+            return True
+        return bool(
+            self._robot_id
+            and msg.sender_imid
+            and msg.sender_imid == self._robot_id
+        )
+
+    @staticmethod
+    def _msg_time_ms(msg: IncomingMessage) -> int:
+        ts = float(getattr(msg, "timestamp", 0.0) or 0.0)
+        if ts <= 0:
+            return 0
+        if ts > 10_000_000_000:
+            return int(ts)
+        return int(ts * 1000)
+
+    def _upsert_participants_from_message(self, msg: IncomingMessage) -> None:
+        """Persist participant facts that are authoritative enough to keep."""
+        self._upsert_self_participant()
+
+        if msg.sender_is_bot:
+            aid = str(getattr(msg, "sender_agent_id", "") or "").strip()
+            if bot_key(aid):
+                self._message_store.upsert_participant(
+                    participant_type="bot",
+                    agent_id=aid,
+                    imid=msg.sender_imid or "",
+                    name=msg.sender_name or "",
+                )
+        elif user_key(msg.sender_id):
+            # Human sender names from headers / DM FromUserName are not trusted.
+            # Human real names are only filled from AT body items below.
+            self._message_store.upsert_participant(
+                participant_type="user",
+                user_id=msg.sender_id,
+            )
+
+        for item in msg.body_items or []:
+            if (getattr(item, "type", "") or "").upper() != "AT":
+                continue
+            uid = getattr(item, "user_id", "") or ""
+            if user_key(uid):
+                self._message_store.upsert_participant(
+                    participant_type="user",
+                    user_id=uid,
+                    name=getattr(item, "name", "") or "",
+                )
+
+    def _upsert_self_participant(self) -> None:
+        """Persist the current bot participant when its stable agent id is known."""
+        me_agent_id = str(self._settings.get("app_agent_id") or "").strip()
+        if not me_agent_id:
+            return
+        try:
+            self._message_store.upsert_participant(
+                participant_type="bot",
+                agent_id=me_agent_id,
+                imid=self._robot_id or "",
+                name=str(self._settings.get("robot_name") or ""),
+            )
+        except Exception:
+            logger.debug("[bot] self participant upsert failed", exc_info=True)
+
+    def _self_robot_ids(self) -> set[str]:
+        """Return known Infoflow robot_id / imid values for the current bot."""
+        ids = {str(self._robot_id or "").strip()} - {""}
+        me_agent_id = str(self._settings.get("app_agent_id") or "").strip()
+        if me_agent_id:
+            participant = self._message_store.find_bot_by_agent_id(me_agent_id)
+            if participant and participant.imid:
+                ids.add(str(participant.imid).strip())
+        return ids
+
+    def _normalize_mention_targets_from_participants(self, msg: IncomingMessage) -> None:
+        """Map robot AT robot_ids to agent_ids only through participants.
+
+        The serverapi boundary gives robot AT targets as normalized robot_id
+        values. Those are IM robot IDs / imids, not app agent IDs; unknown
+        robot IDs remain in ``mention_robot_ids`` and are not promoted to
+        ``mention_agent_ids``.
+        """
+        if not msg.is_group:
+            return
+
+        self_robot_ids = self._self_robot_ids()
+        robot_ids: list[str] = []
+        seen_robot_ids: set[str] = set()
+        source_robot_ids = [
+            str(v or "").strip()
+            for v in (getattr(msg, "mention_robot_ids", None) or [])
+            if str(v or "").strip()
+        ]
+        if not source_robot_ids:
+            for item in msg.body_items or []:
+                if (getattr(item, "type", "") or "").upper() != "AT":
+                    continue
+                rid = str(getattr(item, "robot_id", "") or "").strip()
+                if rid:
+                    source_robot_ids.append(rid)
+
+        mapped_agent_ids: list[int] = []
+        seen_agent_ids: set[int] = set()
+        me_agent_id = str(self._settings.get("app_agent_id") or "").strip()
+
+        def _add_agent_id(value: object) -> None:
+            raw = str(value or "").strip()
+            if not raw or not raw.isdigit() or raw == me_agent_id:
+                return
+            aid = int(raw)
+            if aid not in seen_agent_ids:
+                mapped_agent_ids.append(aid)
+                seen_agent_ids.add(aid)
+
+        for existing in getattr(msg, "mention_agent_ids", None) or []:
+            _add_agent_id(existing)
+
+        for rid in source_robot_ids:
+            if rid in self_robot_ids:
+                continue
+            if rid not in seen_robot_ids:
+                robot_ids.append(rid)
+                seen_robot_ids.add(rid)
+            participant = self._message_store.find_participant_by_imid(rid)
+            if participant and participant.participant_type == "bot":
+                _add_agent_id(participant.agent_id)
+
+        msg.mention_robot_ids = robot_ids
+        msg.mention_agent_ids = mapped_agent_ids
+
+    def _sender_key_for_store(self, msg: IncomingMessage) -> str:
+        sender = sender_key(msg)
+        if sender:
+            return sender
+        if msg.sender_is_bot and msg.sender_imid:
+            participant = self._message_store.find_participant_by_imid(msg.sender_imid)
+            if participant and participant.participant_type == "bot":
+                return participant.key
+        return ""
+
+    def _matched_regex_pattern(self, msg: IncomingMessage) -> str:
+        if not msg.group_id:
+            return ""
+        try:
+            eff = _resolve_for_group(self._policy, msg.group_id)
+            hit = _watch_regex_match(msg.text or "", eff.get("watch_regex") or ())
+            return hit[0] if hit else ""
+        except Exception:
+            return ""
+
+    def _group_message_flags(self, msg: IncomingMessage) -> dict[str, bool | str]:
+        me = self_key(self._settings)
+        self_robot_ids = self._self_robot_ids()
+        mentions_everyone = False
+        mentions_other_people = False
+        for item in msg.body_items or []:
+            if (getattr(item, "type", "") or "").upper() != "AT":
+                continue
+            if getattr(item, "at_all", False):
+                mentions_everyone = True
+                continue
+            uid = str(getattr(item, "user_id", "") or "").strip()
+            rid = str(getattr(item, "robot_id", "") or "").strip()
+            if uid:
+                target = user_key(uid)
+            elif rid and rid in self_robot_ids:
+                target = me
+            elif rid:
+                participant = self._message_store.find_participant_by_imid(rid)
+                if participant and participant.participant_type == "bot":
+                    target = participant.key
+                else:
+                    target = f"robot_id:{rid}"
+            else:
+                target = ""
+            if target and target != me:
+                mentions_other_people = True
+
+        reply_targets = [coerce_reply_target(t) for t in msg.reply_targets]
+        quotes_your_message = any(t.is_bot_message for t in reply_targets)
+        quotes_other = any(not t.is_bot_message for t in reply_targets)
+        return {
+            "mentions_everyone": mentions_everyone,
+            "mentions_other_people": mentions_other_people,
+            "quotes_your_message": quotes_your_message,
+            "quotes_other_peoples_message": quotes_other,
+        }
+
+    def _register_context(
+        self,
+        msg: IncomingMessage,
+        *,
+        is_outgoing_hint: bool = False,
+        register_recall: bool = True,
+    ) -> None:
         """Register inbound context for recall + persist to message store."""
+        # message_id is the message-store primary key and the echo reconciliation
+        # identity. Do not synthesize fallback IDs; messages without one cannot
+        # be safely upserted or matched against later echo callbacks.
         if not msg.message_id:
             return
         target = (
@@ -483,54 +724,71 @@ class Bot:
         )
 
         reply_to_bot_id: str | None = None
-        for tgt in msg.reply_targets:
-            if tgt.get("isBotMessage"):
-                reply_to_bot_id = str(tgt.get("messageid") or "") or None
+        reply_targets = [coerce_reply_target(tgt) for tgt in msg.reply_targets]
+        for tgt in reply_targets:
+            if tgt.is_bot_message:
+                reply_to_bot_id = tgt.message_id or None
                 break
 
-        _register_inbound_context(
-            _InboundContext(
-                account_id=self._settings.get("app_key") or "default",
-                target=target,
-                inbound_message_id=msg.message_id,
-                reply_to_bot_message_id=reply_to_bot_id,
-                reply_targets=list(msg.reply_targets),
-                inbound_body=msg.text or "",
-                sender_imid=msg.sender_imid or "",
-                sender_id=msg.sender_id if not msg.sender_is_bot else "",
-                sender_agent_id=str(getattr(msg, "sender_agent_id", "") or ""),
-                registered_at=time.time(),
-                msgseqid=msg.msgseqid,
-                msgid2=msg.msgid2 or None,
+        if register_recall:
+            _register_inbound_context(
+                _InboundContext(
+                    account_id=self._settings.get("app_key") or "default",
+                    target=target,
+                    inbound_message_id=msg.message_id,
+                    reply_to_bot_message_id=reply_to_bot_id,
+                    reply_targets=[reply_target_to_dict(t) for t in reply_targets],
+                    inbound_body=msg.text or "",
+                    sender_imid=msg.sender_imid or "",
+                    sender_id=msg.sender_id if not msg.sender_is_bot else "",
+                    sender_agent_id=str(getattr(msg, "sender_agent_id", "") or ""),
+                    registered_at=time.time(),
+                    msgseqid=msg.msgseqid,
+                    msgid2=msg.msgid2 or None,
+                )
             )
-        )
 
         # Persist to unified message store.
         raw_json = json.dumps(msg.raw_data, ensure_ascii=False) if msg.raw_data else ""
+        msg_time = self._msg_time_ms(msg)
+        self_id = self_key(self._settings)
+        self._upsert_participants_from_message(msg)
+        content = self._render_message_content(msg)
         if msg.dm_user_id is not None:
+            peer = private_peer_key(msg.dm_user_id)
+            sender = self_id if is_outgoing_hint else user_key(msg.sender_id)
+            is_outgoing = bool(is_outgoing_hint or (sender and self_id and sender == self_id))
             self._message_store.persist_dm(
                 message_id=msg.message_id,
-                dm_user_id=msg.dm_user_id,
-                sender_id=msg.sender_id or msg.sender_imid or "",
-                sender_name=msg.sender_name or "",
-                sender_imid=msg.sender_imid or "",
-                sender_is_bot=msg.sender_is_bot,
-                is_inbound=True,
-                text=msg.text or "",
+                peer=peer,
+                self_id=self_id,
+                sender=sender,
+                is_outgoing=is_outgoing,
+                quotes_your_message=bool(reply_to_bot_id),
+                msg_id2=msg.msgid2 or "",
+                content=content,
+                msg_time=msg_time,
                 raw_json=raw_json,
             )
         elif msg.group_id is not None:
+            sender = self_id if is_outgoing_hint else self._sender_key_for_store(msg)
+            is_outgoing = bool(is_outgoing_hint or (sender and self_id and sender == self_id))
+            flags = self._group_message_flags(msg)
             self._message_store.persist_group(
                 message_id=msg.message_id,
                 group_id=msg.group_id,
-                sender_id=msg.sender_id or msg.sender_imid or "",
-                sender_name=msg.sender_name or "",
-                sender_imid=msg.sender_imid or "",
-                sender_is_bot=msg.sender_is_bot,
-                is_inbound=True,
-                bot_was_mentioned=msg.bot_was_mentioned,
-                msgid2=msg.msgid2 or "",
-                text=msg.text or "",
+                sender=sender,
+                self_id=self_id,
+                is_outgoing=is_outgoing,
+                mentions_you=msg.bot_was_mentioned,
+                matched_regex_pattern=self._matched_regex_pattern(msg),
+                mentions_everyone=bool(flags["mentions_everyone"]),
+                quotes_your_message=bool(flags["quotes_your_message"]),
+                mentions_other_people=bool(flags["mentions_other_people"]),
+                quotes_other_peoples_message=bool(flags["quotes_other_peoples_message"]),
+                msg_id2=msg.msgid2 or "",
+                content=content,
+                msg_time=msg_time,
                 raw_json=raw_json,
             )
 
@@ -919,6 +1177,8 @@ class Bot:
 
         store_key = self._normalize_store_key(group_id, dm_user_id)
         last_message_id: str = ""
+        all_sent_ids: list[tuple[str, str]] = []
+        seen_sent_ids: set[str] = set()
         first_error: str = ""
         failed = 0
         succeeded = 0
@@ -940,21 +1200,27 @@ class Bot:
             else:
                 result = SentResult(success=False, error="no target specified")
 
-            if result.success:
-                succeeded += 1
-                mid = result.message_id
-                if mid:
+            sent_ids = self._sent_result_ids(result)
+            if sent_ids:
+                for mid, seq in sent_ids:
+                    if mid in seen_sent_ids:
+                        continue
+                    seen_sent_ids.add(mid)
+                    all_sent_ids.append((mid, seq))
                     self._sent_store.record(
                         chat_id=store_key,
                         messageid=mid,
-                        msgseqid=result.msgseqid,
+                        msgseqid=seq,
                         digest=chunk[:80],
                     )
                     self._record_sent(
                         message_id=mid, text=chunk,
                         group_id=group_id, dm_user_id=dm_user_id,
                     )
-                    last_message_id = mid
+                last_message_id = str(result.message_id or sent_ids[-1][0] or last_message_id)
+
+            if result.success:
+                succeeded += 1
             else:
                 failed += 1
                 if not first_error:
@@ -979,9 +1245,16 @@ class Bot:
             return SentResult(
                 success=False,
                 message_id=last_message_id,
+                continuation_message_ids=tuple(
+                    mid for mid, _seq in all_sent_ids if mid and mid != last_message_id
+                ),
+                continuation_msgseqids=tuple(
+                    seq for mid, seq in all_sent_ids if mid and mid != last_message_id
+                ),
                 error=(
-                    f"{first_error} (succeeded={succeeded}, failed={failed} of {len(chunks)} chunks)"
-                    if succeeded else first_error
+                    f"{first_error} (sent_messages={len(all_sent_ids)}, "
+                    f"succeeded_chunks={succeeded}, failed={failed} of {len(chunks)} chunks)"
+                    if all_sent_ids or succeeded else first_error
                 ),
             )
         await self._finish_reaction_for_send_target(
@@ -990,7 +1263,16 @@ class Bot:
             reaction_message_id=reaction_message_id,
             reason="send_complete",
         )
-        return SentResult(success=True, message_id=last_message_id)
+        return SentResult(
+            success=True,
+            message_id=last_message_id,
+            continuation_message_ids=tuple(
+                mid for mid, _seq in all_sent_ids if mid and mid != last_message_id
+            ),
+            continuation_msgseqids=tuple(
+                seq for mid, seq in all_sent_ids if mid and mid != last_message_id
+            ),
+        )
 
     # ======================================================================
     # OUTBOUND — send image
@@ -1027,16 +1309,18 @@ class Bot:
             )
             return SentResult(success=False, error="no target specified")
 
-        if result.success:
+        sent_ids = self._sent_result_ids(result)
+        if sent_ids:
             store_key = self._normalize_store_key(group_id, dm_user_id)
-            mid = result.message_id
-            if mid:
+            caption_ids = self._image_caption_message_ids(result)
+            for mid, seq in sent_ids:
+                stored_text = (caption or "") if caption and mid in caption_ids else "[image]"
                 self._sent_store.record(
                     chat_id=store_key, messageid=mid,
-                    msgseqid=result.msgseqid, digest="[image]",
+                    msgseqid=seq, digest=stored_text[:80],
                 )
                 self._record_sent(
-                    message_id=mid, text="[image]",
+                    message_id=mid, text=stored_text,
                     group_id=group_id, dm_user_id=dm_user_id,
                 )
             if group_id:
@@ -1050,7 +1334,7 @@ class Bot:
             group_id=group_id,
             dm_user_id=dm_user_id,
             reaction_message_id=reaction_message_id,
-            reason="image_complete",
+            reason="image_complete" if result.success else "image_error",
         )
         return result
 
@@ -1187,6 +1471,50 @@ class Bot:
     # Internal helpers
     # ======================================================================
 
+    @staticmethod
+    def _sent_result_ids(result: SentResult) -> list[tuple[str, str]]:
+        ids: list[tuple[str, str]] = []
+        continuation_ids = list(getattr(result, "continuation_message_ids", ()) or ())
+        continuation_seqs = list(getattr(result, "continuation_msgseqids", ()) or ())
+        for idx, mid in enumerate(continuation_ids):
+            mid_s = str(mid or "")
+            if not mid_s:
+                continue
+            seq = continuation_seqs[idx] if idx < len(continuation_seqs) else ""
+            ids.append((mid_s, str(seq or "")))
+        primary = str(result.message_id or "")
+        if primary and all(mid != primary for mid, _seq in ids):
+            ids.append((primary, str(result.msgseqid or "")))
+        return ids
+
+    @staticmethod
+    def _image_caption_message_ids(result: SentResult) -> set[str]:
+        """Return image caption IDs only when the image path marks them explicitly."""
+        ids: set[str] = set()
+        if not isinstance(result.raw_response, dict):
+            return ids
+
+        # DM images send caption as a separate private message and keep the
+        # exact response, so this ID is safe to use for provisional content.
+        caption_response = result.raw_response.get("caption_response")
+        if isinstance(caption_response, dict):
+            caption_mid = str(
+                caption_response.get("messageid")
+                or caption_response.get("msgkey")
+                or ""
+            )
+            if caption_mid:
+                ids.add(caption_mid)
+
+        # Group image captions currently share the generic multi-segment group
+        # sender. Until that path returns per-segment roles from real image
+        # payloads, only trust an explicit marker supplied by image-specific code.
+        for raw_mid in result.raw_response.get("caption_messageids") or []:
+            mid = str(raw_mid or "")
+            if mid:
+                ids.add(mid)
+        return ids
+
     def _record_sent(
         self,
         *,
@@ -1197,30 +1525,54 @@ class Bot:
     ) -> None:
         """Persist a bot-sent message to the unified message store."""
         try:
+            me = self_key(self._settings)
+            agent_id = str(self._settings.get("app_agent_id") or "").strip()
+            if agent_id:
+                self._message_store.upsert_participant(
+                    participant_type="bot",
+                    agent_id=agent_id,
+                    imid=self._robot_id or "",
+                    name=str(self._settings.get("robot_name") or ""),
+                )
             if group_id is not None:
                 self._message_store.persist_group(
                     message_id=message_id,
                     group_id=group_id,
-                    sender_id=self._robot_id or "",
-                    sender_name=self._settings.get("robot_name") or "",
-                    sender_imid=self._robot_id or "",
-                    is_inbound=False,
-                    text=text,
-                    digest=text[:80],
+                    sender=me,
+                    self_id=me,
+                    is_outgoing=True,
+                    content=text,
+                    created_time=int(time.time() * 1000),
                 )
             elif dm_user_id is not None:
                 self._message_store.persist_dm(
                     message_id=message_id,
-                    dm_user_id=dm_user_id,
-                    sender_id=self._robot_id or "",
-                    sender_name=self._settings.get("robot_name") or "",
-                    sender_imid=self._robot_id or "",
-                    is_inbound=False,
-                    text=text,
-                    digest=text[:80],
+                    peer=private_peer_key(dm_user_id),
+                    self_id=me,
+                    sender=me,
+                    is_outgoing=True,
+                    content=text,
+                    created_time=int(time.time() * 1000),
                 )
         except Exception:
-            logger.debug("[bot] _record_sent failed", exc_info=True)
+                logger.debug("[bot] _record_sent failed", exc_info=True)
+
+    def _render_message_content(self, msg: IncomingMessage) -> str:
+        return render_message_content(
+            msg,
+            robot_agent_id_lookup=self._agent_id_for_robot_id,
+        )
+
+    def _agent_id_for_robot_id(self, robot_id: str) -> str | None:
+        rid = str(robot_id or "").strip()
+        if not rid:
+            return None
+        participant = self._message_store.find_participant_by_imid(rid)
+        if participant and participant.participant_type == "bot" and participant.agent_id:
+            return participant.agent_id
+        if rid in self._self_robot_ids():
+            return str(self._settings.get("app_agent_id") or "").strip() or None
+        return None
 
     @staticmethod
     def _normalize_store_key(

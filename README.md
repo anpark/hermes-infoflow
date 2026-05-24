@@ -193,7 +193,6 @@ bash scripts/deploy.sh --port 9000 # 指定 webhook 端口并写入 ~/.hermes/.e
 
 | 变量 | 含义 |
 |------|------|
-| `INFOFLOW_API_HOST` | 如流 API 根地址，例如 `https://api.infoflow.example.com` |
 | `INFOFLOW_APP_KEY` | 应用 appKey |
 | `INFOFLOW_APP_SECRET` | 应用 appSecret（原始；插件会自动 MD5 lowercase hex） |
 | `INFOFLOW_CHECK_TOKEN` | echostr 签名校验用 token |
@@ -203,8 +202,10 @@ bash scripts/deploy.sh --port 9000 # 指定 webhook 端口并写入 ~/.hermes/.e
 
 | 变量 | 默认 | 含义 |
 |------|------|------|
+| `INFOFLOW_API_HOST` | `https://api.im.baidu.com` | 如流 API 根地址 |
 | `INFOFLOW_APP_AGENT_ID` | 无 | 私聊撤回必须；如流后台「应用 ID」 |
 | `INFOFLOW_ROBOT_NAME` | 无 | 机器人显示名，用于 @-mention 识别 |
+| `INFOFLOW_ROBOT_ID` | 无 | 如流 IM robot_id / imid；通常自动发现并持久化，可手动提供 |
 | `INFOFLOW_PORT` | `26521` | Webhook 监听端口 |
 | `INFOFLOW_HOST` | `0.0.0.0` | Webhook 监听地址 |
 | `INFOFLOW_WEBHOOK_PATH` | `/webhook/infoflow` | Webhook 路径 |
@@ -223,6 +224,19 @@ bash scripts/deploy.sh --port 9000 # 指定 webhook 端口并写入 ~/.hermes/.e
 | `HERMES_STATE_DIR` | `~/.hermes/state` | sent-messages.db 等状态目录 |
 | `INFOFLOW_DASHBOARD_ENABLED` | `true` | 是否启用 localhost session 仪表盘 |
 | `INFOFLOW_DASHBOARD_EVENT_BUFFER` | `2000` | 每个 session 在内存中保留的最大事件条数 |
+
+`INFOFLOW_ROBOT_NAME` 仍按可选配置处理：当本地还没有持久化的
+`INFOFLOW_ROBOT_ID`，且机器人显示名缺失或已过期时，fresh install
+可能漏掉第一条群内 direct @。这是当前接受的运行限制，后续等如流服务
+提供明确的 robot_id 初始化接口后再彻底解决。注意：群消息 body 里的
+`AT.robotid` 是如流 IM 的 robot_id / imid，绝不是 `INFOFLOW_APP_AGENT_ID`；
+代码只能通过 `participants` 表中由群成员接口等来源维护的映射关系，把
+robot_id / imid 转换成机器人 `agent_id`。
+
+消息库中的 `created_time` 表示该 `message_id` 在插件内“第一次被看到”的时间。
+机器人自己发出的消息可能是发送接口结果先回来，也可能是 echo 回调先回来；
+哪条路径先写入数据库就以当时的时间作为 `created_time`，后续同一
+`message_id` 的 upsert 只补全 echo/raw/msg_id2/content 等字段，不改变排序时间。
 
 设置完后：
 

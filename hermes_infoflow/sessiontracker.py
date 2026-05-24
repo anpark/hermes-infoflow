@@ -14,6 +14,7 @@ from typing import Any
 
 from .api import InfoflowAccountAPI, InfoflowAPIError, get_user_info_by_code
 from .dashboard import SessionEvent, SessionTracker, normalize_chat_id, sessiontracker_enabled
+from .settings import DEFAULT_API_HOST
 
 logger = logging.getLogger(__name__)
 
@@ -322,14 +323,13 @@ def _parse_cursor(raw: str) -> int:
 
 
 def _read_infoflow_account() -> InfoflowAccountAPI:
-    api_host = os.getenv("INFOFLOW_API_HOST", "").strip()
+    api_host = os.getenv("INFOFLOW_API_HOST", "").strip() or DEFAULT_API_HOST
     app_key = os.getenv("INFOFLOW_APP_KEY", "").strip()
     app_secret = os.getenv("INFOFLOW_APP_SECRET", "").strip()
     agent_raw = os.getenv("INFOFLOW_APP_AGENT_ID", "").strip()
-    if not all((api_host, app_key, app_secret, agent_raw)):
+    if not all((app_key, app_secret, agent_raw)):
         raise ValueError(
-            "INFOFLOW_API_HOST, INFOFLOW_APP_KEY, INFOFLOW_APP_SECRET, "
-            "INFOFLOW_APP_AGENT_ID are required"
+            "INFOFLOW_APP_KEY, INFOFLOW_APP_SECRET, INFOFLOW_APP_AGENT_ID are required"
         )
     return InfoflowAccountAPI(
         api_host=api_host,

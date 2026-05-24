@@ -21,9 +21,10 @@ Key correctness rules (each maps to an OpenClaw line we audited):
   integers (preserving the wire shape Infoflow expects).
 * **Dedup key extraction** — ``message.header.messageid`` > ``msgid`` >
   top-level ``MsgId`` > ``{fromuserid}_{groupid}_{ctime}`` composite.
-* **bodyForAgent** — for group messages, rebuild the text with the
-  bot's ``@robotName``/robotid preserved so the LLM can see who was
-  mentioned (matches OpenClaw types.ts ``bodyForAgent``).
+* **Structural parse only** — parser keeps Infoflow wire fields on parsed
+  structures (for example ``BodyItem.robotid``) but does not build the final
+  DB/LLM message body.  That rendering happens after serverapi normalizes
+  fields and bot/adapter can use participants mappings.
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ from typing import Any
 from urllib.parse import parse_qs
 from xml.etree import ElementTree as ET
 
+from .coerce import coerce_bool, first_present
 from .crypto import InfoflowCryptoError, decrypt_message, verify_echostr_signature
 
 # Regex matches IDs with 16 or more digits — anything shorter is safe to
@@ -106,8 +108,11 @@ class InboundMessage:
     chat_type: str                    # "dm" | "group"
     from_user: str                    # uuapName (sender)
     text: str                         # raw message text (no @-mention prefix)
-    body_for_agent: str               # text with @robotName preserved (for LLM)
+    # Deprecated compatibility field. Parser output should be structural; final
+    # DB/LLM text is rendered from body_items/reply_targets in message_content.py.
+    body_for_agent: str = ""
     sender_name: str = ""
+    sender_agent_id: str = ""
     message_id: str | None = None
     group_id: str | None = None       # numeric string, "" when DM
     msgseqid: str | None = None
@@ -117,6 +122,10 @@ class InboundMessage:
     body_items: list[BodyItem] = field(default_factory=list)
     image_urls: list[str] = field(default_factory=list)
     mention_user_ids: list[str] = field(default_factory=list)
+    # Infoflow AT.robotid values are robot_id / imid values, not app agent_id.
+    # They are mapped to mention_agent_ids later when the participants table
+    # has a robot_id -> agent_id relationship.
+    mention_robot_ids: list[str] = field(default_factory=list)
     mention_agent_ids: list[str] = field(default_factory=list)
     reply_targets: list[dict[str, Any]] = field(default_factory=list)
     is_reply_to_bot: bool = False
@@ -132,8 +141,8 @@ class InboundMessage:
     # Used by the adapter to compare against the persisted robotId for the
     # "ignore own bot message" guard (OpenClaw bot.ts:766-775).
     fromid: str = ""
-    # ``eventtype`` from the inbound payload — surfaced so the adapter / policy
-    # can branch on ``MESSAGE_RECEIVE`` vs ``ALL_MESSAGE_FORWARD`` etc.
+    # ``eventtype`` from the inbound payload.  It is metadata only; direct bot
+    # mention state is derived from body AT items, not from event type.
     event_type: str = ""
     # Whether the sender is a bot (agent).  Detected by matching ``fromid``
     # against body-item ``robotid`` values, or by checking if ``fromid`` is a
@@ -281,7 +290,7 @@ def _coerce_body_item(raw: dict[str, Any]) -> BodyItem:
         name=_stringify(raw.get("name")),
         userid=_stringify(raw.get("userid")),
         robotid=_stringify(raw.get("robotid")),
-        atall=bool(raw.get("atall")),
+        atall=coerce_bool(raw.get("atall")),
         downloadurl=_stringify(raw.get("downloadurl")),
         messageid=_stringify(raw.get("messageid") or raw.get("sBasemsgId")),
         preview=_stringify(raw.get("preview")),
@@ -291,7 +300,7 @@ def _coerce_body_item(raw: dict[str, Any]) -> BodyItem:
             or raw.get("sender_imid")
             or raw.get("senderImid")
         ),
-        is_bot_message=bool(raw.get("isBotMessage") or raw.get("is_bot_message")),
+        is_bot_message=coerce_bool(first_present(raw, "isBotMessage", "is_bot_message")),
     )
 
 
@@ -303,23 +312,21 @@ def _check_bot_mentioned(
     body_items: list[BodyItem],
     *,
     robot_name: str,
-    app_agent_id: int | None,
     robot_id: str,
 ) -> tuple[bool, str]:
-    """Return ``(was_mentioned, discovered_robot_id)``.
+    """Return ``(directly_mentioned, discovered_robot_id)``.
 
-    Matches against (in order) ``app_agent_id``, ``robot_name``, ``robot_id``
-    — same priority as openclaw-infoflow/src/bot.ts::checkBotMentioned.
+    Infoflow AT.robotid is the robot_id / imid exposed by the IM service. It
+    is never the app_agent_id, so direct mention detection only compares it to
+    a known robot_id, or discovers it when the configured robot_name matches.
+    ``@all`` is deliberately not a direct bot mention.
     """
     norm_name = _normalize_robot_name(robot_name)
     norm_id = (robot_id or "").strip()
-    app_agent_id_str = str(app_agent_id) if app_agent_id is not None else ""
     discovered = ""
     for item in body_items:
         if item.type != "AT":
             continue
-        if app_agent_id_str and item.robotid and item.robotid == app_agent_id_str:
-            return True, item.robotid or discovered
         if norm_name and item.name and item.name.lower() == norm_name:
             if item.robotid:
                 discovered = item.robotid
@@ -332,26 +339,22 @@ def _check_bot_mentioned(
 def _extract_mention_ids(
     body_items: list[BodyItem],
     *,
-    bot_app_agent_id: int | None,
     bot_robot_id: str,
 ) -> tuple[list[str], list[str]]:
-    """Return ``(user_ids, agent_ids)`` of @-mentions excluding the bot itself."""
-    bot_id_str = str(bot_app_agent_id) if bot_app_agent_id is not None else ""
+    """Return ``(user_ids, robot_ids)`` of @-mentions excluding the bot itself."""
     bot_robot = (bot_robot_id or "").strip()
     user_ids: list[str] = []
-    agent_ids: list[str] = []
+    robot_ids: list[str] = []
     for item in body_items:
         if item.type != "AT":
             continue
         if item.userid:
             user_ids.append(item.userid)
         elif item.robotid:
-            if (bot_id_str and item.robotid == bot_id_str) or (
-                bot_robot and item.robotid == bot_robot
-            ):
+            if bot_robot and item.robotid == bot_robot:
                 continue
-            agent_ids.append(item.robotid)
-    return user_ids, agent_ids
+            robot_ids.append(item.robotid)
+    return user_ids, robot_ids
 
 
 def _extract_reply_targets(
@@ -390,43 +393,33 @@ def _extract_reply_targets(
     return targets, is_reply_to_bot
 
 
-def _build_body_for_agent(body_items: list[BodyItem]) -> tuple[str, str, list[str]]:
-    """Reconstruct two strings + the image URL list from the body items.
+def _extract_body_parts(body_items: list[BodyItem]) -> tuple[str, bool, list[str]]:
+    """Extract plain text, structural-body presence, and image URLs.
 
-    Mirrors openclaw-infoflow/src/bot.ts (handleGroupChatMessage body loop):
-
-    * ``raw_text`` — TEXT/MD content only, used for ``CommandBody`` (no @-prefix).
-    * ``body_for_agent`` — what the LLM sees: TEXT/MD plus each AT rendered as
-      ``@<name> (robotid:<N>) `` (or ``@<name> `` for human ATs). LINK items
-      contribute their ``label`` (matches OpenClaw's LINK handling for the
-      agent-visible text).
+    Parser stays at the service-boundary layer: it preserves IDs on BodyItem
+    fields but does not construct the LLM-facing message body.  That final text
+    is rendered later from normalized internal fields by message_content.py.
     """
     raw_parts: list[str] = []
-    agent_parts: list[str] = []
+    has_structural_body = False
     image_urls: list[str] = []
     for item in body_items:
         t = (item.type or "").upper()
         if t in ("TEXT", "MD"):
             raw_parts.append(item.content)
-            agent_parts.append(item.content)
         elif t == "AT":
-            name = item.name or item.userid or item.robotid or "?"
-            if item.robotid:
-                agent_parts.append(f"@{name} (robotid:{item.robotid}) ")
-            else:
-                agent_parts.append(f"@{name} ")
+            has_structural_body = True
         elif t == "LINK":
             label = item.label or item.content or ""
             if label:
                 raw_parts.append(f" {label} ")
-                agent_parts.append(f" {label} ")
         elif t in ("REPLYDATA", "REPLY"):
             if item.messageid:
-                agent_parts.append(f"<引用 message_id:{item.messageid}>{item.content}</引用>")
+                has_structural_body = True
         elif t == "IMAGE":
             if item.downloadurl:
                 image_urls.append(item.downloadurl)
-    return ("".join(raw_parts).strip(), "".join(agent_parts).strip(), image_urls)
+    return ("".join(raw_parts).strip(), has_structural_body, image_urls)
 
 
 # ---------------------------------------------------------------------------
@@ -471,14 +464,31 @@ def _try_decrypt_and_parse(
 def build_private_inbound(
     msg_data: dict[str, Any],
     *,
+    account: AccountConfig | None = None,
     sent_message_ids: set[str] | None = None,
 ) -> InboundMessage | None:
     """Translate a decrypted private-chat ``msgData`` to ``InboundMessage``."""
+    fromid_str = _stringify(
+        msg_data.get("FromId")
+        or msg_data.get("fromid")
+        or msg_data.get("fromId")
+    )
+    to_user = _stringify(
+        msg_data.get("ToUserId")
+        or msg_data.get("touser")
+        or msg_data.get("to_user")
+        or msg_data.get("to")
+    )
     from_user = _stringify(
         msg_data.get("FromUserId")
         or msg_data.get("fromuserid")
         or msg_data.get("from")
     )
+    app_agent_id = str(account.app_agent_id or "") if account is not None else ""
+    robot_id = str(account.robot_id or "") if account is not None else ""
+    is_bot_sender = bool(robot_id and fromid_str and fromid_str == robot_id)
+    if is_bot_sender and not from_user:
+        from_user = to_user
     if not from_user:
         return None
 
@@ -489,11 +499,10 @@ def build_private_inbound(
         or msg_data.get("mes")
     ).strip()
 
-    sender_name = _stringify(
-        msg_data.get("FromUserName")
-        or msg_data.get("username")
-        or from_user
-    )
+    # Private webhook FromUserName is a nickname, not the stable/real human
+    # name. Keep it only inside raw_msgdata; never promote it into structured
+    # fields or LLM-facing sender metadata.
+    sender_name = ""
 
     raw_msg_id = (
         msg_data.get("MsgId")
@@ -550,12 +559,6 @@ def build_private_inbound(
             if is_bot:
                 is_reply_to_bot = True
 
-    # Build body_for_agent with reply tag prefix (same format as group chat)
-    reply_prefix = ""
-    if reply_targets:
-        rt = reply_targets[0]
-        reply_prefix = f"<引用 message_id:{rt['messageid']}>{rt['preview']}</引用>\n"
-
     if not text and not image_urls and not reply_targets:
         return None
 
@@ -564,14 +567,13 @@ def build_private_inbound(
     elif not text and reply_targets:
         text = "(引用回复)"
 
-    body_for_agent = reply_prefix + text
-
     return InboundMessage(
         chat_type="dm",
         from_user=from_user,
         text=text,
-        body_for_agent=body_for_agent,
+        body_for_agent="",
         sender_name=sender_name,
+        sender_agent_id=app_agent_id if is_bot_sender else "",
         message_id=message_id,
         msgid2=msgid2_str,
         timestamp_ms=timestamp_ms,
@@ -580,6 +582,8 @@ def build_private_inbound(
         was_mentioned=True,  # private chat is always "directly addressed"
         reply_targets=reply_targets,
         is_reply_to_bot=is_reply_to_bot,
+        fromid=fromid_str,
+        is_bot_sender=is_bot_sender,
     )
 
 
@@ -635,25 +639,19 @@ def build_group_inbound(
         _coerce_body_item(item) for item in raw_body if isinstance(item, dict)
     ]
 
-    raw_text, body_for_agent, image_urls = _build_body_for_agent(body_items)
+    raw_text, has_structural_body, image_urls = _extract_body_parts(body_items)
 
-    was_mentioned_flag, discovered_robot_id = _check_bot_mentioned(
+    was_mentioned, discovered_robot_id = _check_bot_mentioned(
         body_items,
         robot_name=account.robot_name,
-        app_agent_id=account.app_agent_id,
         robot_id=account.robot_id,
     )
     event_type = _stringify(msg_data.get("eventtype"))
-    if msg_data.get("wasMentioned") is True or event_type == "MESSAGE_RECEIVE":
-        was_mentioned = True
-    else:
-        was_mentioned = was_mentioned_flag
     fromid_str = _stringify(msg_data.get("fromid"))
 
-    mention_user_ids, mention_agent_ids = _extract_mention_ids(
+    mention_user_ids, mention_robot_ids = _extract_mention_ids(
         body_items,
-        bot_app_agent_id=account.app_agent_id,
-        bot_robot_id=account.robot_id,
+        bot_robot_id=account.robot_id or discovered_robot_id,
     )
     reply_targets, is_reply_to_bot = _extract_reply_targets(
         body_items,
@@ -661,7 +659,7 @@ def build_group_inbound(
         bot_robot_id=account.robot_id,
     )
 
-    if not raw_text.strip() and not image_urls and not reply_targets and not body_for_agent:
+    if not raw_text.strip() and not image_urls and not reply_targets and not has_structural_body:
         return None
 
     _is_at_only = False  # will be set True if AT-only message
@@ -678,9 +676,10 @@ def build_group_inbound(
             text_out = "<media:image>"
     elif not _raw_stripped and reply_targets:
         text_out = "(引用回复)"
-    elif not _raw_stripped and body_for_agent:
-        # AT-only message (no TEXT/MD body, e.g. user just @'s the bot)
-        text_out = body_for_agent
+    elif not _raw_stripped and has_structural_body:
+        # AT-only message (no TEXT/MD body, e.g. user just @'s the bot).
+        # Keep text empty; final readable content is rendered from body_items.
+        text_out = ""
         _is_at_only = True
     else:
         text_out = raw_text
@@ -717,7 +716,7 @@ def build_group_inbound(
         chat_type="group",
         from_user=from_user,
         text=text_out,
-        body_for_agent=body_for_agent or text_out,
+        body_for_agent="",
         sender_name=sender_display,
         message_id=message_id,
         group_id=group_id_str,
@@ -728,7 +727,8 @@ def build_group_inbound(
         body_items=body_items,
         image_urls=image_urls,
         mention_user_ids=mention_user_ids,
-        mention_agent_ids=mention_agent_ids,
+        mention_robot_ids=mention_robot_ids,
+        mention_agent_ids=[],
         reply_targets=reply_targets,
         is_reply_to_bot=is_reply_to_bot,
         was_mentioned=was_mentioned,
@@ -812,7 +812,11 @@ def parse_webhook(
                     status_code=500,
                     body="decryption failed",
                 )
-            inbound = build_private_inbound(decoded, sent_message_ids=sent_message_ids)
+            inbound = build_private_inbound(
+                decoded,
+                account=account,
+                sent_message_ids=sent_message_ids,
+            )
             if not inbound:
                 return ParsedWebhook(kind="ignored")
             return ParsedWebhook(kind="message", inbound=inbound)

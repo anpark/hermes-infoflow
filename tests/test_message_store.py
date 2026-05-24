@@ -1,4 +1,4 @@
-"""Tests for hermes_infoflow.message_store (msgid2 persistence)."""
+"""Tests for the Infoflow message fact store."""
 
 from __future__ import annotations
 
@@ -9,121 +9,235 @@ from pathlib import Path
 import pytest
 
 from hermes_infoflow import message_store as ms
+from hermes_infoflow.itypes import GroupMember
 from hermes_infoflow.message_store import MessageStore
 
 
-def test_persist_group_stores_msgid2(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(ms, "_STATE_BASE_DIR", tmp_path)
-    store = MessageStore(account_id="test-acct")
-    rec = store.persist_group(
-        message_id="mid-1",
-        group_id="4507088",
-        sender_id="bob",
-        is_inbound=True,
-        msgid2="300014580",
-        text="hello",
-    )
-    assert rec is not None
-    assert rec.msgid2 == "300014580"
-
-    found = store.find_group("mid-1")
-    assert found is not None
-    assert found.msgid2 == "300014580"
-
-
-def test_persist_group_alter_table_migration_on_old_schema(
+def test_old_schema_is_dropped_and_new_schema_created(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Existing DB without msgid2 column gets migrated via ALTER TABLE."""
     monkeypatch.setattr(ms, "_STATE_BASE_DIR", tmp_path)
-    store1 = MessageStore(account_id="test-acct")
-    store1.persist_group(
-        message_id="mid-old",
-        group_id="1",
-        text="before migration",
-    )
-    store2 = MessageStore(account_id="test-acct")
-    rec = store2.persist_group(
-        message_id="mid-new",
-        group_id="1",
-        msgid2="999",
-        text="after migration",
-    )
-    assert rec is not None
-    assert rec.msgid2 == "999"
-    found = store2.find_group("mid-new")
-    assert found is not None
-    assert found.msgid2 == "999"
-
-
-def test_pre_migration_schema_then_open_adds_msgid2_at_end(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Simulate an existing pre-msgid2 DB: ALTER adds column at end,
-    SELECT must still return msgid2 in the expected position via explicit
-    column list.
-    """
-    monkeypatch.setattr(ms, "_STATE_BASE_DIR", tmp_path)
-
     db_dir = tmp_path / "test-acct"
     db_dir.mkdir(parents=True, exist_ok=True)
     db_path = db_dir / "messages.db"
 
-    # Hand-create the OLD schema (without msgid2).
     conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE dm_messages (message_id TEXT PRIMARY KEY, text TEXT)")
+    conn.execute("INSERT INTO dm_messages VALUES ('legacy-dm', 'old')")
     conn.execute(
         """
         CREATE TABLE group_messages (
             message_id TEXT PRIMARY KEY,
             group_id TEXT NOT NULL DEFAULT '',
-            sender_id TEXT NOT NULL DEFAULT '',
-            sender_name TEXT NOT NULL DEFAULT '',
-            sender_imid TEXT NOT NULL DEFAULT '',
-            sender_is_bot INTEGER NOT NULL DEFAULT 0,
-            is_inbound INTEGER NOT NULL DEFAULT 1,
-            bot_was_mentioned INTEGER NOT NULL DEFAULT 0,
-            text TEXT NOT NULL DEFAULT '',
-            digest TEXT NOT NULL DEFAULT '',
-            created_at REAL NOT NULL,
-            raw_json TEXT
+            text TEXT NOT NULL DEFAULT ''
         )
         """
     )
-    now = time.time()
-    conn.execute(
-        "INSERT INTO group_messages (message_id, group_id, text, digest, created_at) "
-        "VALUES ('legacy-1', '4507088', 'before migration', '', ?)",
-        (now,),
-    )
+    conn.execute("INSERT INTO group_messages VALUES ('legacy-group', '1', 'old')")
     conn.commit()
     conn.close()
 
-    # First open triggers ALTER TABLE migration (msgid2 added at end).
     store = MessageStore(account_id="test-acct")
-
-    # Legacy row should still be readable, with msgid2 defaulting to "".
-    legacy = store.find_group("legacy-1")
-    assert legacy is not None
-    assert legacy.text == "before migration"
-    assert legacy.msgid2 == ""
-
-    # New writes correctly persist msgid2 too.
-    new_rec = store.persist_group(
+    rec = store.persist_group(
         message_id="new-1",
         group_id="4507088",
-        msgid2="300014580",
-        text="after migration",
+        sender="user:alice",
+        content="hello",
     )
-    assert new_rec is not None
+
+    assert rec is not None
+    assert store.find_group("legacy-group") is None
+    assert store.find_dm("legacy-dm") is None
     found = store.find_group("new-1")
     assert found is not None
-    assert found.msgid2 == "300014580"
-    assert found.text == "after migration"
+    assert found.content == "hello"
 
-    # list also returns correct fields.
-    recent = store.recent_group("4507088", limit=10)
-    by_id = {r.message_id: r for r in recent}
-    assert by_id["legacy-1"].msgid2 == ""
-    assert by_id["legacy-1"].text == "before migration"
-    assert by_id["new-1"].msgid2 == "300014580"
-    assert by_id["new-1"].text == "after migration"
+
+def test_group_upsert_preserves_first_seen_created_time_and_fills_echo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ms, "_STATE_BASE_DIR", tmp_path)
+    store = MessageStore(account_id="test-acct")
+    created_time = int(time.time() * 1000)
+
+    store.persist_group(
+        message_id="mid-1",
+        group_id="4507088",
+        sender="bot:6471",
+        self_id="bot:6471",
+        is_outgoing=True,
+        content="provisional",
+        created_time=created_time,
+    )
+    store.persist_group(
+        message_id="mid-1",
+        group_id="4507088",
+        sender="bot:6471",
+        self_id="bot:6471",
+        is_outgoing=False,
+        mentions_you=True,
+        msg_id2="300014580",
+        content="echo body",
+        msg_time=2000,
+        raw_json='{"fromid":"999","body":[]}',
+        created_time=9999,
+    )
+
+    found = store.find_group("mid-1")
+    assert found is not None
+    assert found.created_time == created_time
+    assert found.is_outgoing is True
+    assert found.mentions_you is True
+    assert found.msg_id2 == "300014580"
+    assert found.content == "echo body"
+    assert found.msg_time == 2000
+    assert found.raw_json == '{"fromid":"999","body":[]}'
+
+
+def test_group_echo_first_content_wins_over_late_send_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ms, "_STATE_BASE_DIR", tmp_path)
+    store = MessageStore(account_id="test-acct")
+    first_seen = int(time.time() * 1000)
+    late_seen = first_seen + 1
+
+    store.persist_group(
+        message_id="mid-echo-first",
+        group_id="4507088",
+        sender="bot:6471",
+        self_id="bot:6471",
+        is_outgoing=True,
+        content="canonical echo body",
+        msg_id2="300014580",
+        msg_time=2000,
+        raw_json='{"fromid":999,"body":[{"type":"TEXT","content":"canonical echo body"}]}',
+        created_time=first_seen,
+    )
+    store.persist_group(
+        message_id="mid-echo-first",
+        group_id="4507088",
+        sender="bot:6471",
+        self_id="bot:6471",
+        is_outgoing=True,
+        content="provisional send body",
+        created_time=late_seen,
+    )
+
+    found = store.find_group("mid-echo-first")
+    assert found is not None
+    assert found.created_time == first_seen
+    assert found.content == "canonical echo body"
+    assert found.msg_id2 == "300014580"
+    assert found.msg_time == 2000
+    assert found.raw_json == '{"fromid":999,"body":[{"type":"TEXT","content":"canonical echo body"}]}'
+
+
+def test_private_echo_first_content_wins_over_late_send_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ms, "_STATE_BASE_DIR", tmp_path)
+    store = MessageStore(account_id="test-acct")
+    first_seen = int(time.time() * 1000)
+    late_seen = first_seen + 1
+
+    store.persist_dm(
+        message_id="dm-echo-first",
+        peer="user:alice",
+        self_id="bot:6471",
+        sender="bot:6471",
+        is_outgoing=True,
+        content="canonical dm echo",
+        msg_id2="300014581",
+        msg_time=2000,
+        raw_json='{"FromId":999,"Content":"canonical dm echo"}',
+        created_time=first_seen,
+    )
+    store.persist_dm(
+        message_id="dm-echo-first",
+        peer="user:alice",
+        self_id="bot:6471",
+        sender="bot:6471",
+        is_outgoing=True,
+        content="provisional dm body",
+        created_time=late_seen,
+    )
+
+    found = store.find_dm("dm-echo-first")
+    assert found is not None
+    assert found.created_time == first_seen
+    assert found.content == "canonical dm echo"
+    assert found.msg_id2 == "300014581"
+    assert found.msg_time == 2000
+    assert found.raw_json == '{"FromId":999,"Content":"canonical dm echo"}'
+
+
+def test_private_raw_json_keeps_from_user_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ms, "_STATE_BASE_DIR", tmp_path)
+    store = MessageStore(account_id="test-acct")
+
+    store.persist_dm(
+        message_id="dm-1",
+        peer="user:alice",
+        self_id="bot:6471",
+        sender="user:alice",
+        content="hi",
+        raw_json='{"FromUserId":"alice","FromUserName":"临时昵称"}',
+    )
+
+    found = store.find_dm("dm-1")
+    assert found is not None
+    assert found.raw_json == '{"FromUserId":"alice","FromUserName":"临时昵称"}'
+    assert found.sender == "user:alice"
+
+
+def test_participant_upsert_backfills_group_sender_by_imid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ms, "_STATE_BASE_DIR", tmp_path)
+    store = MessageStore(account_id="test-acct")
+
+    store.persist_group(
+        message_id="mid-1",
+        group_id="4507088",
+        sender="",
+        content="bot echo before member cache",
+        raw_json='{"fromid":999}',
+    )
+    rec = store.upsert_participant(
+        participant_type="bot",
+        agent_id="6471",
+        imid="999",
+        name="helper",
+    )
+
+    assert rec is not None
+    assert rec.key == "bot:6471"
+    found = store.find_group("mid-1")
+    assert found is not None
+    assert found.sender == "bot:6471"
+
+
+def test_group_members_update_participants_without_human_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ms, "_STATE_BASE_DIR", tmp_path)
+    store = MessageStore(account_id="test-acct")
+
+    store.upsert_group_members(
+        "4507088",
+        [
+            GroupMember(uid="6471", name="helper", imid="999", agent_id=6471, is_bot=True),
+            GroupMember(uid="alice", name="Should Not Store", is_bot=False),
+        ],
+    )
+
+    bot = store.find_bot_by_agent_id("6471")
+    user = store.find_user_by_user_id("alice")
+    assert bot is not None
+    assert bot.imid == "999"
+    assert bot.name == "helper"
+    assert user is not None
+    assert user.name == ""

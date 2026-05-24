@@ -19,7 +19,7 @@ These are read from `~/.hermes/.env` (or your shell):
 
 | Variable | Notes |
 | --- | --- |
-| `INFOFLOW_API_HOST` | e.g. `http://apiin.im.baidu.com` |
+| `INFOFLOW_API_HOST` | optional; defaults to `https://api.im.baidu.com` |
 | `INFOFLOW_APP_KEY` | from the Infoflow open-platform console |
 | `INFOFLOW_APP_SECRET` | from the Infoflow open-platform console |
 | `INFOFLOW_APP_AGENT_ID` | optional but required for some calls |

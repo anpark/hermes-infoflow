@@ -72,6 +72,20 @@ async def test_self_mention_by_name_is_dropped_to_plain_text() -> None:
     assert options.at_all is False
 
 
+async def test_metadata_string_false_at_all_is_not_truthy() -> None:
+    async def get_group_members(group_id: str, **kwargs):
+        return []
+
+    _text, options = await prepare_outbound_message(
+        "hello",
+        group_id="1",
+        metadata={"at_all": "false"},
+        get_group_members=get_group_members,
+    )
+
+    assert options.at_all is False
+
+
 async def test_self_mention_by_digit_id_is_dropped() -> None:
     """`@<self-agent-id>` in text should also be discarded."""
     members = [

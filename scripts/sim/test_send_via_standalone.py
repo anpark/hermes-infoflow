@@ -70,7 +70,7 @@ def _build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     status = bootstrap()
     print(f"[sim] bootstrap: {json.dumps(status, ensure_ascii=False)}")
-    required_env("INFOFLOW_API_HOST", "INFOFLOW_APP_KEY", "INFOFLOW_APP_SECRET")
+    required_env("INFOFLOW_APP_KEY", "INFOFLOW_APP_SECRET")
 
     parser = _build_parser()
     args = parser.parse_args()
