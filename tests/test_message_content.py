@@ -81,6 +81,8 @@ def test_render_at_only_description_and_hint() -> None:
     content = render_message_content(msg)
     assert content.startswith("（仅@了以下对象，无正文：@成博 (user_id:chengbo05)）")
     assert "用户 @ 了你但没有输入正文" in content
+    assert "请优先阅读并理解上下文" in content
+    assert "只有在上下文中没有可识别的问题、话题或待办时" in content
 
 
 def test_render_string_false_boolean_fields_are_not_truthy() -> None:
