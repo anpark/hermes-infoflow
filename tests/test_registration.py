@@ -60,6 +60,18 @@ def test_register_registers_platform_and_tool() -> None:
     assert members_tool["is_async"] is True
     assert members_tool["schema"]["parameters"]["required"] == ["group_id"]
 
+    assert any(t["name"] == "infoflow_get_message_history" for t in ctx.tools)
+    history_tool = next(
+        t for t in ctx.tools if t["name"] == "infoflow_get_message_history"
+    )
+    assert history_tool["toolset"] == "hermes-infoflow"
+    assert history_tool["is_async"] is True
+    history_props = history_tool["schema"]["parameters"]["properties"]
+    assert "message_id" in history_props
+    assert "start_time" in history_props
+    assert "end_time" in history_props
+    assert "date" not in history_props
+
 
 def test_plugin_name_consistency() -> None:
     """plugin.yaml.name, register(name=...), and entry-point key must align."""

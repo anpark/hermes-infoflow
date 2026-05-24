@@ -38,7 +38,7 @@ _ROW_LIMIT = 5000
 _DB_TIMEOUT_SECONDS = 30.0
 _DB_BUSY_TIMEOUT_MS = 5_000
 _STATE_BASE_DIR = Path("~/.hermes/state/infoflow")
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 _PRIVATE_COLUMNS = (
     "message_id, peer, self, sender, is_outgoing, quotes_your_message, "
@@ -52,6 +52,10 @@ _GROUP_COLUMNS = (
 )
 _PARTICIPANT_COLUMNS = (
     "id, participant_type, agent_id, user_id, imid, name, updated_time"
+)
+_LLM_CONTEXT_COLUMNS = (
+    "llm_context_key, chat_key, last_llm_visible_message_id, "
+    "last_llm_visible_created_time, updated_time"
 )
 
 
@@ -202,6 +206,15 @@ class ParticipantRecord:
         if self.participant_type == "user":
             return _participant_key("user", self.user_id)
         return ""
+
+
+@dataclass(frozen=True)
+class LLMContextState:
+    llm_context_key: str
+    chat_key: str
+    last_llm_visible_message_id: str = ""
+    last_llm_visible_created_time: int = 0
+    updated_time: int = 0
 
 
 # Compatibility names kept for callers that still import the old classes.
@@ -506,6 +519,193 @@ class MessageStore:
     def recent_group_sent(self, group_id: str, limit: int = 10) -> list[GroupMessageRecord]:
         return self.recent_group(group_id, sent_only=True, limit=limit)
 
+    def query_dm_range(
+        self,
+        dm_user_id: str,
+        *,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+        limit: int = 50,
+    ) -> list[PrivateMessageRecord]:
+        peer = _participant_key("user", dm_user_id)
+        conditions = ["peer = ?"]
+        params: list[Any] = [peer]
+        if start_ms is not None:
+            conditions.append("created_time >= ?")
+            params.append(int(start_ms))
+        if end_ms is not None:
+            conditions.append("created_time < ?")
+            params.append(int(end_ms))
+        rows = self._query_all(
+            f"SELECT {_PRIVATE_COLUMNS} FROM private_messages "
+            f"WHERE {' AND '.join(conditions)} "
+            "ORDER BY created_time ASC, message_id ASC LIMIT ?",
+            (*params, max(1, int(limit))),
+        )
+        return [self._row_to_private(r) for r in rows]
+
+    def query_group_range(
+        self,
+        group_id: str,
+        *,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+        limit: int = 50,
+    ) -> list[GroupMessageRecord]:
+        conditions = ["group_id = ?"]
+        params: list[Any] = [str(group_id or "")]
+        if start_ms is not None:
+            conditions.append("created_time >= ?")
+            params.append(int(start_ms))
+        if end_ms is not None:
+            conditions.append("created_time < ?")
+            params.append(int(end_ms))
+        rows = self._query_all(
+            f"SELECT {_GROUP_COLUMNS} FROM group_messages "
+            f"WHERE {' AND '.join(conditions)} "
+            "ORDER BY created_time ASC, message_id ASC LIMIT ?",
+            (*params, max(1, int(limit))),
+        )
+        return [self._row_to_group(r) for r in rows]
+
+    def dm_window_around(
+        self,
+        anchor: PrivateMessageRecord,
+        *,
+        before_count: int = 0,
+        after_count: int = 0,
+    ) -> list[PrivateMessageRecord]:
+        before = self._private_before(
+            anchor.peer,
+            anchor.created_time,
+            anchor.message_id,
+            max(0, int(before_count)),
+        )
+        after = self._private_after(
+            anchor.peer,
+            anchor.created_time,
+            anchor.message_id,
+            max(0, int(after_count)),
+        )
+        return [*reversed(before), anchor, *after]
+
+    def group_window_around(
+        self,
+        anchor: GroupMessageRecord,
+        *,
+        before_count: int = 0,
+        after_count: int = 0,
+    ) -> list[GroupMessageRecord]:
+        before = self._group_before(
+            anchor.group_id,
+            anchor.created_time,
+            anchor.message_id,
+            max(0, int(before_count)),
+        )
+        after = self._group_after(
+            anchor.group_id,
+            anchor.created_time,
+            anchor.message_id,
+            max(0, int(after_count)),
+        )
+        return [*reversed(before), anchor, *after]
+
+    def count_group_between(
+        self,
+        group_id: str,
+        *,
+        after_created_time: int = 0,
+        after_message_id: str = "",
+        before_created_time: int,
+        before_message_id: str,
+    ) -> int:
+        return self._count_between(
+            "group_messages",
+            "group_id",
+            str(group_id or ""),
+            after_created_time=after_created_time,
+            after_message_id=after_message_id,
+            before_created_time=before_created_time,
+            before_message_id=before_message_id,
+        )
+
+    def count_dm_between(
+        self,
+        dm_user_id: str,
+        *,
+        after_created_time: int = 0,
+        after_message_id: str = "",
+        before_created_time: int,
+        before_message_id: str,
+    ) -> int:
+        return self._count_between(
+            "private_messages",
+            "peer",
+            _participant_key("user", dm_user_id),
+            after_created_time=after_created_time,
+            after_message_id=after_message_id,
+            before_created_time=before_created_time,
+            before_message_id=before_message_id,
+        )
+
+    def get_llm_context_state(self, llm_context_key: str) -> LLMContextState | None:
+        row = self._query_one(
+            f"SELECT {_LLM_CONTEXT_COLUMNS} FROM llm_context_state "
+            "WHERE llm_context_key = ?",
+            (str(llm_context_key or ""),),
+        ) if llm_context_key else None
+        return self._row_to_llm_context(row) if row else None
+
+    def update_llm_context_state(
+        self,
+        *,
+        llm_context_key: str,
+        chat_key: str,
+        message_id: str,
+        created_time: int,
+        updated_time: int | None = None,
+    ) -> LLMContextState | None:
+        if not llm_context_key or not message_id:
+            return None
+        ts = int(updated_time or _now_ms())
+        with self._db_lock:
+            conn = self._connect()
+            if conn is None:
+                return None
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO llm_context_state (
+                        llm_context_key, chat_key, last_llm_visible_message_id,
+                        last_llm_visible_created_time, updated_time
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(llm_context_key) DO UPDATE SET
+                        chat_key = excluded.chat_key,
+                        last_llm_visible_message_id = excluded.last_llm_visible_message_id,
+                        last_llm_visible_created_time = excluded.last_llm_visible_created_time,
+                        updated_time = excluded.updated_time
+                    """,
+                    (
+                        str(llm_context_key),
+                        str(chat_key or ""),
+                        str(message_id),
+                        int(created_time or 0),
+                        ts,
+                    ),
+                )
+                row = conn.execute(
+                    f"SELECT {_LLM_CONTEXT_COLUMNS} FROM llm_context_state "
+                    "WHERE llm_context_key = ?",
+                    (str(llm_context_key),),
+                ).fetchone()
+                return self._row_to_llm_context(row) if row else None
+            except sqlite3.Error as exc:
+                logger.warning("[infoflow:message_store] context upsert failed: %s", exc)
+                return None
+            finally:
+                with contextlib.suppress(sqlite3.Error):
+                    conn.close()
+
     def find_participant_by_imid(self, imid: str) -> ParticipantRecord | None:
         row = self._query_one(
             f"SELECT {_PARTICIPANT_COLUMNS} FROM participants WHERE imid = ? "
@@ -599,6 +799,10 @@ class MessageStore:
                 "id", "participant_type", "agent_id", "user_id", "imid",
                 "name", "updated_time",
             },
+            "llm_context_state": {
+                "llm_context_key", "chat_key", "last_llm_visible_message_id",
+                "last_llm_visible_created_time", "updated_time",
+            },
         }
         for table, cols in expected.items():
             if table not in tables:
@@ -610,7 +814,13 @@ class MessageStore:
 
     @staticmethod
     def _drop_message_tables(conn: sqlite3.Connection) -> None:
-        for table in ("dm_messages", "private_messages", "group_messages", "participants"):
+        for table in (
+            "dm_messages",
+            "private_messages",
+            "group_messages",
+            "participants",
+            "llm_context_state",
+        ):
             conn.execute(f"DROP TABLE IF EXISTS {table}")
 
     @staticmethod
@@ -667,6 +877,17 @@ class MessageStore:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS llm_context_state (
+                llm_context_key TEXT PRIMARY KEY,
+                chat_key TEXT NOT NULL DEFAULT '',
+                last_llm_visible_message_id TEXT NOT NULL DEFAULT '',
+                last_llm_visible_created_time INTEGER NOT NULL DEFAULT 0,
+                updated_time INTEGER NOT NULL
+            )
+            """
+        )
         conn.execute("DROP INDEX IF EXISTS uniq_participant_bot")
         conn.execute("DROP INDEX IF EXISTS uniq_participant_user")
         conn.execute(
@@ -694,6 +915,10 @@ class MessageStore:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_group_sender_time "
             "ON group_messages(sender, created_time DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_llm_context_chat_time "
+            "ON llm_context_state(chat_key, updated_time DESC)"
         )
         conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
@@ -860,6 +1085,110 @@ class MessageStore:
                 with contextlib.suppress(sqlite3.Error):
                     conn.close()
 
+    def _private_before(
+        self,
+        peer: str,
+        created_time: int,
+        message_id: str,
+        limit: int,
+    ) -> list[PrivateMessageRecord]:
+        if limit <= 0:
+            return []
+        rows = self._query_all(
+            f"SELECT {_PRIVATE_COLUMNS} FROM private_messages "
+            "WHERE peer = ? AND "
+            "(created_time < ? OR (created_time = ? AND message_id < ?)) "
+            "ORDER BY created_time DESC, message_id DESC LIMIT ?",
+            (peer, int(created_time), int(created_time), str(message_id), limit),
+        )
+        return [self._row_to_private(r) for r in rows]
+
+    def _private_after(
+        self,
+        peer: str,
+        created_time: int,
+        message_id: str,
+        limit: int,
+    ) -> list[PrivateMessageRecord]:
+        if limit <= 0:
+            return []
+        rows = self._query_all(
+            f"SELECT {_PRIVATE_COLUMNS} FROM private_messages "
+            "WHERE peer = ? AND "
+            "(created_time > ? OR (created_time = ? AND message_id > ?)) "
+            "ORDER BY created_time ASC, message_id ASC LIMIT ?",
+            (peer, int(created_time), int(created_time), str(message_id), limit),
+        )
+        return [self._row_to_private(r) for r in rows]
+
+    def _group_before(
+        self,
+        group_id: str,
+        created_time: int,
+        message_id: str,
+        limit: int,
+    ) -> list[GroupMessageRecord]:
+        if limit <= 0:
+            return []
+        rows = self._query_all(
+            f"SELECT {_GROUP_COLUMNS} FROM group_messages "
+            "WHERE group_id = ? AND "
+            "(created_time < ? OR (created_time = ? AND message_id < ?)) "
+            "ORDER BY created_time DESC, message_id DESC LIMIT ?",
+            (str(group_id), int(created_time), int(created_time), str(message_id), limit),
+        )
+        return [self._row_to_group(r) for r in rows]
+
+    def _group_after(
+        self,
+        group_id: str,
+        created_time: int,
+        message_id: str,
+        limit: int,
+    ) -> list[GroupMessageRecord]:
+        if limit <= 0:
+            return []
+        rows = self._query_all(
+            f"SELECT {_GROUP_COLUMNS} FROM group_messages "
+            "WHERE group_id = ? AND "
+            "(created_time > ? OR (created_time = ? AND message_id > ?)) "
+            "ORDER BY created_time ASC, message_id ASC LIMIT ?",
+            (str(group_id), int(created_time), int(created_time), str(message_id), limit),
+        )
+        return [self._row_to_group(r) for r in rows]
+
+    def _count_between(
+        self,
+        table: str,
+        partition_column: str,
+        partition_value: str,
+        *,
+        after_created_time: int = 0,
+        after_message_id: str = "",
+        before_created_time: int,
+        before_message_id: str,
+    ) -> int:
+        if table not in {"private_messages", "group_messages"}:
+            return 0
+        if partition_column not in {"peer", "group_id"}:
+            return 0
+        row = self._query_one(
+            f"SELECT COUNT(*) FROM {table} "
+            f"WHERE {partition_column} = ? AND "
+            "(created_time > ? OR (created_time = ? AND message_id > ?)) AND "
+            "(created_time < ? OR (created_time = ? AND message_id < ?))",
+            (
+                partition_value,
+                int(after_created_time or 0),
+                int(after_created_time or 0),
+                str(after_message_id or ""),
+                int(before_created_time or 0),
+                int(before_created_time or 0),
+                str(before_message_id or ""),
+            ),
+        )
+        return int(row[0] or 0) if row else 0
+
     @staticmethod
     def _row_to_private(row: tuple) -> PrivateMessageRecord:
         return PrivateMessageRecord(
@@ -907,6 +1236,16 @@ class MessageStore:
             imid=str(row[4] or ""),
             name=str(row[5] or ""),
             updated_time=int(row[6] or 0),
+        )
+
+    @staticmethod
+    def _row_to_llm_context(row: tuple) -> LLMContextState:
+        return LLMContextState(
+            llm_context_key=str(row[0] or ""),
+            chat_key=str(row[1] or ""),
+            last_llm_visible_message_id=str(row[2] or ""),
+            last_llm_visible_created_time=int(row[3] or 0),
+            updated_time=int(row[4] or 0),
         )
 
     @staticmethod
@@ -974,6 +1313,7 @@ class MessageStore:
 __all__ = [
     "DMMessageRecord",
     "GroupMessageRecord",
+    "LLMContextState",
     "MessageStore",
     "ParticipantRecord",
     "PrivateMessageRecord",

@@ -28,13 +28,17 @@ from hermes_infoflow.adapter import (  # noqa: E402
     MessageType,
     _inbound_mid,
 )
+from hermes_infoflow import message_store as ms  # noqa: E402
+from hermes_infoflow.bot import recall_inbound_message_id_hint_scope  # noqa: E402
 from hermes_infoflow.itypes import IncomingMessage, RecallResult, SentResult  # noqa: E402
+from hermes_infoflow.llm_format import format_created_time_ms  # noqa: E402
+from hermes_infoflow.recall import _InboundContext, _register_inbound_context  # noqa: E402
 from hermes_infoflow.sent_store import SentMessageStore  # noqa: E402
 from tests._aes_helpers import aes_ecb_encrypt_b64url, aes_key_b64url  # noqa: E402
 
 
 @pytest.fixture
-def configured_env(monkeypatch):
+def configured_env(monkeypatch, tmp_path):
     """Set the minimum env vars needed to construct an adapter.
 
     Also pre-registers ``infoflow`` in hermes's ``platform_registry`` so
@@ -50,7 +54,13 @@ def configured_env(monkeypatch):
     monkeypatch.setenv("INFOFLOW_CHECK_TOKEN", "tok")
     monkeypatch.setenv("INFOFLOW_ENCODING_AES_KEY", aes_key)
     monkeypatch.setenv("INFOFLOW_ROBOT_NAME", "hermes")
+    monkeypatch.setenv("HERMES_STATE_DIR", str(tmp_path / "hermes-state"))
     monkeypatch.delenv("INFOFLOW_PORT", raising=False)
+    monkeypatch.setattr(ms, "_STATE_BASE_DIR", tmp_path / "infoflow-state")
+
+    from hermes_infoflow import bot as bot_module
+
+    monkeypatch.setattr(bot_module, "_ROBOT_ID_PATH", None)
 
     from gateway.platform_registry import PlatformEntry, platform_registry
 
@@ -97,7 +107,7 @@ def test_adapter_parse_target_handles_group_and_dm() -> None:
 
 def test_adapter_construction_reads_env(configured_env, monkeypatch) -> None:
     adapter = InfoflowAdapter(_make_config())
-    assert adapter._api_account.app_key == "k"
+    assert adapter._serverapi._api_account.app_key == "k"
     assert adapter._policy.reply_mode == "mention-and-watch"
     assert adapter._policy.require_mention is True
 
@@ -110,6 +120,24 @@ def test_build_message_event_uses_settings_agent_id_for_bot_identity(
     cfg = _make_config()
     cfg.extra = {"app_agent_id": "6471"}
     adapter = InfoflowAdapter(cfg)
+    created_time = 1_716_307_019_000
+    record = SimpleNamespace(
+        mentions_you=False,
+        matched_regex_pattern="",
+        mentions_everyone=False,
+        quotes_your_message=False,
+        mentions_other_people=False,
+        quotes_other_peoples_message=False,
+        created_time=created_time,
+    )
+    original_store = adapter._message_store
+    adapter._message_store = SimpleNamespace(
+        find_group=lambda mid: record if mid == "mid-1" else None,
+        find_dm=lambda mid: None,
+        find_user_by_user_id=lambda uid: None,
+        find_bot_by_agent_id=lambda aid: None,
+        find_participant_by_imid=original_store.find_participant_by_imid,
+    )
 
     async def _go():
         return await adapter.build_message_event(
@@ -122,7 +150,11 @@ def test_build_message_event_uses_settings_agent_id_for_bot_identity(
         )
 
     event = asyncio.run(_go())
-    assert "agentId: 6471" in event.channel_prompt
+    assert "agent_id=6471" in event.channel_prompt
+    assert (
+        f"[Message: message_id=mid-1; created_time={format_created_time_ms(created_time)}]"
+        in event.text
+    )
 
 
 def test_hermes_background_processor_signature_matches_context_override() -> None:
@@ -244,6 +276,75 @@ def test_processing_context_binding_replaces_inherited_values(configured_env) ->
     asyncio.run(_go())
 
 
+def test_hidden_history_line_injected_and_context_state_updated(
+    configured_env, monkeypatch, tmp_path,
+) -> None:
+    monkeypatch.setattr(ms, "_STATE_BASE_DIR", tmp_path)
+    adapter = InfoflowAdapter(_make_config())
+    store = adapter._message_store
+    base_time = int(__import__("time").time() * 1000)
+    store.persist_group(
+        message_id="M1",
+        group_id="4507088",
+        sender="user:alice",
+        content="visible before",
+        created_time=base_time + 1_000,
+    )
+    store.persist_group(
+        message_id="M2",
+        group_id="4507088",
+        sender="user:bob",
+        content="hidden between",
+        created_time=base_time + 2_000,
+    )
+    store.persist_group(
+        message_id="M3",
+        group_id="4507088",
+        sender="user:carol",
+        content="current",
+        created_time=base_time + 3_000,
+    )
+
+    source = adapter.build_source(
+        chat_id="group:4507088",
+        chat_name="group:4507088",
+        chat_type="group",
+        user_id="carol",
+        user_name="carol",
+        message_id="M3",
+    )
+    event = MessageEvent(
+        text="[Attention: mentions_you=true]\n[Sender: type=human; user_id=carol]\n"
+        "[Message: message_id=M3]\ncurrent",
+        message_type=MessageType.TEXT,
+        source=source,
+        raw_message={"infoflow_standard_message": True},
+        message_id="M3",
+    )
+    context_key = adapter._llm_context_key_for_event(event)
+    store.update_llm_context_state(
+        llm_context_key=context_key,
+        chat_key="group:4507088",
+        message_id="M1",
+        created_time=base_time + 1_000,
+    )
+
+    async def _go():
+        await adapter.on_processing_start(event)
+        await adapter.on_processing_complete(event, SimpleNamespace(value="success"))
+
+    asyncio.run(_go())
+
+    assert event.text.startswith(
+        "[Hidden History: count=1; tool=infoflow_get_message_history]\n"
+    )
+    assert event.raw_message["infoflow_hidden_history_count"] == 1
+    state = store.get_llm_context_state(context_key)
+    assert state is not None
+    assert state.last_llm_visible_message_id == "M3"
+    assert state.last_llm_visible_created_time == base_time + 3_000
+
+
 def test_handle_webhook_returns_echostr_synchronously(configured_env) -> None:
     raw_key, aes_key = configured_env
     adapter = InfoflowAdapter(_make_config())
@@ -257,7 +358,7 @@ def test_handle_webhook_returns_echostr_synchronously(configured_env) -> None:
     )
 
     async def _go():
-        return await adapter._handle_webhook(request)
+        return await adapter._webhook_server._handle_request(request)
 
     response = asyncio.run(_go())
     assert response.status == 200
@@ -298,7 +399,7 @@ def test_handle_webhook_returns_200_before_dispatch_completes(configured_env, mo
 
     async def _go():
         # Webhook returns immediately even though handle_message takes 500ms.
-        response = await adapter._handle_webhook(request)
+        response = await adapter._webhook_server._handle_request(request)
         # Confirm handle_message has been *started* (task scheduled) but not finished.
         await asyncio.wait_for(handle_started.wait(), timeout=1.0)
         assert not handle_finished.is_set(), "handle_message must not block the webhook"
@@ -477,8 +578,12 @@ def test_send_partial_failure_returns_error_with_last_messageid(
     Mirrors OpenClaw send.ts firstError semantics.
     """
     adapter = InfoflowAdapter(_make_config())
-    # Force tiny chunk size so a normal message splits into >1 chunk.
-    monkeypatch.setattr(adapter, "MAX_MESSAGE_LENGTH", 5)
+    # Force deterministic chunking at the Hermes split boundary used by Bot.
+    monkeypatch.setattr(
+        gateway_base.BasePlatformAdapter,
+        "truncate_message",
+        staticmethod(lambda content, max_length=4096, len_fn=None: ["abcde", "fghij", "klmnop"]),
+    )
     call_count = {"n": 0}
 
     async def fake_send_private(account, to_user, contents, *, session=None):
@@ -704,7 +809,8 @@ def test_webhook_ignores_own_bot_message_by_fromid(configured_env, monkeypatch) 
     """An inbound whose root-level ``fromid`` equals our discovered robotId must be dropped."""
     raw_key, _ = configured_env
     adapter = InfoflowAdapter(_make_config())
-    adapter._robot_id = "8675309"  # simulate previously-discovered id
+    adapter._serverapi.robot_id = "8675309"  # simulate previously-discovered id
+    adapter._bot.robot_id = "8675309"
 
     payload = {
         "fromid": "8675309",
@@ -725,7 +831,7 @@ def test_webhook_ignores_own_bot_message_by_fromid(configured_env, monkeypatch) 
     monkeypatch.setattr(adapter, "handle_message", trapping_handle_message)
 
     async def _go():
-        return await adapter._handle_webhook(request)
+        return await adapter._webhook_server._handle_request(request)
 
     response = asyncio.run(_go())
     assert response.status == 200
@@ -736,7 +842,8 @@ def test_webhook_ignores_own_bot_message_by_fromid(configured_env, monkeypatch) 
 def test_webhook_persists_discovered_robot_id(configured_env, monkeypatch) -> None:
     raw_key, _ = configured_env
     adapter = InfoflowAdapter(_make_config())
-    assert adapter._robot_id == ""
+    assert adapter._serverapi.robot_id == ""
+    assert adapter._bot.robot_id == ""
 
     payload = {
         "message": {
@@ -756,10 +863,11 @@ def test_webhook_persists_discovered_robot_id(configured_env, monkeypatch) -> No
     monkeypatch.setattr(adapter, "handle_message", stub_handle_message)
 
     async def _go():
-        return await adapter._handle_webhook(request)
+        return await adapter._webhook_server._handle_request(request)
 
     asyncio.run(_go())
-    assert adapter._robot_id == "777"
+    assert adapter._serverapi.robot_id == "777"
+    assert adapter._bot.robot_id == "777"
 
 
 # ---------------------------------------------------------------------------
@@ -772,8 +880,6 @@ def test_delete_message_corrects_inbound_id_via_reply_target(
 ) -> None:
     """When LLM passes the inbound message_id and inbound is a quote-reply to a
     bot message, ``delete_message`` swaps in the bot message id automatically."""
-    from hermes_infoflow.adapter import _InboundContext, _register_inbound_context
-
     adapter = InfoflowAdapter(_make_config())
     adapter._sent_store.record("alice", "BOT-MSG", msgseqid="")
 
@@ -816,8 +922,6 @@ def test_delete_message_drops_to_count_one_on_recall_latest_intent(
     configured_env, monkeypatch
 ) -> None:
     """When LLM passes inbound id and the user said '撤回上一条', drop to count=1."""
-    from hermes_infoflow.adapter import _InboundContext, _register_inbound_context
-
     adapter = InfoflowAdapter(_make_config())
     adapter._sent_store.record("alice", "LATEST-BOT-MSG")
 
@@ -874,15 +978,13 @@ def test_delete_message_group_falls_back_via_current_inbound_reply(
     configured_env, monkeypatch
 ) -> None:
     """When message_id is wrong but current_inbound quotes a bot message, recall that bot id."""
-    from hermes_infoflow.adapter import _InboundContext, _register_inbound_context
-
     adapter = InfoflowAdapter(_make_config())
     adapter._sent_store.record(
         "group:42", "BOT999", msgseqid="SEQ-99", digest="joke"
     )
     _register_inbound_context(
         _InboundContext(
-            account_id=adapter._inbound_ctx_account_id(),
+            account_id=adapter._sent_store.account_id,
             target="group:42",
             inbound_message_id="USER123",
             reply_to_bot_message_id="BOT999",
@@ -905,10 +1007,11 @@ def test_delete_message_group_falls_back_via_current_inbound_reply(
     monkeypatch.setattr(_api, "recall_group_message", fake_recall_group)
 
     async def _go():
-        return await adapter.delete_message(
-            "group:42",
-            message_id="HALLUCINATED",
-        )
+        with recall_inbound_message_id_hint_scope("USER123"):
+            return await adapter.delete_message(
+                "group:42",
+                message_id="HALLUCINATED",
+            )
 
     result = asyncio.run(_go())
     assert result.success is True
@@ -921,15 +1024,13 @@ def test_delete_message_group_no_fallback_when_target_mismatches_inbound_ctx(
     configured_env, monkeypatch
 ) -> None:
     """Do not apply reply-to fallback from inbound ctx registered for another chat."""
-    from hermes_infoflow.adapter import _InboundContext, _register_inbound_context
-
     adapter = InfoflowAdapter(_make_config())
     adapter._sent_store.record(
         "group:42", "BOT999", msgseqid="SEQ-99", digest="joke"
     )
     _register_inbound_context(
         _InboundContext(
-            account_id=adapter._inbound_ctx_account_id(),
+            account_id=adapter._sent_store.account_id,
             target="group:OTHER",
             inbound_message_id="USER123",
             reply_to_bot_message_id="BOT999",
@@ -961,19 +1062,13 @@ def test_delete_message_group_falls_back_via_context_hint(
     configured_env, monkeypatch
 ) -> None:
     """ContextVar hint (webhook dispatch) supplies current inbound without tool arg."""
-    from hermes_infoflow.adapter import (
-        _InboundContext,
-        _register_inbound_context,
-        recall_inbound_message_id_hint_scope,
-    )
-
     adapter = InfoflowAdapter(_make_config())
     adapter._sent_store.record(
         "group:42", "BOT999", msgseqid="SEQ-99", digest="joke"
     )
     _register_inbound_context(
         _InboundContext(
-            account_id=adapter._inbound_ctx_account_id(),
+            account_id=adapter._sent_store.account_id,
             target="group:42",
             inbound_message_id="USER123",
             reply_to_bot_message_id="BOT999",
@@ -1024,7 +1119,8 @@ def test_connect_rejects_websocket_mode(configured_env, monkeypatch) -> None:
     # Adapter must surface a clear fatal error (not just a warning).
     # The exact attribute name depends on hermes-agent's base class; we just
     # confirm connect() returned False without spinning up the server.
-    assert adapter._site is None
+    assert adapter._webhook_server.is_running is False
+    assert adapter._http_session is None
 
 
 # ---------------------------------------------------------------------------
@@ -1096,8 +1192,6 @@ def test_delete_message_corrects_without_explicit_current_inbound_id(
     """LLM rarely supplies ``current_inbound_message_id``. The correction must
     fire as long as ``message_id`` itself is a known inbound context id.
     """
-    from hermes_infoflow.adapter import _InboundContext, _register_inbound_context
-
     adapter = InfoflowAdapter(_make_config())
     adapter._sent_store.record("alice", "BOT-MSG-2", msgseqid="")
 

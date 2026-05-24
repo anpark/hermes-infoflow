@@ -5,8 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections.abc import Callable
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
+
+from .llm_format import format_created_time_ms, format_dm_record, format_group_record
 
 if TYPE_CHECKING:
     pass
@@ -113,7 +117,7 @@ RECALL_TOOL_SCHEMA = {
 }
 
 
-def tool_result_json(payload: dict[str, Any]) -> str:
+def tool_result_json(payload: Any) -> str:
     """Serialize a tool handler result for Chat Completions tool messages.
 
     OpenAI-compatible APIs require tool message ``content`` to be a string,
@@ -194,6 +198,73 @@ GROUP_MEMBERS_TOOL_SCHEMA = {
 }
 
 
+# Schema for the agent-callable infoflow_get_message_history tool.
+HISTORY_TOOL_SCHEMA = {
+    "name": "infoflow_get_message_history",
+    "description": (
+        "获取当前如流会话或指定如流会话的历史消息。"
+        "成功和失败都返回 JSON 字符串；成功时是 JSON 数组字符串，"
+        "每项包含 `time` 和 `content`。`content` 与当前 User Message 的"
+        "结构化 envelope 一致，但不包含 Hidden History / Handling Strategy。"
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "target": {
+                "type": "string",
+                "description": (
+                    "可选。目标会话。群聊传 `infoflow:group:<群组ID>` 或 "
+                    "`group:<群组ID>`；私聊传 `infoflow:<user_id>` 或 `<user_id>`。"
+                    "省略时查询当前会话。非 admin 只能查询当前会话。"
+                ),
+            },
+            "start_time": {
+                "type": "string",
+                "description": (
+                    "可选。开始时间，严格格式 `YYYY.MM.DD HH.mm.ss`，"
+                    "例如 `2025.05.21 19.56.59`。按包含计算。"
+                ),
+            },
+            "end_time": {
+                "type": "string",
+                "description": (
+                    "可选。结束时间，严格格式 `YYYY.MM.DD HH.mm.ss`，"
+                    "例如 `2025.05.21 19.56.59`。按包含计算。"
+                ),
+            },
+            "message_id": {
+                "type": "string",
+                "description": (
+                    "可选。按消息 ID 查询单条消息，或作为窗口查询锚点。"
+                    "提供后优先使用 message_id 模式，忽略 start_time/end_time。"
+                ),
+            },
+            "before_count": {
+                "type": "integer",
+                "description": "配合 message_id 使用，返回锚点之前的消息条数。",
+                "minimum": 0,
+                "maximum": 100,
+                "default": 0,
+            },
+            "after_count": {
+                "type": "integer",
+                "description": "配合 message_id 使用，返回锚点之后的消息条数。",
+                "minimum": 0,
+                "maximum": 100,
+                "default": 0,
+            },
+            "limit": {
+                "type": "integer",
+                "description": "时间范围或最近历史查询的最大返回条数，默认 20，最大 100。",
+                "minimum": 1,
+                "maximum": 100,
+                "default": 20,
+            },
+        },
+    },
+}
+
+
 def _serialize_group_members_payload(
     members: list[Any],
     group_id: str,
@@ -235,6 +306,148 @@ def _serialize_group_members_payload(
         payload["source"] = source
     if stale:
         payload["stale"] = True
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# History tool helpers
+# ---------------------------------------------------------------------------
+
+
+_HISTORY_DATETIME_RE = re.compile(
+    r"^\s*(\d{4})\.(\d{2})\.(\d{2}) (\d{2})\.(\d{2})\.(\d{2})\s*$"
+)
+
+
+def _json_error(message: str) -> str:
+    return tool_result_json({"success": False, "error": message})
+
+
+def _clamp_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        n = default
+    return max(minimum, min(maximum, n))
+
+
+def _parse_history_datetime(value: Any) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    match = _HISTORY_DATETIME_RE.match(raw)
+    if not match:
+        return None
+    year, month, day, hour, minute, second = match.groups()
+    try:
+        return datetime(
+            int(year),
+            int(month),
+            int(day),
+            int(hour),
+            int(minute),
+            int(second),
+        )
+    except ValueError:
+        return None
+
+
+def _to_ms(dt: datetime | None) -> int | None:
+    if dt is None:
+        return None
+    return int(dt.timestamp() * 1000)
+
+
+def _history_bounds(args: dict[str, Any]) -> tuple[int | None, int | None, str | None]:
+    start_text = str(args.get("start_time") or "").strip()
+    end_text = str(args.get("end_time") or "").strip()
+
+    if str(args.get("date") or "").strip():
+        return None, None, "date is not supported; use start_time/end_time in YYYY.MM.DD HH.mm.ss format"
+
+    start_dt = _parse_history_datetime(start_text) if start_text else None
+    end_dt = _parse_history_datetime(end_text) if end_text else None
+    if start_text and start_dt is None:
+        return None, None, "start_time must use format YYYY.MM.DD HH.mm.ss"
+    if end_text and end_dt is None:
+        return None, None, "end_time must use format YYYY.MM.DD HH.mm.ss"
+    start_ms = _to_ms(start_dt)
+    end_ms = _to_ms(end_dt)
+    if end_ms is not None:
+        end_ms += 1000
+    return start_ms, end_ms, None
+
+
+def _format_history_time(ms: int) -> str:
+    return format_created_time_ms(ms)
+
+
+def _parse_history_target(target: Any) -> tuple[str, str, str, str] | None:
+    raw = str(target or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("infoflow:"):
+        raw = raw[len("infoflow:"):]
+    if raw.startswith("group:"):
+        group_id = raw[len("group:"):].strip()
+        if not group_id:
+            return None
+        return "group", group_id, "", f"group:{group_id}"
+    if raw.startswith("dm:user:"):
+        user_id = raw[len("dm:user:"):].strip()
+    elif raw.startswith("user:"):
+        user_id = raw[len("user:"):].strip()
+    else:
+        user_id = raw
+    if not user_id:
+        return None
+    return "dm", "", user_id, f"dm:user:{user_id}"
+
+
+def _target_from_record(record: Any) -> tuple[str, str, str, str]:
+    group_id = str(getattr(record, "group_id", "") or "")
+    if group_id:
+        return "group", group_id, "", f"group:{group_id}"
+    peer = str(getattr(record, "peer", "") or "")
+    user_id = peer.removeprefix("user:")
+    return "dm", "", user_id, f"dm:user:{user_id}"
+
+
+def _same_target(a: tuple[str, str, str, str], b: tuple[str, str, str, str]) -> bool:
+    return a[0] == b[0] and a[3] == b[3]
+
+
+def _record_is_admin(record: Any, admin_uid: str) -> bool:
+    admin = str(admin_uid or "").strip().lower()
+    if not admin:
+        return False
+    sender = str(getattr(record, "sender", "") or "").strip().lower()
+    return sender == f"user:{admin}"
+
+
+def _records_to_history_payload(adapter: Any, records: list[Any]) -> list[dict[str, str]]:
+    admin_uid = str(getattr(adapter, "_admin_uid", "") or "")
+    lookup = getattr(adapter, "_participant_name_for_key", None)
+    if not callable(lookup):
+        lookup = None
+    payload: list[dict[str, str]] = []
+    for record in records:
+        if str(getattr(record, "group_id", "") or ""):
+            content = format_group_record(
+                record,
+                sender_name_lookup=lookup,
+                admin_uid=admin_uid,
+            )
+        else:
+            content = format_dm_record(
+                record,
+                sender_name_lookup=lookup,
+                admin_uid=admin_uid,
+            )
+        payload.append({
+            "time": _format_history_time(int(getattr(record, "created_time", 0) or 0)),
+            "content": content,
+        })
     return payload
 
 
@@ -400,6 +613,112 @@ def make_group_members_handler():
             trusted_user_name_lookup=_trusted_user_name_lookup(adapter),
         )
         return tool_result_json(payload)
+
+    return _handler
+
+
+def make_history_handler():
+    """Build the ``infoflow_get_message_history`` tool handler."""
+
+    async def _handler(args: dict, **_kwargs) -> str:
+        adapter = _get_live_adapter()
+        if adapter is None:
+            return _json_error("Infoflow adapter not running — cannot read message history.")
+        store = getattr(adapter, "_message_store", None)
+        if store is None:
+            return _json_error("Infoflow message store is unavailable.")
+
+        from .bot import get_recall_inbound_message_id_hint  # noqa: E402
+
+        current_message_id = get_recall_inbound_message_id_hint() or ""
+        current_record = store.find_any(current_message_id) if current_message_id else None
+        current_target = _target_from_record(current_record) if current_record else None
+        admin_uid = str(getattr(adapter, "_admin_uid", "") or "")
+        current_is_admin = bool(current_record and _record_is_admin(current_record, admin_uid))
+
+        explicit_target = _parse_history_target(args.get("target"))
+        if args.get("target") and explicit_target is None:
+            return _json_error("target must be infoflow:group:<id>, group:<id>, or a user_id")
+
+        message_id = str(args.get("message_id") or "").strip()
+        before_count = _clamp_int(args.get("before_count", 0), 0, 0, 100)
+        after_count = _clamp_int(args.get("after_count", 0), 0, 0, 100)
+        limit = _clamp_int(args.get("limit", 20), 20, 1, 100)
+        start_ms = end_ms = None
+        if not message_id:
+            start_ms, end_ms, bounds_error = _history_bounds(args)
+            if bounds_error:
+                return _json_error(bounds_error)
+            if start_ms is not None and end_ms is not None and end_ms <= start_ms:
+                return _json_error("end_time must be later than start_time")
+
+        target = explicit_target or current_target
+        if target is None and not message_id:
+            return _json_error(
+                "No current Infoflow context. Provide target during an Infoflow turn."
+            )
+        if explicit_target is not None:
+            if current_record is None:
+                return _json_error(
+                    "Current Infoflow message context is required to authorize target access."
+                )
+            if current_target is not None and not _same_target(explicit_target, current_target):
+                if not current_is_admin:
+                    return _json_error("Only admin can query history outside the current conversation.")
+
+        records: list[Any]
+        if message_id:
+            anchor = store.find_any(message_id)
+            if anchor is None:
+                return tool_result_json([])
+            anchor_target = _target_from_record(anchor)
+            if target is not None and not _same_target(anchor_target, target):
+                return _json_error("message_id does not belong to target")
+            if current_target is not None and not _same_target(anchor_target, current_target):
+                if not current_is_admin:
+                    return _json_error("Only admin can query history outside the current conversation.")
+            elif current_record is None:
+                return _json_error(
+                    "Current Infoflow message context is required to authorize message_id lookup."
+                )
+
+            if anchor_target[0] == "group":
+                records = store.group_window_around(
+                    anchor,
+                    before_count=before_count,
+                    after_count=after_count,
+                )
+            else:
+                records = store.dm_window_around(
+                    anchor,
+                    before_count=before_count,
+                    after_count=after_count,
+                )
+            return tool_result_json(_records_to_history_payload(adapter, records))
+
+        assert target is not None
+        kind, group_id, dm_user, _chat_key = target
+        if kind == "group":
+            if start_ms is not None or end_ms is not None:
+                records = store.query_group_range(
+                    group_id,
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                    limit=limit,
+                )
+            else:
+                records = list(reversed(store.recent_group(group_id, limit=limit)))
+        else:
+            if start_ms is not None or end_ms is not None:
+                records = store.query_dm_range(
+                    dm_user,
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                    limit=limit,
+                )
+            else:
+                records = list(reversed(store.recent_dm(dm_user, limit=limit)))
+        return tool_result_json(_records_to_history_payload(adapter, records))
 
     return _handler
 

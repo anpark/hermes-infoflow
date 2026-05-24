@@ -400,7 +400,7 @@ def _trunc(value: Any, limit: int = MAX_TEXT_PREVIEW) -> Any:
     return s
 
 
-_MESSAGE_LINE_RE = re.compile(r"(?m)^\[Message\][ \t]*\r?$")
+_MESSAGE_LINE_RE = re.compile(r"(?m)^\[Message(?::[^\]]*)?\][ \t]*\r?$")
 
 
 def _sessiontracker_user_display_text(value: Any) -> str:

@@ -241,3 +241,49 @@ def test_group_members_update_participants_without_human_names(
     assert bot.name == "helper"
     assert user is not None
     assert user.name == ""
+
+
+def test_history_window_and_context_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ms, "_STATE_BASE_DIR", tmp_path)
+    store = MessageStore(account_id="test-acct")
+    base_time = int(time.time() * 1000)
+
+    for idx, mid in enumerate(("m1", "m2", "m3"), start=1):
+        store.persist_group(
+            message_id=mid,
+            group_id="4507088",
+            sender=f"user:u{idx}",
+            content=f"text {idx}",
+            created_time=base_time + idx,
+        )
+
+    anchor = store.find_group("m2")
+    assert anchor is not None
+    assert [r.message_id for r in store.group_window_around(
+        anchor,
+        before_count=1,
+        after_count=1,
+    )] == ["m1", "m2", "m3"]
+
+    assert store.count_group_between(
+        "4507088",
+        after_created_time=base_time + 1,
+        after_message_id="m1",
+        before_created_time=base_time + 3,
+        before_message_id="m3",
+    ) == 1
+
+    state = store.update_llm_context_state(
+        llm_context_key="agent:main:infoflow:group:4507088:alice",
+        chat_key="group:4507088",
+        message_id="m2",
+        created_time=base_time + 2,
+    )
+    assert state is not None
+    found = store.get_llm_context_state("agent:main:infoflow:group:4507088:alice")
+    assert found is not None
+    assert found.chat_key == "group:4507088"
+    assert found.last_llm_visible_message_id == "m2"
+    assert found.last_llm_visible_created_time == base_time + 2
