@@ -15,6 +15,7 @@ from hermes_infoflow.policy import (
     _FOLLOW_UP_ENGAGED_TEMPLATE,
     _FOLLOW_UP_PASSIVE_TEMPLATE,
     _FOLLOW_UP_REPLY_TO_BOT_CONTEXT_TEMPLATE,
+    _INFOFLOW_TOOL_RULES_DOC,
     _MENTION_PROMPT,
     _PROACTIVE_PROMPT,
     _WATCH_MENTION_PROMPT,
@@ -75,6 +76,13 @@ def test_mention_path_forbids_no_reply() -> None:
     """① @bot path is the one exception: the bot must always reply, even if
     the answer is '暂时帮不上'. The template must explicitly forbid NO_REPLY."""
     assert "不要" in _MENTION_PROMPT and "NO_REPLY" in _MENTION_PROMPT
+
+
+def test_recall_tool_rules_keep_silent_success_contract() -> None:
+    assert "infoflow_recall_message" in _INFOFLOW_TOOL_RULES_DOC
+    assert "NO_REPLY" in _INFOFLOW_TOOL_RULES_DOC
+    assert "其它任务" in _INFOFLOW_TOOL_RULES_DOC
+    assert "撤回失败" in _INFOFLOW_TOOL_RULES_DOC
 
 
 def test_passive_template_keeps_recipient_gate() -> None:

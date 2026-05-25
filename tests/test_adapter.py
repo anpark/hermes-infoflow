@@ -792,6 +792,34 @@ def test_delete_message_by_count_uses_sent_store(configured_env, monkeypatch) ->
     assert captured["msgkey"] == "MID-1"
 
 
+def test_delete_message_marks_recall_success_for_current_turn(
+    configured_env, monkeypatch
+) -> None:
+    adapter = InfoflowAdapter(_make_config())
+    adapter._sent_store.record("alice", "MID-1")
+
+    async def fake_recall_private(account, *, msgkey, session=None):
+        return {"ok": True}
+
+    monkeypatch.setattr(_api, "recall_private_message", fake_recall_private)
+
+    async def _go():
+        token = _inbound_mid.set("IN-1")
+        try:
+            result = await adapter.delete_message("alice", count=1)
+            return result, adapter._recall_silence_tracker().consume_if_suppress(
+                inbound_mid="IN-1",
+                chat_id="alice",
+                text="已撤回",
+            )
+        finally:
+            _inbound_mid.reset(token)
+
+    result, suppressed = asyncio.run(_go())
+    assert result.success is True
+    assert suppressed is True
+
+
 def test_delete_message_with_no_recent_returns_error(configured_env, monkeypatch) -> None:
     adapter = InfoflowAdapter(_make_config())
 
@@ -804,6 +832,79 @@ def test_delete_message_with_no_recent_returns_error(configured_env, monkeypatch
     result = asyncio.run(_go())
     assert result.success is False
     assert "no recent" in (result.error or "")
+
+
+def test_send_suppresses_short_recall_ack_after_success(configured_env) -> None:
+    adapter = InfoflowAdapter(_make_config())
+    adapter._bot.send_message = AsyncMock(
+        return_value=SentResult(success=True, message_id="OUT-1")
+    )
+    adapter._bot.finish_processing_reaction = AsyncMock()
+    adapter._push_infoflow_event = MagicMock()
+
+    async def _go():
+        token = _inbound_mid.set("IN-1")
+        try:
+            adapter._recall_silence_tracker().mark_success(
+                inbound_mid="IN-1",
+                chat_id="alice",
+            )
+            return await adapter.send("alice", "已撤回。")
+        finally:
+            _inbound_mid.reset(token)
+
+    result = asyncio.run(_go())
+
+    assert result.success is True
+    adapter._bot.send_message.assert_not_called()
+    adapter._bot.finish_processing_reaction.assert_awaited_once()
+    event = adapter._push_infoflow_event.call_args.kwargs["extra"]
+    assert event["suppressed_recall_ack"] is True
+
+
+def test_send_keeps_recall_ack_without_success_marker(configured_env) -> None:
+    adapter = InfoflowAdapter(_make_config())
+    adapter._bot.send_message = AsyncMock(
+        return_value=SentResult(success=True, message_id="OUT-1")
+    )
+    adapter._push_infoflow_event = MagicMock()
+
+    async def _go():
+        token = _inbound_mid.set("IN-1")
+        try:
+            return await adapter.send("alice", "已撤回。")
+        finally:
+            _inbound_mid.reset(token)
+
+    result = asyncio.run(_go())
+
+    assert result.success is True
+    adapter._bot.send_message.assert_awaited_once()
+
+
+def test_send_keeps_other_task_text_after_recall_success(configured_env) -> None:
+    adapter = InfoflowAdapter(_make_config())
+    adapter._bot.send_message = AsyncMock(
+        return_value=SentResult(success=True, message_id="OUT-1")
+    )
+    adapter._push_infoflow_event = MagicMock()
+
+    async def _go():
+        token = _inbound_mid.set("IN-1")
+        try:
+            adapter._recall_silence_tracker().mark_success(
+                inbound_mid="IN-1",
+                chat_id="alice",
+            )
+            return await adapter.send("alice", "已撤回。另外，另一个任务结果如下：OK")
+        finally:
+            _inbound_mid.reset(token)
+
+    result = asyncio.run(_go())
+
+    assert result.success is True
+    adapter._bot.send_message.assert_awaited_once()
+    assert adapter._bot.send_message.await_args.kwargs["text"].startswith("已撤回。另外")
 
 
 def test_recall_tool_handler_takes_args_dict(configured_env, monkeypatch) -> None:

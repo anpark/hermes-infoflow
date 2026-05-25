@@ -51,6 +51,7 @@ def test_register_registers_platform_and_tool() -> None:
     assert tool["toolset"] == "hermes-infoflow"
     assert tool["is_async"] is True
     assert tool["schema"]["parameters"]["required"] == ["target"]
+    assert "NO_REPLY" in tool["schema"]["description"]
 
     assert any(t["name"] == "infoflow_get_group_members" for t in ctx.tools)
     members_tool = next(

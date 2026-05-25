@@ -843,7 +843,13 @@ async def recall_group_message(
         headers=headers,
         timeout=aiohttp.ClientTimeout(total=timeout),
     ) as resp:
+        status = resp.status
         text = await resp.text()
+    gw_log().info(
+        "[infoflow:recall_response] group status=%s body=%s",
+        status,
+        text[:1000],
+    )
     return _parse_recall_response(text, kind="group")
 
 
@@ -886,7 +892,13 @@ async def recall_private_message(
         headers=headers,
         timeout=aiohttp.ClientTimeout(total=timeout),
     ) as resp:
+        status = resp.status
         text = await resp.text()
+    gw_log().info(
+        "[infoflow:recall_response] private status=%s body=%s",
+        status,
+        text[:1000],
+    )
     return _parse_recall_response(text, kind="private")
 
 

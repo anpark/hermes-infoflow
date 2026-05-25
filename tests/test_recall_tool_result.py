@@ -69,9 +69,17 @@ def test_recall_handler_success_returns_json_string() -> None:
         result = asyncio.run(handler({"target": "alice", "count": 1}))
 
     assert isinstance(result, str)
-    assert json.loads(result) == {
-        "success": True,
-        "message_id": "1865187797205374754",
+    parsed = json.loads(result)
+    assert parsed["success"] is True
+    assert parsed["action"] == "recall_message"
+    assert parsed["status"] == "recalled"
+    assert parsed["target"] == "alice"
+    assert parsed["count"] == 1
+    assert "error" not in parsed
+    assert parsed["final_response"] == {
+        "mode": "silent_if_only_task",
+        "content": "NO_REPLY",
+        "if_other_tasks": "answer_only_other_tasks_without_recall_confirmation",
     }
 
 
@@ -80,4 +88,11 @@ def test_recall_handler_error_returns_json_string() -> None:
     result = asyncio.run(handler({"count": 1}))
     assert isinstance(result, str)
     parsed = json.loads(result)
-    assert parsed == {"error": "target is required"}
+    assert parsed["success"] is False
+    assert parsed["action"] == "recall_message"
+    assert parsed["status"] == "failed"
+    assert parsed["error"] == "target is required"
+    assert parsed["final_response"] == {
+        "mode": "report_failure",
+        "content": "撤回失败，消息可能已过期。",
+    }

@@ -199,6 +199,7 @@ from .policy import (
     normalize_reply_mode,
 )
 from .recall import get_inbound_body, get_inbound_sender_id, get_inbound_sender_imid
+from .recall_silence import RecallSilenceTracker
 from .sent_store import SentMessageStore
 from .serverapi import ServerAPI
 from .settings import (
@@ -361,6 +362,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
 
         # ── Session dashboard (plugin hooks + infoflow events) ─────
         self._tracker = get_tracker()
+        self._recall_silence = RecallSilenceTracker()
 
         # ── HTTP webhook server (delegated to webhook.py) ──────────
         self._webhook_server = WebhookServer(
@@ -1306,6 +1308,24 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             return chat_id[len("infoflow:"):]
         return chat_id
 
+    def _recall_silence_tracker(self) -> RecallSilenceTracker:
+        tracker = getattr(self, "_recall_silence", None)
+        if tracker is None:
+            tracker = RecallSilenceTracker()
+            self._recall_silence = tracker
+        return tracker
+
+    @staticmethod
+    def _current_inbound_mid() -> str:
+        mid = _inbound_mid.get("")
+        if mid:
+            return mid
+        with contextlib.suppress(Exception):
+            from .bot import get_recall_inbound_message_id_hint
+
+            return get_recall_inbound_message_id_hint() or ""
+        return ""
+
     async def send(
         self,
         chat_id: str,
@@ -1316,6 +1336,40 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         """Send a text/markdown message (Hermes interface → bot layer)."""
         session = self._effective_session(self._http_session)
         kind, group_id, dm_user = self._parse_target(chat_id)
+        inbound_mid = self._current_inbound_mid()
+
+        if self._recall_silence_tracker().consume_if_suppress(
+            inbound_mid=inbound_mid,
+            chat_id=chat_id,
+            text=content,
+        ):
+            gw_log().info(
+                "[iflow:send] mid=%s target=%s suppressed recall ack preview=%r",
+                inbound_mid,
+                chat_id,
+                (content or "")[:80],
+            )
+            await self._bot.finish_processing_reaction(
+                group_id=str(group_id) if group_id is not None else None,
+                dm_user_id=dm_user or None,
+                reaction_message_id=reply_to or inbound_mid or None,
+                reason="recall_ack_suppressed",
+            )
+            self._push_infoflow_event(
+                None,
+                kind="outbound.infoflow",
+                chat_id=chat_id,
+                extra={
+                    "type": "text",
+                    "chars": len(content or ""),
+                    "success": True,
+                    "message_id": "",
+                    "error": "",
+                    "suppressed_recall_ack": True,
+                    "preview": (content or "")[:200],
+                },
+            )
+            return SendResult(success=True)
 
         status_kind = (
             _group_status_redirect_kind(content)
@@ -1630,6 +1684,11 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         )
 
         if result.success:
+            inbound_mid = self._current_inbound_mid()
+            self._recall_silence_tracker().mark_success(
+                inbound_mid=inbound_mid,
+                chat_id=chat_id,
+            )
             return SendResult(success=True)
         return SendResult(success=False, error=result.error, retryable=False)
 
@@ -1788,6 +1847,9 @@ def register(ctx: Any) -> None:
             "它就是你那条消息的 ID\n"
             "- **不要**把用户当前消息本身的 inbound message_id 当作撤回目标——"
             "那是用户发出的消息，你无权撤回\n"
+            "- 撤回成功且用户只要求撤回时，最终输出单独一行 `NO_REPLY`，"
+            "不要输出\"已撤回\"或\"撤回成功\"。若同一条用户消息还有其它任务，"
+            "只回复其它任务结果，不要提及撤回已成功\n"
             "\n"
             "【引用回复】使用 `infoflow_reply` 引用某条消息并附带原文预览。"
             "若省略 `reply_to`，自动引用触发本轮对话的那条用户消息。\n"

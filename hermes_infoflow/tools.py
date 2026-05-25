@@ -92,7 +92,10 @@ RECALL_TOOL_SCHEMA = {
         "（这是被引用消息的 ID，即你的消息；传参时不要带引号）\n"
         "- ❌ 用户当前消息本身的 inbound ID（那是用户的消息，传入会失败）\n\n"
         "典型场景：用户 reply 了你的一条消息说\"撤回这个\"，"
-        "直接从引用标签中取出 message_id 传入即可。"
+        "直接从引用标签中取出 message_id 传入即可。\n\n"
+        "**最终回复规则：**撤回成功且用户只要求撤回时，最终输出必须是单独一行 "
+        "`NO_REPLY`；如果同一条用户消息还要求其它任务，只回复其它任务结果，"
+        "不要说\"已撤回\"或\"撤回成功\"。只有撤回失败时才说明失败。"
     ),
     "parameters": {
         "type": "object",
@@ -126,6 +129,55 @@ def tool_result_json(payload: Any) -> str:
     persists the handler return value as-is.
     """
     return json.dumps(payload, ensure_ascii=False)
+
+
+def recall_tool_success_payload(
+    *,
+    target: str,
+    requested_message_id: str | None,
+    count: int,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "success": True,
+        "action": "recall_message",
+        "status": "recalled",
+        "target": target,
+        "count": count,
+        "final_response": {
+            "mode": "silent_if_only_task",
+            "content": "NO_REPLY",
+            "if_other_tasks": "answer_only_other_tasks_without_recall_confirmation",
+        },
+    }
+    if requested_message_id:
+        payload["requested_message_id"] = str(requested_message_id)
+    return payload
+
+
+def recall_tool_error_payload(
+    error: str,
+    *,
+    target: str | None = None,
+    requested_message_id: str | None = None,
+    count: int | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "success": False,
+        "action": "recall_message",
+        "status": "failed",
+        "error": error,
+        "final_response": {
+            "mode": "report_failure",
+            "content": "撤回失败，消息可能已过期。",
+        },
+    }
+    if target:
+        payload["target"] = target
+    if requested_message_id:
+        payload["requested_message_id"] = str(requested_message_id)
+    if count is not None:
+        payload["count"] = count
+    return payload
 
 
 # Schema for the agent-callable infoflow_reply tool.
@@ -536,8 +588,8 @@ def make_recall_handler():
     """Build the ``infoflow_recall_message`` tool handler.
 
     Resolves the live adapter via the platform registry so we can reach
-    its in-memory ``SentMessageStore``. Returns a JSON string with
-    ``{"error": ...}`` or ``{"success": true, "message_id": ...}``.
+    its in-memory ``SentMessageStore``. Returns a JSON string with explicit
+    success/failure status and final-response guidance for the model.
     """
 
     async def _handler(args: dict, **_kwargs) -> str:
@@ -548,7 +600,11 @@ def make_recall_handler():
         except (TypeError, ValueError):
             count = 1
         if not target:
-            return tool_result_json({"error": "target is required"})
+            return tool_result_json(recall_tool_error_payload(
+                "target is required",
+                requested_message_id=message_id,
+                count=count,
+            ))
 
         # Strip ``infoflow:`` prefix if present (adapter expects raw chat_id).
         if target.startswith("infoflow:"):
@@ -556,11 +612,16 @@ def make_recall_handler():
 
         adapter = _get_live_adapter()
         if adapter is None:
-            return tool_result_json({"error": (
-                "Infoflow adapter not running in this process — cross-process "
-                "recall is only supported with an explicit message_id (use the "
-                "send_message tool's last-known id)."
-            )})
+            return tool_result_json(recall_tool_error_payload(
+                (
+                    "Infoflow adapter not running in this process — cross-process "
+                    "recall is only supported with an explicit message_id (use the "
+                    "send_message tool's last-known id)."
+                ),
+                target=target,
+                requested_message_id=message_id,
+                count=count,
+            ))
 
         result = await _with_temp_session(adapter, adapter.delete_message(
             target,
@@ -568,12 +629,17 @@ def make_recall_handler():
             count=count,
         ))
         if not result.success:
-            return tool_result_json({"error": result.error or "recall failed"})
-        mid = result.message_id
-        return tool_result_json({
-            "success": True,
-            "message_id": str(mid) if mid is not None else None,
-        })
+            return tool_result_json(recall_tool_error_payload(
+                result.error or "recall failed",
+                target=target,
+                requested_message_id=message_id,
+                count=count,
+            ))
+        return tool_result_json(recall_tool_success_payload(
+            target=target,
+            requested_message_id=message_id,
+            count=count,
+        ))
 
     return _handler
 
