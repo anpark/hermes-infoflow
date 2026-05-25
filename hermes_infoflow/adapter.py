@@ -43,6 +43,10 @@ from urllib.parse import urlparse as _urlparse
 _PROGRESS_LINE_RE = re.compile(r"^[┊\s]*[🔍⚙️💻🌐📁📝🧠✨]")
 _GROUP_STATUS_REDIRECT_PREFIXES = (
     "⚡ Interrupting current task",
+    "⚠️ Gateway shutting down",
+    "⚠️ Gateway restarting",
+    "Gateway shutting down",
+    "Gateway restarting",
     "💾 Self-improvement review:",
 )
 _GROUP_STATUS_TRACKER_ONLY_PREFIXES = (

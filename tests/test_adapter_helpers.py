@@ -284,6 +284,13 @@ def test_parse_infoflow_target_thread_always_none() -> None:
     "text",
     [
         "⚡ Interrupting current task. I'll respond to your message shortly.",
+        "⚠️ Gateway shutting down — Your current task will be interrupted.",
+        (
+            "⚠️ Gateway restarting — Your current task will be interrupted. "
+            "Send any message after restart and I'll try to resume where you left off."
+        ),
+        "Gateway shutting down — Your current task will be interrupted.",
+        "Gateway restarting — Your current task will be interrupted.",
         "  💾 Self-improvement review: Memory updated",
     ],
 )

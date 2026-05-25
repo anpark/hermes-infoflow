@@ -1124,8 +1124,19 @@ def test_send_records_bot_reply_for_follow_up(configured_env, monkeypatch) -> No
     assert "42" in adapter._policy.last_reply_at
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        "⚡ Interrupting current task. I'll respond to your message shortly.",
+        "⚠️ Gateway shutting down — Your current task will be interrupted.",
+        (
+            "⚠️ Gateway restarting — Your current task will be interrupted. "
+            "Send any message after restart and I'll try to resume where you left off."
+        ),
+    ],
+)
 def test_group_runtime_status_is_suppressed_and_redirected_to_admin(
-    configured_env, monkeypatch
+    configured_env, monkeypatch, content
 ) -> None:
     monkeypatch.setenv("INFOFLOW_ADMIN_USER", "admin01")
     adapter = InfoflowAdapter(_make_config())
@@ -1138,8 +1149,6 @@ def test_group_runtime_status_is_suppressed_and_redirected_to_admin(
         raise AssertionError("group send must not be called for runtime status")
 
     monkeypatch.setattr(_api, "send_group_message", fake_send_group)
-
-    content = "⚡ Interrupting current task. I'll respond to your message shortly."
 
     async def _go():
         return await adapter.send("group:42", content)
@@ -1168,8 +1177,15 @@ def test_group_runtime_status_is_suppressed_and_redirected_to_admin(
     )
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        "💾 Self-improvement review: Memory updated",
+        "⚠️ Gateway shutting down — Your current task will be interrupted.",
+    ],
+)
 def test_group_runtime_status_suppression_survives_admin_redirect_exception(
-    configured_env, monkeypatch
+    configured_env, monkeypatch, content
 ) -> None:
     monkeypatch.setenv("INFOFLOW_ADMIN_USER", "admin01")
     adapter = InfoflowAdapter(_make_config())
@@ -1182,7 +1198,7 @@ def test_group_runtime_status_suppression_survives_admin_redirect_exception(
     monkeypatch.setattr(_api, "send_group_message", fake_send_group)
 
     async def _go():
-        return await adapter.send("group:42", "💾 Self-improvement review: Memory updated")
+        return await adapter.send("group:42", content)
 
     result = asyncio.run(_go())
 
