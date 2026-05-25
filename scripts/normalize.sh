@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Normalize any hermes-infoflow checkout/plugin dir into the canonical
-# ~/.hermes/plugins/infoflow directory layout, then run deploy-common.sh.
+# ~/.hermes/plugins/infoflow directory layout via the shared deploy.py
+# orchestrator.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

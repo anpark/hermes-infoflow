@@ -8,6 +8,16 @@ versioning (with prerelease suffixes such as `0.1.0b1` for betas).
 
 ## [Unreleased]
 
+### Fixed
+
+- `hermes-infoflow-tools update`, `hermes-infoflow-deploy`, `scripts/deploy.sh`,
+  and normalize installs now share `hermes_infoflow/deploy.py` as the single
+  deployment orchestrator. It aligns `~/.hermes/hermes-agent` to the required
+  `chbo/fix/send-message-plugin-target-routing` fork branch, stashes dirty
+  worktrees, creates a timestamped backup branch before moving local HEADs,
+  and verifies the gateway Python imports `gateway` from that checkout before
+  replacing the Infoflow plugin directory.
+
 ## [2026.5.25] - 2026-05-25
 
 ### Added

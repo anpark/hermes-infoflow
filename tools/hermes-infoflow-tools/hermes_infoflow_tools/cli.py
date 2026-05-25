@@ -16,10 +16,10 @@ Two installation modes:
   Python environment, which could shadow ``~/.hermes/plugins/infoflow``. This
   tool now keeps the Hermes plugin source of truth in the directory plugin.
 
-Both update modes finish by running ``scripts/lib/deploy-common.sh`` to ensure
-``plugins.enabled`` contains ``infoflow``, seed ``INFOFLOW_PORT``, remove
-shadowing entry-point installs from the Hermes runtime when found, and
-optionally restart the gateway.
+Both update modes hand off to ``hermes_infoflow/deploy.py``. That shared
+orchestrator first aligns the local Hermes Agent checkout to the required
+patched fork branch, verifies the gateway Python imports that checkout, then
+normalizes the directory plugin, config, env, and gateway restart.
 
 The ``normalize`` subcommand is for installs created by ``hermes plugins
 install``: it runs the package's ``hermes_infoflow/deploy.py`` in-place so the

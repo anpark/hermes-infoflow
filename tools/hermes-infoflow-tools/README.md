@@ -3,6 +3,11 @@
 CLI helper to install/update the `hermes-infoflow` plugin into a Hermes Agent
 home directory.
 
+Every complete install path first aligns `~/.hermes/hermes-agent` to
+`chbo297/hermes-agent` branch `fix/send-message-plugin-target-routing`, then
+verifies the gateway Python imports `gateway` from that checkout before the
+plugin directory is replaced.
+
 ```bash
 # default: pip download + tar + normalize into ~/.hermes/plugins/infoflow/
 pipx run hermes-infoflow-tools update --version <version>
@@ -26,7 +31,7 @@ pipx run --spec hermes-infoflow-tools==0.2.2b1 hermes-infoflow-tools update --ve
 <!-- /sync:hermes-infoflow-version:beta -->
 
 ```bash
-# compatibility alias; still deploys directory-style to ~/.hermes/plugins/infoflow/
+# deprecated compatibility alias; still deploys directory-style to ~/.hermes/plugins/infoflow/
 pipx run hermes-infoflow-tools update --version <version> --mode pip
 pipx run hermes-infoflow-tools update --version <version> --mode pip --port 9000
 

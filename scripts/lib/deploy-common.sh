@@ -4,9 +4,10 @@
 # Mirrors openclaw-infoflow/scripts/lib/deploy-common.sh in spirit, but
 # replaces the npm/tsc steps with Python + hermes-cli equivalents.
 #
-# Called both by scripts/deploy.sh (local dev) and by
-# tools/hermes-infoflow-tools/hermes_infoflow_tools/cli.py (PyPI installer)
-# AFTER they have already synced the plugin source into $PLUGIN_DIR.
+# Called by hermes_infoflow/deploy.py after that single orchestrator has
+# aligned the required hermes-agent checkout. ``preflight`` runs before the
+# plugin directory is replaced; ``apply`` runs after replacement for config,
+# env, and gateway restart.
 #
 # Required:
 #   --plugin-dir DIR     destination (e.g. ~/.hermes/plugins/infoflow)
@@ -15,6 +16,7 @@
 # Optional:
 #   --port PORT          webhook listen port (writes INFOFLOW_PORT to .env)
 #   --dry-run            print actions; don't mutate anything
+#   --phase PHASE        all / preflight / apply (default: all)
 set -euo pipefail
 
 PLUGIN_DIR=""
@@ -22,11 +24,14 @@ PLUGIN_ID="infoflow"
 CONFIG_FILE="${HOME}/.hermes/config.yaml"
 PORT=""
 DRY_RUN="false"
+PHASE="all"
 DEFAULT_INFOFLOW_PORT=26521
 CANONICAL_PLUGIN_ID="infoflow"
 ENTRYPOINT_PACKAGE="hermes-infoflow"
 ENTRYPOINT_POLICY="${HERMES_INFOFLOW_ENTRYPOINT_POLICY:-uninstall}"
 GATEWAY_RESTART_POLICY="${HERMES_INFOFLOW_GATEWAY_RESTART:-auto}"
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+HERMES_AGENT_DIR="${HERMES_AGENT_DIR:-$HERMES_HOME/hermes-agent}"
 
 validate_port() {
   local value="$1"
@@ -34,6 +39,23 @@ validate_port() {
     echo "✗ --port must be an integer 1-65535 (got: $value)" >&2
     exit 1
   fi
+}
+
+normalize_explicit_gateway_python() {
+  local py="${HERMES_INFOFLOW_GATEWAY_PYTHON:-}"
+  [[ -n "$py" ]] || return 0
+  if [[ "$py" != /* ]]; then
+    if ! py="$(command -v "$py" 2>/dev/null)"; then
+      echo "✗ HERMES_INFOFLOW_GATEWAY_PYTHON is not executable: ${HERMES_INFOFLOW_GATEWAY_PYTHON}" >&2
+      exit 1
+    fi
+  fi
+  if [[ ! -x "$py" ]]; then
+    echo "✗ HERMES_INFOFLOW_GATEWAY_PYTHON is not executable: $py" >&2
+    exit 1
+  fi
+  HERMES_INFOFLOW_GATEWAY_PYTHON="$py"
+  export HERMES_INFOFLOW_GATEWAY_PYTHON
 }
 
 while [[ $# -gt 0 ]]; do
@@ -50,6 +72,14 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --dry-run)      DRY_RUN="true";    shift   ;;
+    --phase)
+      if [[ $# -lt 2 ]]; then
+        echo "✗ --phase requires a value" >&2
+        exit 1
+      fi
+      PHASE="$2"
+      shift 2
+      ;;
     *)
       echo "Unknown argument: $1" >&2
       exit 1
@@ -59,6 +89,14 @@ done
 if [[ -n "$PORT" ]]; then
   validate_port "$PORT"
 fi
+case "$PHASE" in
+  all|preflight|apply) ;;
+  *)
+    echo "✗ --phase must be all, preflight, or apply (got: $PHASE)" >&2
+    exit 1
+    ;;
+esac
+normalize_explicit_gateway_python
 
 if [[ -z "$PLUGIN_DIR" ]]; then
   echo "Missing --plugin-dir" >&2
@@ -71,7 +109,7 @@ if [[ "$PLUGIN_ID" != "$CANONICAL_PLUGIN_ID" ]]; then
   exit 1
 fi
 
-if [[ "$DRY_RUN" != "true" ]]; then
+if [[ "$DRY_RUN" != "true" && "$PHASE" != "preflight" ]]; then
   if [[ ! -d "$PLUGIN_DIR" ]]; then
     echo "Plugin directory does not exist: $PLUGIN_DIR" >&2
     exit 1
@@ -204,6 +242,12 @@ detect_launchd_gateway_python() {
   return 1
 }
 
+detect_explicit_gateway_python() {
+  local py="${HERMES_INFOFLOW_GATEWAY_PYTHON:-}"
+  [[ -n "$py" && -x "$py" ]] || return 1
+  printf '%s\n' "$py"
+}
+
 _add_hermes_linked_python() {
   local py="$1"
   local existing
@@ -302,6 +346,9 @@ collect_candidate_pythons() {
   HERMES_LINKED_PYTHONS=()
 
   local hermes_py
+  if hermes_py="$(detect_explicit_gateway_python)"; then
+    _add_candidate "$hermes_py" 1
+  fi
   if hermes_py="$(detect_launchd_gateway_python)"; then
     _add_candidate "$hermes_py" 1
   fi
@@ -341,6 +388,9 @@ collect_hermes_runtime_pythons() {
   local runtimes=()
   local seen_runtimes=()
 
+  if py="$(detect_explicit_gateway_python 2>/dev/null)"; then
+    runtimes+=("$py")
+  fi
   if py="$(detect_launchd_gateway_python 2>/dev/null)"; then
     runtimes+=("$py")
   fi
@@ -369,6 +419,27 @@ collect_hermes_runtime_pythons() {
       fi
     done
   fi
+}
+
+detect_primary_gateway_python() {
+  local py
+  if py="$(detect_explicit_gateway_python)"; then
+    printf '%s\n' "$py"
+    return 0
+  fi
+  if py="$(detect_launchd_gateway_python)"; then
+    printf '%s\n' "$py"
+    return 0
+  fi
+  if py="$(detect_hermes_python)"; then
+    printf '%s\n' "$py"
+    return 0
+  fi
+  if py="$(detect_pipx_hermes_python)"; then
+    printf '%s\n' "$py"
+    return 0
+  fi
+  return 1
 }
 
 python_infoflow_entrypoint_version() {
@@ -443,31 +514,61 @@ pipx_has_hermes_agent() {
   detect_pipx_hermes_python >/dev/null 2>&1
 }
 
-warn_if_deploy_python_differs_from_hermes() {
+verify_python_uses_patched_agent() {
   local py="$1"
-  local ref="" ref_label=""
-  if ref="$(detect_launchd_gateway_python 2>/dev/null)"; then
-    ref_label="launchd gateway"
-  elif ref="$(detect_pipx_hermes_python 2>/dev/null)"; then
-    ref_label="pipx hermes-agent"
-  elif ref="$(detect_hermes_python 2>/dev/null)"; then
-    ref_label="hermes CLI"
-  else
+  (
+    cd / || exit 1
+    PYTHONPATH= "$py" - "$HERMES_AGENT_DIR" <<'PY'
+from __future__ import annotations
+
+import importlib.util
+import sys
+from pathlib import Path
+
+agent_dir = Path(sys.argv[1]).expanduser().resolve()
+spec = importlib.util.find_spec("gateway")
+if spec is None or spec.origin is None:
+    print("gateway module is not importable")
+    raise SystemExit(2)
+origin = Path(spec.origin).resolve()
+try:
+    origin.relative_to(agent_dir)
+except ValueError:
+    print(f"gateway imports from {origin}, not from required checkout {agent_dir}")
+    raise SystemExit(1)
+print(origin)
+PY
+  )
+}
+
+ensure_python_uses_patched_agent() {
+  local py="$1"
+  echo "==> Verifying Hermes runtime imports patched hermes-agent"
+  if verify_python_uses_patched_agent "$py" >/dev/null; then
+    echo "  - gateway imports from $HERMES_AGENT_DIR"
     return 0
   fi
-  local py_real="$py" ref_real="$ref"
-  if command -v realpath >/dev/null 2>&1; then
-    py_real="$(realpath "$py" 2>/dev/null || echo "$py")"
-    ref_real="$(realpath "$ref" 2>/dev/null || echo "$ref")"
+
+  echo "  - gateway is not imported from $HERMES_AGENT_DIR; installing editable checkout"
+  if ! python_has_pip "$py"; then
+    echo "✗ $py has no working pip; cannot install editable hermes-agent checkout." >&2
+    echo "  Repair pip or set HERMES_INFOFLOW_GATEWAY_PYTHON to the gateway venv Python." >&2
+    return 1
   fi
-  if [[ "$py_real" == "$ref_real" ]]; then
+  echo "$ $py -m pip install -e $HERMES_AGENT_DIR"
+  if [[ "$DRY_RUN" == "true" ]]; then
     return 0
   fi
-  echo "  ⚠ warning: deploy verified deps on: $py" >&2
-  echo "    but $ref_label Python is: $ref" >&2
-  echo "    Gateway loads plugins with the hermes-agent interpreter — if the plugin" >&2
-  echo "    fails at runtime, re-run with:" >&2
-  echo "      PYTHON=\$(pipx environment hermes-agent -P python) bash scripts/deploy.sh" >&2
+  if ! "$py" -m pip install -e "$HERMES_AGENT_DIR"; then
+    echo "✗ failed to install editable hermes-agent checkout into $py" >&2
+    return 1
+  fi
+  if ! verify_python_uses_patched_agent "$py" >/dev/null; then
+    echo "✗ $py still does not import gateway from $HERMES_AGENT_DIR after editable install" >&2
+    verify_python_uses_patched_agent "$py" || true
+    return 1
+  fi
+  echo "  - gateway imports from $HERMES_AGENT_DIR"
 }
 
 print_no_pip_guidance() {
@@ -561,79 +662,40 @@ auto_install_plugin_deps() {
   return 0
 }
 
-pick_install_target() {
-  local py
-  if [[ ${#HERMES_LINKED_PYTHONS[@]} -gt 0 ]]; then
-    printf '%s\n' "${HERMES_LINKED_PYTHONS[0]}"
-    return 0
-  fi
-  if [[ ${#CANDIDATE_PYTHONS[@]} -gt 0 ]]; then
-    for py in "${CANDIDATE_PYTHONS[@]}"; do
-      if python_has_pip "$py"; then
-        printf '%s\n' "$py"
-        return 0
-      fi
-    done
-    printf '%s\n' "${CANDIDATE_PYTHONS[0]}"
-  fi
-}
-
-select_dependency_ready_python() {
-  local candidate
-  if [[ ${#HERMES_LINKED_PYTHONS[@]} -gt 0 ]]; then
-    for candidate in "${HERMES_LINKED_PYTHONS[@]}"; do
-      if python_deps_ok "$candidate"; then
-        printf '%s\n' "$candidate"
-        return 0
-      fi
-    done
-    return 1
-  fi
-
-  for candidate in "${CANDIDATE_PYTHONS[@]}"; do
-    if python_deps_ok "$candidate"; then
-      printf '%s\n' "$candidate"
-      return 0
-    fi
-  done
-  return 1
-}
-
 collect_candidate_pythons
 
+PRIMARY_GATEWAY_PYTHON="$(detect_primary_gateway_python || true)"
 PY=""
 if [[ "$DRY_RUN" == "true" ]]; then
-  PY="${CANDIDATE_PYTHONS[0]:-python3}"
+  PY="${PRIMARY_GATEWAY_PYTHON:-${CANDIDATE_PYTHONS[0]:-python3}}"
   echo "  candidate interpreters: ${CANDIDATE_PYTHONS[*]:-<none>}"
   echo "  hermes-linked interpreters: ${HERMES_LINKED_PYTHONS[*]:-<none>}"
+  echo "  primary gateway interpreter: ${PRIMARY_GATEWAY_PYTHON:-<none>}"
   echo "$ $PY -c <dep-check>"
 else
-  if [[ ${#CANDIDATE_PYTHONS[@]} -gt 0 ]] && PY="$(select_dependency_ready_python)"; then
-    echo "  using interpreter: $PY"
+  if [[ -z "$PRIMARY_GATEWAY_PYTHON" ]]; then
+    echo "✗ Cannot determine the Hermes gateway Python." >&2
+    echo "  hermes-infoflow must run on the patched checkout at $HERMES_AGENT_DIR." >&2
+    echo "  Fixes (any one):" >&2
+    echo "    1) run the deploy from an environment where 'hermes' or launchd gateway is visible" >&2
+    echo "    2) set HERMES_INFOFLOW_GATEWAY_PYTHON=/path/to/hermes-agent/venv/bin/python" >&2
+    exit 1
   fi
 
-  if [[ -z "$PY" ]]; then
-    install_target="$(pick_install_target)"
-    if [[ -n "$install_target" ]] && auto_install_plugin_deps "$install_target"; then
+  PY="$PRIMARY_GATEWAY_PYTHON"
+  echo "  using gateway interpreter: $PY"
+  if ! python_deps_ok "$PY" && [[ "$PHASE" != "apply" ]]; then
+    if auto_install_plugin_deps "$PY"; then
       collect_candidate_pythons
-      if [[ ${#CANDIDATE_PYTHONS[@]} -gt 0 ]] && PY="$(select_dependency_ready_python)"; then
-        echo "  using interpreter after auto-install: $PY"
-      fi
     fi
   fi
 
-  if [[ -z "$PY" ]]; then
-    install_target="${install_target:-$(pick_install_target)}"
-    if [[ -n "${install_target:-}" ]]; then
-      "$install_target" -c "$DEP_CHECK_SCRIPT" || true
-    elif [[ ${#CANDIDATE_PYTHONS[@]} -gt 0 ]]; then
-      "${CANDIDATE_PYTHONS[0]}" -c "$DEP_CHECK_SCRIPT" || true
-    fi
+  if ! python_deps_ok "$PY"; then
+    "$PY" -c "$DEP_CHECK_SCRIPT" || true
     echo
     echo "✗ One or more required Python packages are missing." >&2
     echo "  Required: ${PLUGIN_PIP_PACKAGES[*]}" >&2
-    echo "  Tried interpreters: ${CANDIDATE_PYTHONS[*]:-<none>}" >&2
-    echo "  Hermes-linked interpreters: ${HERMES_LINKED_PYTHONS[*]:-<none>}" >&2
+    echo "  Gateway interpreter: $PY" >&2
     if [[ "$HERMES_DEPLOY_AUTO_PIP" == "0" ]]; then
       echo "  Auto-install was disabled (HERMES_DEPLOY_AUTO_PIP=0)." >&2
     else
@@ -643,31 +705,44 @@ else
     echo "    1) install hermes-agent (recommended — gateway uses its venv):" >&2
     echo "         pipx install hermes-agent" >&2
     echo "    2) point deploy at that Python explicitly:" >&2
-    echo "         PYTHON=\$(pipx environment hermes-agent -P python) bash scripts/deploy.sh" >&2
+    echo "         HERMES_INFOFLOW_GATEWAY_PYTHON=/path/to/hermes-agent/venv/bin/python bash scripts/deploy.sh" >&2
     echo "    3) install manually:" >&2
-    if [[ -n "${install_target:-}" ]]; then
-      if python_has_pip "$install_target"; then
-        echo "         ${install_target} -m pip install ${PLUGIN_PIP_PACKAGES[*]}" >&2
-      else
-        echo "         ${install_target} -m ensurepip --upgrade" >&2
-        echo "         ${install_target} -m pip install ${PLUGIN_PIP_PACKAGES[*]}" >&2
-      fi
+    if python_has_pip "$PY"; then
+      echo "         ${PY} -m pip install ${PLUGIN_PIP_PACKAGES[*]}" >&2
     else
-      echo "         python3 -m pip install --user ${PLUGIN_PIP_PACKAGES[*]}" >&2
+      echo "         ${PY} -m ensurepip --upgrade" >&2
+      echo "         ${PY} -m pip install ${PLUGIN_PIP_PACKAGES[*]}" >&2
     fi
     exit 1
   fi
 
   if [[ -n "$PY" ]]; then
-    warn_if_deploy_python_differs_from_hermes "$PY"
+    if [[ "$PHASE" == "apply" ]]; then
+      echo "==> Verifying Hermes runtime imports patched hermes-agent"
+      if ! verify_python_uses_patched_agent "$PY" >/dev/null; then
+        echo "✗ $PY does not import gateway from $HERMES_AGENT_DIR" >&2
+        verify_python_uses_patched_agent "$PY" || true
+        exit 1
+      fi
+      echo "  - gateway imports from $HERMES_AGENT_DIR"
+    else
+      ensure_python_uses_patched_agent "$PY"
+    fi
   fi
 fi
 
-cleanup_shadowing_entrypoint_installs
+if [[ "$PHASE" == "all" || "$PHASE" == "preflight" ]]; then
+  cleanup_shadowing_entrypoint_installs
+fi
+
+if [[ "$PHASE" == "preflight" ]]; then
+  echo "==> Done (preflight)"
+  exit 0
+fi
 
 echo "==> Enabling plugin in $CONFIG_FILE"
-# Prefer the repo copy (script lives alongside this file) so dry-run on a
-# brand-new install works even before the rsync has actually happened.
+# Prefer the script copy alongside this file so preflight/dry-run can work
+# before a brand-new plugin directory has been replaced.
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EDIT_SCRIPT="$SELF_DIR/edit_hermes_config.py"
 if [[ ! -f "$EDIT_SCRIPT" ]]; then
@@ -683,7 +758,6 @@ if [[ "$DRY_RUN" == "true" ]]; then
 fi
 run_cmd "$PY" "$EDIT_SCRIPT" "${EDIT_ARGS[@]}"
 
-HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 HERMES_ENV_FILE="$HERMES_HOME/.env"
 echo "==> Configuring INFOFLOW_PORT in $HERMES_ENV_FILE"
 EDIT_ENV_SCRIPT="$SELF_DIR/edit_hermes_env.py"

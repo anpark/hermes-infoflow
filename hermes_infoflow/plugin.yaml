@@ -19,12 +19,12 @@
 #   B. ``hermes-infoflow-tools --mode extract`` — unpacks sdist then runs the
 #      same normalizer to flatten ``hermes_infoflow/*`` into the plugin dir root
 #      (overwrites root ``__init__.py`` with the flattened copy).
-#      ``--mode pip`` is a backwards-compatible alias for this directory-style
+#      ``--mode pip`` is a deprecated compatibility alias for this directory-style
 #      deploy, not an entry-point install.
 #   C. ``pip install hermes-infoflow`` + ``hermes-infoflow-deploy`` — copy
 #      the installed package into the same canonical directory layout.
-#   D. ``scripts/deploy.sh`` — rsync flattens ``hermes_infoflow/*`` to the
-#      plugin dir root (same as B-extract).
+#   D. ``scripts/deploy.sh`` — thin wrapper around the same deploy.py
+#      normalizer used by B/C.
 #
 # There is NO ``entry_module`` field hermes-agent reads; pointing at a nested
 # package via the manifest would not help.

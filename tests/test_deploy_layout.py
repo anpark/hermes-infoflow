@@ -34,6 +34,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 _DEPLOY_SCRIPT = _REPO_ROOT / "scripts" / "deploy.sh"
 _DEPLOY_COMMON_SCRIPT = _REPO_ROOT / "scripts" / "lib" / "deploy-common.sh"
 _EDIT_ENV_SCRIPT = _REPO_ROOT / "scripts" / "lib" / "edit_hermes_env.py"
+_AGENT_BRANCH = "fix/send-message-plugin-target-routing"
 
 
 def _expected_package_files() -> set[str]:
@@ -46,9 +47,9 @@ def _expected_package_files() -> set[str]:
     }
 
 
-if shutil.which("rsync") is None or shutil.which("bash") is None:
+if shutil.which("bash") is None or shutil.which("git") is None:
     pytest.skip(
-        "rsync and bash are required for deploy layout tests",
+        "bash and git are required for deploy layout tests",
         allow_module_level=True,
     )
 
@@ -87,16 +88,74 @@ def _deploy_pythonpath() -> str:
     return os.pathsep.join(paths)
 
 
+def _run_git(args: list[str], cwd: Path) -> None:
+    subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _git_stdout(args: list[str], cwd: Path) -> str:
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def _seed_patched_agent_checkout(home: Path) -> tuple[Path, Path]:
+    hermes_home = home / ".hermes"
+    agent_dir = hermes_home / "hermes-agent"
+    remote_dir = hermes_home / "hermes-agent-remote.git"
+    if (agent_dir / ".git").is_dir() and remote_dir.exists():
+        return agent_dir, remote_dir
+
+    seed = hermes_home / "hermes-agent-seed"
+    seed.mkdir(parents=True, exist_ok=True)
+    _run_git(["init"], seed)
+    _run_git(["config", "user.email", "test@example.invalid"], seed)
+    _run_git(["config", "user.name", "Hermes Infoflow Tests"], seed)
+    (seed / "gateway").mkdir()
+    (seed / "gateway" / "__init__.py").write_text(
+        "__version__ = 'patched-test'\n",
+        encoding="utf-8",
+    )
+    _run_git(["add", "gateway/__init__.py"], seed)
+    _run_git(["commit", "-m", "patched agent"], seed)
+    _run_git(["branch", "-M", _AGENT_BRANCH], seed)
+    _run_git(["clone", "--bare", str(seed), str(remote_dir)], hermes_home)
+    _run_git(["clone", str(remote_dir), str(agent_dir)], hermes_home)
+    _run_git(["switch", _AGENT_BRANCH], agent_dir)
+    return agent_dir, remote_dir
+
+
 def _deploy_env(home: Path) -> dict[str, str]:
+    agent_dir, remote_dir = _seed_patched_agent_checkout(home)
+    gateway_python = _write_gateway_python_wrapper(home, agent_dir)
     env = os.environ.copy()
     env["HOME"] = str(home)
     env["PYTHON"] = sys.executable
     env["PATH"] = "/usr/bin:/bin"
     env["HERMES_DEPLOY_AUTO_PIP"] = "0"
+    env["HERMES_AGENT_FORK_URL"] = str(remote_dir)
+    env["HERMES_AGENT_FORK_REMOTE"] = "chbo"
+    env["HERMES_AGENT_FORK_BRANCH"] = _AGENT_BRANCH
+    env["HERMES_INFOFLOW_GATEWAY_PYTHON"] = str(gateway_python)
     pythonpath = _deploy_pythonpath()
+    pythonpath = os.pathsep.join(p for p in (str(agent_dir), pythonpath) if p)
     if pythonpath:
         env["PYTHONPATH"] = pythonpath
     return env
+
+
+def _apply_deploy_env(monkeypatch: pytest.MonkeyPatch, home: Path) -> None:
+    for key, value in _deploy_env(home).items():
+        monkeypatch.setenv(key, value)
 
 
 def _run_deploy(
@@ -132,6 +191,96 @@ def _run_deploy(
 def _write_executable(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
     path.chmod(0o755)
+
+
+def _write_gateway_python_wrapper(home: Path, agent_dir: Path) -> Path:
+    wrapper = home / ".hermes" / "python-test-gateway"
+    wrapper.parent.mkdir(parents=True, exist_ok=True)
+    _write_executable(
+        wrapper,
+        "#!/bin/sh\n"
+        f"REAL_PY={sys.executable!s}\n"
+        "if [ \"$1\" = \"-\" ]; then\n"
+        "  script=\"${TMPDIR:-/tmp}/hermes-infoflow-gateway-python-$$.py\"\n"
+        "  cat > \"$script\"\n"
+        "  if grep -q 'find_spec(\"gateway\")' \"$script\"; then\n"
+        "    if [ -n \"${PYTHONPATH:-}\" ]; then\n"
+        "      printf 'PYTHONPATH leaked into gateway verification\\n'\n"
+        "      rm -f \"$script\"\n"
+        "      exit 1\n"
+        "    fi\n"
+        "    agent_dir=\"$2\"\n"
+        f"    [ -n \"$agent_dir\" ] || agent_dir={agent_dir!s}\n"
+        "    printf '%s/gateway/__init__.py\\n' \"$agent_dir\"\n"
+        "    rm -f \"$script\"\n"
+        "    exit 0\n"
+        "  fi\n"
+        "  \"$REAL_PY\" \"$@\" < \"$script\"\n"
+        "  rc=$?\n"
+        "  rm -f \"$script\"\n"
+        "  exit \"$rc\"\n"
+        "fi\n"
+        "exec \"$REAL_PY\" \"$@\"\n",
+    )
+    return wrapper
+
+
+def _install_fake_git_for_agent_sync(fakebin: Path) -> Path:
+    fakebin.mkdir(parents=True, exist_ok=True)
+    git_log = fakebin.parent / "git.log"
+    _write_executable(
+        fakebin / "git",
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"-C\" ]; then\n"
+        "  repo=\"$2\"\n"
+        "  shift 2\n"
+        "else\n"
+        "  repo=\"\"\n"
+        "fi\n"
+        "state=\"$FAKE_GIT_LOG.state\"\n"
+        "target_branch=\"fix/send-message-plugin-target-routing\"\n"
+        "state_branch() { [ -f \"$state.branch\" ] && cat \"$state.branch\" || printf 'main\\n'; }\n"
+        "state_head() { [ -f \"$state.head\" ] && cat \"$state.head\" || printf 'oldhead\\n'; }\n"
+        "printf 'repo=%s cmd=%s\\n' \"$repo\" \"$*\" >> \"$FAKE_GIT_LOG\"\n"
+        "case \"$1\" in\n"
+        "  status) exit 0 ;;\n"
+        "  stash)\n"
+        "    if [ \"$2\" = \"list\" ]; then printf 'stash@{0}\\n'; fi\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "  rev-parse)\n"
+        "    if [ \"$2\" = \"--is-inside-work-tree\" ]; then printf 'true\\n'; exit 0; fi\n"
+        "    if [ \"$2\" = \"--short\" ]; then printf 'oldhead\\n'; exit 0; fi\n"
+        "    if [ \"$2\" = \"HEAD\" ]; then state_head; exit 0; fi\n"
+        "    printf 'remotehead\\n'\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "  remote)\n"
+        "    if [ \"$2\" = \"get-url\" ]; then exit 1; fi\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "  branch)\n"
+        "    if [ \"$2\" = \"--show-current\" ]; then state_branch; fi\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "  fetch)\n"
+        "    if [ -f \"$FAKE_PLUGIN_MARKER\" ]; then\n"
+        "      printf 'sync_before_replace=yes\\n' >> \"$FAKE_GIT_LOG\"\n"
+        "    else\n"
+        "      printf 'sync_before_replace=no\\n' >> \"$FAKE_GIT_LOG\"\n"
+        "    fi\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "  merge) exit 1 ;;\n"
+        "  switch)\n"
+        "    if [ \"$2\" = \"--detach\" ]; then printf 'remotehead\\n' > \"$state.head\"; printf '\\n' > \"$state.branch\"; fi\n"
+        "    if [ \"$2\" = \"$target_branch\" ]; then printf 'remotehead\\n' > \"$state.head\"; printf '%s\\n' \"$target_branch\" > \"$state.branch\"; fi\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "esac\n"
+        "exit 0\n",
+    )
+    return git_log
 
 
 def _seed_launchd_gateway_plist(home: Path) -> None:
@@ -270,14 +419,8 @@ def test_tools_extract_overwrites_deploy_layout(tmp_path: Path, monkeypatch) -> 
     stale = plugin_dir / "stale_from_deploy_sh.py"
     stale.write_text("# stale\n", encoding="utf-8")
 
-    monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("HERMES_HOME", str(home / ".hermes"))
-    monkeypatch.setenv("PYTHON", sys.executable)
-    monkeypatch.setenv("PATH", "/usr/bin:/bin")
-    monkeypatch.setenv("HERMES_DEPLOY_AUTO_PIP", "0")
-    pythonpath = _deploy_pythonpath()
-    if pythonpath:
-        monkeypatch.setenv("PYTHONPATH", pythonpath)
+    _apply_deploy_env(monkeypatch, home)
 
     from hermes_infoflow_tools import cli
 
@@ -296,6 +439,353 @@ def test_tools_extract_overwrites_deploy_layout(tmp_path: Path, monkeypatch) -> 
     assert (plugin_dir / "__init__.py").is_file()
     assert (plugin_dir / "adapter.py").is_file()
     assert not (plugin_dir / "hermes_infoflow").exists()
+
+
+def test_tools_extract_syncs_hermes_agent_before_replacing_plugin(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    home = tmp_path / "home"
+    hermes_home = home / ".hermes"
+    agent_dir = hermes_home / "hermes-agent"
+    plugin_dir = hermes_home / "plugins" / "infoflow"
+    marker = plugin_dir / "old-plugin-marker.txt"
+    _, remote_dir = _seed_patched_agent_checkout(home)
+    plugin_dir.mkdir(parents=True)
+    marker.write_text("old\n", encoding="utf-8")
+
+    fakebin = tmp_path / "fakebin"
+    git_log = _install_fake_git_for_agent_sync(fakebin)
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _apply_deploy_env(monkeypatch, home)
+    monkeypatch.setenv("PATH", f"{fakebin}:/usr/bin:/bin")
+    monkeypatch.setenv("HERMES_DEPLOY_AUTO_PIP", "0")
+    monkeypatch.setenv("HERMES_INFOFLOW_ENTRYPOINT_POLICY", "keep")
+    monkeypatch.setenv("FAKE_GIT_LOG", str(git_log))
+    monkeypatch.setenv("FAKE_PLUGIN_MARKER", str(marker))
+
+    from hermes_infoflow_tools import cli
+
+    rc = cli.main(
+        [
+            "update",
+            "--package-name",
+            str(_REPO_ROOT),
+            "--mode",
+            "extract",
+        ]
+    )
+
+    assert rc == 0
+    log = git_log.read_text(encoding="utf-8")
+    assert f"repo={agent_dir} cmd=remote add chbo {remote_dir}" in log
+    assert (
+        f"repo={agent_dir} cmd=fetch chbo "
+        "+refs/heads/fix/send-message-plugin-target-routing:"
+        "refs/remotes/chbo/fix/send-message-plugin-target-routing"
+    ) in log
+    assert (
+        f"repo={agent_dir} cmd=switch --detach "
+        "refs/remotes/chbo/fix/send-message-plugin-target-routing"
+    ) in log
+    assert (
+        f"repo={agent_dir} cmd=branch -f fix/send-message-plugin-target-routing "
+        "refs/remotes/chbo/fix/send-message-plugin-target-routing"
+    ) in log
+    assert (
+        f"repo={agent_dir} cmd=switch fix/send-message-plugin-target-routing"
+    ) in log
+    assert "sync_before_replace=yes" in log
+    assert not marker.exists()
+    assert (plugin_dir / "adapter.py").is_file()
+
+
+def test_deploy_fails_closed_before_replace_when_agent_missing(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    plugin_dir = home / ".hermes" / "plugins" / "infoflow"
+    plugin_dir.mkdir(parents=True)
+    marker = plugin_dir / "old-plugin-marker.txt"
+    marker.write_text("old\n", encoding="utf-8")
+
+    env = os.environ.copy()
+    env["HOME"] = str(home)
+    env["PATH"] = "/usr/bin:/bin"
+    env["HERMES_DEPLOY_AUTO_PIP"] = "0"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_REPO_ROOT / "hermes_infoflow" / "deploy.py"),
+            "--source",
+            str(_REPO_ROOT),
+        ],
+        cwd=str(_REPO_ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "requires a patched hermes-agent checkout" in result.stderr
+    assert marker.read_text(encoding="utf-8") == "old\n"
+    assert not (plugin_dir / "adapter.py").exists()
+
+
+def test_deploy_fails_closed_before_replace_when_gateway_python_is_wrong(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    hermes_home = home / ".hermes"
+    plugin_dir = hermes_home / "plugins" / "infoflow"
+    marker = plugin_dir / "old-plugin-marker.txt"
+    _seed_patched_agent_checkout(home)
+    plugin_dir.mkdir(parents=True)
+    marker.write_text("old\n", encoding="utf-8")
+
+    fakebin = tmp_path / "fakebin"
+    fakebin.mkdir()
+    fake_python = fakebin / "python"
+    _write_executable(
+        fake_python,
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"-c\" ]; then exit 0; fi\n"
+        "if [ \"$1\" = \"-m\" ] && [ \"$2\" = \"pip\" ]; then exit 1; fi\n"
+        "printf 'gateway imports from /wrong/gateway/__init__.py\\n'\n"
+        "exit 1\n",
+    )
+
+    env = _deploy_env(home)
+    env["PATH"] = "/usr/bin:/bin"
+    env["HERMES_INFOFLOW_GATEWAY_PYTHON"] = str(fake_python)
+    env["HERMES_INFOFLOW_ENTRYPOINT_POLICY"] = "keep"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_REPO_ROOT / "hermes_infoflow" / "deploy.py"),
+            "--source",
+            str(_REPO_ROOT),
+        ],
+        cwd=str(_REPO_ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "cannot install editable hermes-agent checkout" in result.stderr
+    assert marker.read_text(encoding="utf-8") == "old\n"
+    assert not (plugin_dir / "adapter.py").exists()
+
+
+def test_deploy_common_rejects_invalid_explicit_gateway_python(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    env = _deploy_env(home)
+    env["HERMES_INFOFLOW_GATEWAY_PYTHON"] = str(tmp_path / "missing-python")
+
+    result = subprocess.run(
+        [
+            "bash",
+            str(_DEPLOY_COMMON_SCRIPT),
+            "--plugin-dir",
+            str(home / ".hermes" / "plugins" / "infoflow"),
+            "--config-file",
+            str(home / ".hermes" / "config.yaml"),
+            "--phase",
+            "preflight",
+            "--dry-run",
+        ],
+        cwd=str(_REPO_ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "HERMES_INFOFLOW_GATEWAY_PYTHON is not executable" in result.stderr
+
+
+def test_deploy_common_uses_primary_gateway_python_without_fallback(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    fakebin = tmp_path / "fakebin"
+    fakebin.mkdir()
+    bad_gateway_python = fakebin / "python-launchd"
+    _write_executable(
+        bad_gateway_python,
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"-c\" ]; then printf 'MISSING: cryptography\\n'; exit 1; fi\n"
+        "exit 1\n",
+    )
+    _seed_launchd_gateway_plist(home)
+    _install_fake_launchd_tools(fakebin)
+    _write_executable(
+        fakebin / "pipx",
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"environment\" ] && [ \"$2\" = \"hermes-agent\" ] "
+        "&& [ \"$3\" = \"-P\" ] && [ \"$4\" = \"python\" ]; then\n"
+        f"  printf '%s\\n' {sys.executable!s}\n"
+        "  exit 0\n"
+        "fi\n"
+        "exit 1\n",
+    )
+
+    env = _deploy_env(home)
+    env.pop("HERMES_INFOFLOW_GATEWAY_PYTHON", None)
+    env["PATH"] = f"{fakebin}:/usr/bin:/bin"
+    env["FAKE_HERMES_PYTHON"] = str(bad_gateway_python)
+    env["FAKE_LAUNCHCTL_LOG"] = str(tmp_path / "launchctl.log")
+    env["FAKE_HERMES_LOG"] = str(tmp_path / "hermes.log")
+    env["HERMES_DEPLOY_AUTO_PIP"] = "0"
+    env["HERMES_INFOFLOW_ENTRYPOINT_POLICY"] = "keep"
+
+    result = subprocess.run(
+        [
+            "bash",
+            str(_DEPLOY_COMMON_SCRIPT),
+            "--plugin-dir",
+            str(home / ".hermes" / "plugins" / "infoflow"),
+            "--config-file",
+            str(home / ".hermes" / "config.yaml"),
+            "--phase",
+            "preflight",
+        ],
+        cwd=str(_REPO_ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert f"Gateway interpreter: {bad_gateway_python}" in result.stderr
+    assert f"using gateway interpreter: {bad_gateway_python}" in result.stdout
+    assert f"using gateway interpreter: {sys.executable}" not in result.stdout
+
+
+def test_deploy_common_gateway_verification_clears_pythonpath(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    agent_dir, _ = _seed_patched_agent_checkout(home)
+    env = _deploy_env(home)
+    env["HERMES_INFOFLOW_ENTRYPOINT_POLICY"] = "keep"
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(agent_dir), env.get("PYTHONPATH", "")]
+    )
+
+    result = subprocess.run(
+        [
+            "bash",
+            str(_DEPLOY_COMMON_SCRIPT),
+            "--plugin-dir",
+            str(home / ".hermes" / "plugins" / "infoflow"),
+            "--config-file",
+            str(home / ".hermes" / "config.yaml"),
+            "--phase",
+            "preflight",
+        ],
+        cwd=str(_REPO_ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "PYTHONPATH leaked" not in result.stdout
+    assert "==> Done (preflight)" in result.stdout
+
+
+def test_deploy_saves_dirty_and_local_agent_head_before_aligning(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    agent_dir, _ = _seed_patched_agent_checkout(home)
+    _run_git(["config", "user.email", "test@example.invalid"], agent_dir)
+    _run_git(["config", "user.name", "Hermes Infoflow Tests"], agent_dir)
+
+    gateway_init = agent_dir / "gateway" / "__init__.py"
+    gateway_init.write_text("__version__ = 'local-commit'\n", encoding="utf-8")
+    _run_git(["add", "gateway/__init__.py"], agent_dir)
+    _run_git(["commit", "-m", "local agent commit"], agent_dir)
+    local_commit = _git_stdout(["rev-parse", "HEAD"], agent_dir)
+    (agent_dir / "local-untracked.txt").write_text("keep me\n", encoding="utf-8")
+
+    env = _deploy_env(home)
+    env["HERMES_INFOFLOW_ENTRYPOINT_POLICY"] = "keep"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_REPO_ROOT / "hermes_infoflow" / "deploy.py"),
+            "--source",
+            str(_REPO_ROOT),
+        ],
+        cwd=str(_REPO_ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    remote_head = _git_stdout(
+        ["rev-parse", f"refs/remotes/chbo/{_AGENT_BRANCH}"],
+        agent_dir,
+    )
+    assert _git_stdout(["rev-parse", "HEAD"], agent_dir) == remote_head
+    backup_heads = _git_stdout(
+        [
+            "for-each-ref",
+            "refs/heads/hermes-infoflow/backup",
+            "--format=%(objectname)",
+        ],
+        agent_dir,
+    ).splitlines()
+    assert local_commit in backup_heads
+    stash_subjects = _git_stdout(["stash", "list", "--format=%s"], agent_dir)
+    assert "hermes-infoflow deploy" in stash_subjects
+    assert "saved dirty hermes-agent worktree to stash" in result.stdout
+    assert "saved previous hermes-agent HEAD to branch" in result.stdout
+
+
+def test_deploy_validates_staging_before_touching_agent(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    agent_dir, _ = _seed_patched_agent_checkout(home)
+    bad_source = tmp_path / "bad-source"
+    package_dir = bad_source / "hermes_infoflow"
+    scripts_dir = bad_source / "scripts" / "lib"
+    package_dir.mkdir(parents=True)
+    scripts_dir.mkdir(parents=True)
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (bad_source / "plugin.yaml").write_text("name: infoflow\n", encoding="utf-8")
+    shutil.copy2(_DEPLOY_COMMON_SCRIPT, scripts_dir / "deploy-common.sh")
+
+    before_head = _git_stdout(["rev-parse", "HEAD"], agent_dir)
+    env = _deploy_env(home)
+    env["HERMES_INFOFLOW_ENTRYPOINT_POLICY"] = "keep"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_REPO_ROOT / "hermes_infoflow" / "deploy.py"),
+            "--source",
+            str(bad_source),
+        ],
+        cwd=str(_REPO_ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "staged plugin has no edit_hermes_config.py" in result.stderr
+    assert "Aligning required hermes-agent checkout" not in result.stdout
+    assert _git_stdout(["rev-parse", "HEAD"], agent_dir) == before_head
+    assert not _git_stdout(
+        ["for-each-ref", "refs/heads/hermes-infoflow/backup", "--format=%(refname)"],
+        agent_dir,
+    )
+    assert not _git_stdout(["stash", "list", "--format=%s"], agent_dir)
 
 
 def _seed_plugins_install_layout(plugin_dir: Path) -> None:
@@ -570,8 +1060,10 @@ def test_deploy_auto_restart_uses_launchctl_when_cli_status_fails(
     launchctl_log, hermes_log = _install_fake_launchd_tools(fakebin)
 
     env = _deploy_env(home)
+    gateway_python = env["HERMES_INFOFLOW_GATEWAY_PYTHON"]
+    env.pop("HERMES_INFOFLOW_GATEWAY_PYTHON", None)
     env["PATH"] = f"{fakebin}:/usr/bin:/bin"
-    env["FAKE_HERMES_PYTHON"] = sys.executable
+    env["FAKE_HERMES_PYTHON"] = gateway_python
     env["FAKE_LAUNCHCTL_LOG"] = str(launchctl_log)
     env["FAKE_HERMES_LOG"] = str(hermes_log)
     env["HERMES_INFOFLOW_ENTRYPOINT_POLICY"] = "keep"
@@ -603,9 +1095,11 @@ def test_deploy_common_prefers_launchd_gateway_python_over_python_env(
     (fakebin / "hermes").unlink()
 
     env = _deploy_env(home)
+    gateway_python = env["HERMES_INFOFLOW_GATEWAY_PYTHON"]
+    env.pop("HERMES_INFOFLOW_GATEWAY_PYTHON", None)
     env["PATH"] = f"{fakebin}:/usr/bin:/bin"
     env["PYTHON"] = "/bin/sh"
-    env["FAKE_HERMES_PYTHON"] = sys.executable
+    env["FAKE_HERMES_PYTHON"] = gateway_python
     env["FAKE_LAUNCHCTL_LOG"] = str(tmp_path / "launchctl.log")
     env["FAKE_HERMES_LOG"] = str(tmp_path / "hermes.log")
     env["HERMES_INFOFLOW_ENTRYPOINT_POLICY"] = "keep"
@@ -627,8 +1121,9 @@ def test_deploy_common_prefers_launchd_gateway_python_over_python_env(
     )
 
     assert result.returncode == 0, result.stderr
-    assert f"candidate interpreters: {sys.executable}" in result.stdout
-    assert f"hermes-linked interpreters: {sys.executable}" in result.stdout
+    assert f"candidate interpreters: {gateway_python}" in result.stdout
+    assert f"hermes-linked interpreters: {gateway_python}" in result.stdout
+    assert f"primary gateway interpreter: {gateway_python}" in result.stdout
     assert "hermes-linked interpreters: /bin/sh" not in result.stdout
 
 

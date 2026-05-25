@@ -4,7 +4,7 @@ Baidu Infoflow（如流）Channel 插件 for [Hermes Agent](https://github.com/n
 
 把企业内的 Infoflow 群聊 / 私聊接入 Hermes，机器人可以接收并回复 Markdown / 链接 / 图片消息，支持 @-mention 触发、消息撤回（recall）、cron 定时投递等。本仓库对齐 [openclaw-infoflow](https://github.com/chbo297/openclaw-infoflow) 的发布形态：一个主插件包（`hermes-infoflow`） + 一个独立的安装 CLI（`hermes-infoflow-tools`）+ 与 OpenClaw 同款的 `scripts/deploy.sh` 脚本。
 
-> **Hermes 主仓零改动**：完全靠 hermes-agent 已存在的 4 条插件加载路径接入。
+> **Hermes 主仓不内嵌插件代码**：插件仍通过 hermes-agent 既有插件加载路径接入；在上游修复合入前，完整部署会强制把本机 `~/.hermes/hermes-agent` 对齐到 chbo297 fork 的补丁分支。
 
 ---
 
@@ -27,7 +27,9 @@ Baidu Infoflow（如流）Channel 插件 for [Hermes Agent](https://github.com/n
 
 ## 安装方式与覆盖规则
 
-主推 directory-style：所有推荐路径都使用固定插件 ID `infoflow`，并最终写入同一个目录 `~/.hermes/plugins/infoflow/`。完整部署都会运行同一个归一化步骤：把源码扁平化到插件目录根、写入 `plugin.yaml`、同步 `scripts/`、补齐 `plugins.enabled` / `platform_toolsets.infoflow`，并维护 `~/.hermes/.env` 里的 `INFOFLOW_PORT`。因此 A / B / C / D 可以互相覆盖，最终 Hermes 里看到的插件名、平台名、工具集名都保持一致。
+主推 directory-style：所有推荐路径都使用固定插件 ID `infoflow`，并最终写入同一个目录 `~/.hermes/plugins/infoflow/`。完整部署都会运行同一个归一化步骤：先校验并对齐 `~/.hermes/hermes-agent`，再把源码扁平化到插件目录根、写入 `plugin.yaml`、同步 `scripts/`、补齐 `plugins.enabled` / `platform_toolsets.infoflow`，并维护 `~/.hermes/.env` 里的 `INFOFLOW_PORT`。因此 A / B / C / D 可以互相覆盖，最终 Hermes 里看到的插件名、平台名、工具集名都保持一致。
+
+当前版本硬性要求 gateway runtime 使用补丁版 Hermes Agent：`~/.hermes/hermes-agent` 必须是 git checkout，部署/归一化命令会 fetch `https://github.com/chbo297/hermes-agent.git` 的 `fix/send-message-plugin-target-routing` 分支并对齐到 `chbo/fix/send-message-plugin-target-routing` 最新节点。若 worktree 有本地改动，会自动 `git stash push -u` 并输出 stash 名；若当前 HEAD/分支需要切换，会先创建 `hermes-infoflow/backup/<timestamp>` 备份分支。若 agent 缺失、不是 git repo、fetch/switch 失败，或 gateway Python 不能从该 checkout import `gateway`，部署会在替换插件目录前失败。
 
 旧式 `pip install hermes-infoflow` 只安装 entry-point，不再视为完整部署；完整 pip 部署需要再执行 `hermes-infoflow-deploy`。如果 Hermes runtime 中残留同名 entry-point，归一化步骤默认会尝试移除它，避免遮挡目录插件；可用 `HERMES_INFOFLOW_ENTRYPOINT_POLICY=warn` 只告警，或 `keep` 保留。
 
@@ -105,7 +107,7 @@ pipx run hermes-infoflow-tools update --version <version> --port 9000
 - `--version <ver>`：PyPI 版本号（缺省 `latest`，会被解析为当前正式版）
 - `--index-url <url>`：PyPI 源（默认 `https://pypi.org/simple`）
 - `--mode extract`（默认）：`pip download` sdist → 解包 → normalize 到 `~/.hermes/plugins/infoflow/`；体验对齐 OpenClaw。
-- `--mode pip`：兼容旧命令的别名；现在仍走 directory-style 部署到 `~/.hermes/plugins/infoflow/`，不会再安装 entry point 遮挡目录插件。
+- `--mode pip`：deprecated 兼容别名；现在仍走 directory-style 部署到 `~/.hermes/plugins/infoflow/`，不会再安装 entry point 遮挡目录插件。
 - `--channel-id <id>`：仅接受 `infoflow`；保留参数是为了旧脚本兼容，不能改成其它名字。
 - `--port <PORT>`：Webhook 端口（1–65535），写入 `~/.hermes/.env` 的 `INFOFLOW_PORT`；未传则保留已有值，缺失时写入默认 `26521`（`extract` 与 `pip` 模式均支持）
 - `--dry-run`：仅打印命令
@@ -175,13 +177,13 @@ bash scripts/deploy.sh --dry-run   # 仅打印操作
 bash scripts/deploy.sh --port 9000 # 指定 webhook 端口并写入 ~/.hermes/.env
 ```
 
-`deploy.sh` 会同步插件并自动选择 Python：优先 launchd plist 里的 gateway Python，其次 `hermes` / `pipx` 的 `hermes-agent` venv，再尝试 `PYTHON` / `python3`。若缺少 `cryptography` / `aiohttp` / `pyyaml`，默认会尝试 `pipx inject hermes-agent …` 或对目标解释器 `pip install`（可用 `HERMES_DEPLOY_AUTO_PIP=0` 关闭）。若目标 venv 没有 pip，脚本会提示先用 `ensurepip` 或修复 Hermes agent 环境。历史上的 hermes-agent fork 同步已改为显式 opt-in：只有设置 `HERMES_INFOFLOW_SYNC_AGENT_FORK=1` 时才会执行。
+所有完整部署入口都会先把 `~/.hermes/hermes-agent` 对齐到 `chbo297/hermes-agent` 的 `fix/send-message-plugin-target-routing` 分支最新节点，再同步插件并自动选择 Python：优先显式 `HERMES_INFOFLOW_GATEWAY_PYTHON`，其次 launchd plist 里的 gateway Python，再其次 `hermes` / `pipx` 的 `hermes-agent` venv。若目标 Python 没有从该 checkout import `gateway`，脚本会先尝试 `python -m pip install -e ~/.hermes/hermes-agent`，仍不满足则终止且不替换插件目录。若缺少 `cryptography` / `aiohttp` / `pyyaml` / `Pillow`，默认会尝试 `pipx inject hermes-agent …` 或对目标解释器 `pip install`（可用 `HERMES_DEPLOY_AUTO_PIP=0` 关闭）。若目标 venv 没有 pip，脚本会提示先用 `ensurepip` 或修复 Hermes agent 环境。
 
 部署时还会维护 `~/.hermes/.env` 中的 `INFOFLOW_PORT`：传 `--port` 则写入指定端口；未传时若 `.env` 已有 `INFOFLOW_PORT` 则保留，否则写入默认 `26521`（便于查看当前监听端口）。同时会补齐 `~/.hermes/config.yaml` 里的 `platform_toolsets.infoflow`，让 Infoflow 会话拥有与 CLI 会话一致的基础工具权限，并包含 `hermes-infoflow` 工具集。
 
 > 当前安全取舍：项目初期以使用效率优先，部署脚本会主动给 `platform_toolsets.infoflow` 补齐 CLI 级基础工具权限（如 terminal / file / browser / web / code_execution 等）。`infoflow_get_group_members` 也允许显式传入 `group_id` 查询群成员，暂不强制绑定当前会话群。除非后续安全策略变更，这两点视为当前设计选择，不作为缺陷处理；需要收紧时再引入 allowlist / admin-only / 当前会话限定等策略。
 
-镜像 [`openclaw-infoflow/scripts/deploy.sh`](https://github.com/chbo297/openclaw-infoflow/blob/main/scripts/deploy.sh)。
+`scripts/deploy.sh` 保留 OpenClaw 风格入口，但实现上只是 `hermes_infoflow/deploy.py` 的 thin wrapper；PyPI tools、`hermes-infoflow-deploy`、normalize 和本地开发都共享同一个部署编排。
 
 ---
 
