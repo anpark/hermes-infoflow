@@ -8,8 +8,22 @@ versioning (with prerelease suffixes such as `0.1.0b1` for betas).
 
 ## [Unreleased]
 
+## [2026.5.25] - 2026-05-25
+
 ### Added
 
+- Localhost session dashboard at `/webhook/infoflow/dashboard` for inspecting
+  Infoflow-scoped sessions and agent event streams.
+- Session Tracker Web UI at `/webhook/infoflow/sessiontracker`, including
+  Infoflow-code based lookup, live event polling/streaming, user-line display,
+  and CLI-like tool progress rendering.
+- `infoflow_get_message_history` agent tool and structured message-context
+  formatting so the model can inspect unread/nearby messages before deciding
+  whether and how to reply.
+- `infoflow_get_group_members` agent tool with request coalescing and deploy
+  config setup for the `hermes-infoflow` toolset.
+- Native Infoflow image/media sending for outbound messages and
+  `infoflow_reply`, including local image validation and size handling.
 - `scripts/deploy.sh` and `scripts/lib/deploy-common.sh` accept `--port` to
   set `INFOFLOW_PORT` in `~/.hermes/.env`; without `--port`, an existing
   value is preserved and the default `26521` is seeded only when missing.
@@ -20,15 +34,35 @@ versioning (with prerelease suffixes such as `0.1.0b1` for betas).
 - Deploy / installer config editing now ensures
   `platform_toolsets.infoflow` includes the same baseline tool permissions
   as CLI sessions, including the `hermes-infoflow` toolset.
-- Documented the current efficiency-first security posture: Infoflow sessions
-  intentionally receive CLI-level tool permissions, and
-  `infoflow_get_group_members` intentionally accepts an explicit `group_id`
-  until a stricter policy is introduced.
 
 ### Changed
 
 - Default webhook listen port (`DEFAULT_PORT` / `INFOFLOW_PORT`) is now
   **26521** (was 8646).
+- Directory, pip, tools, and normalize deployment paths now converge on the
+  same canonical `~/.hermes/plugins/infoflow` layout and config edits.
+- LLM-facing Infoflow message formatting now uses clearer structured tags for
+  message metadata, unread context, mentions, and media.
+
+### Fixed
+
+- Session tracker rendering and streaming now deduplicate replayed/interim
+  events, finalize tool streams correctly, and avoid showing injected prompts
+  as user text.
+- Session tracker lookup is more resilient for expired Infoflow codes, stale
+  gateway session bindings, group chat types, and pre-LLM fallback cases.
+- Recall success can now finalize silently where appropriate instead of
+  producing an unnecessary chat reply.
+- Processing/status reactions are more reliable for image and watch-triggered
+  messages.
+- Reply-to-other-bot false positives are reduced during message policy checks.
+
+### Security
+
+- Documented the current efficiency-first security posture: Infoflow sessions
+  intentionally receive CLI-level tool permissions, and
+  `infoflow_get_group_members` intentionally accepts an explicit `group_id`
+  until a stricter policy is introduced.
 
 ## [2026.5.21] - 2026-05-21
 

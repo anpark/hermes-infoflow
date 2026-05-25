@@ -71,9 +71,9 @@ pipx run hermes-infoflow-tools normalize --port 9000
 <!-- sync:hermes-infoflow-version:latest -->
 ```bash
 # 二选一：extract 模式
-pipx run --spec hermes-infoflow-tools==2026.5.21 hermes-infoflow-tools update --version 2026.5.21 --mode extract --port 9000
+pipx run --spec hermes-infoflow-tools==2026.5.25 hermes-infoflow-tools update --version 2026.5.25 --mode extract --port 9000
 # 二选一：pip 兼容别名
-pipx run --spec hermes-infoflow-tools==2026.5.21 hermes-infoflow-tools update --version 2026.5.21 --mode pip --port 9000
+pipx run --spec hermes-infoflow-tools==2026.5.25 hermes-infoflow-tools update --version 2026.5.25 --mode pip --port 9000
 ```
 <!-- /sync:hermes-infoflow-version:latest -->
 
@@ -123,7 +123,7 @@ pipx run hermes-infoflow-tools normalize --port 9000
 
 <!-- sync:hermes-infoflow-version:latest -->
 ```bash
-python -m pip install --upgrade 'hermes-infoflow==2026.5.21'
+python -m pip install --upgrade 'hermes-infoflow==2026.5.25'
 hermes-infoflow-deploy --port 9000
 ```
 <!-- /sync:hermes-infoflow-version:latest -->
@@ -141,7 +141,7 @@ hermes-infoflow-deploy --port 9000
 
 <!-- sync:hermes-infoflow-version:latest -->
 ```bash
-pipx run --spec hermes-infoflow==2026.5.21 hermes-infoflow-deploy --port 9000
+pipx run --spec hermes-infoflow==2026.5.25 hermes-infoflow-deploy --port 9000
 ```
 <!-- /sync:hermes-infoflow-version:latest -->
 
@@ -440,13 +440,17 @@ PyPI 没有 npm 的 dist-tag 概念。我们用 **PEP 440 prerelease** 后缀来
 将下方所有 `<X.Y.Z>` 替换为目标正式版本号（不带 `b/a/rc` 后缀）：
 
 ```bash
-# 1) 改主包 pyproject.toml 的 version 字段
+# 1) 改所有版本位
 hatch version <X.Y.Z>
-# 同步 tools 子包版本（与主包对齐）
 hatch version <X.Y.Z> --pyproject tools/hermes-infoflow-tools/pyproject.toml
+# hatch 只更新 pyproject；还要同步：
+#   plugin.yaml
+#   hermes_infoflow/plugin.yaml
+#   hermes_infoflow/__init__.py
 
 # 2) 同步 README 安装命令版本号
-python scripts/sync_readme_install_version.py
+# 发版前 PyPI 还没有新版本，所以 stable release 要把 latest 指向当前版本。
+python scripts/sync_readme_install_version.py --latest-from-current
 
 # 3) 编辑 CHANGELOG.md 顶部，添加本版本章节
 
@@ -456,7 +460,9 @@ pytest -q
 pytest -q -m integration
 
 # 5) 提交、打 tag、push
-git add pyproject.toml tools/hermes-infoflow-tools/pyproject.toml README.md CHANGELOG.md
+git add pyproject.toml tools/hermes-infoflow-tools/pyproject.toml \
+  plugin.yaml hermes_infoflow/plugin.yaml hermes_infoflow/__init__.py \
+  README.md tools/hermes-infoflow-tools/README.md CHANGELOG.md
 git commit -m "<X.Y.Z>"
 git tag <X.Y.Z>
 git push origin main <X.Y.Z>
@@ -487,9 +493,9 @@ pip install hermes-infoflow==<X.Y.ZbN>           # 显式锁定
 
 <!-- sync:hermes-infoflow-version -->
 ```bash
-hatch version 2026.5.21
-git tag 2026.5.21
-git push origin 2026.5.21
+hatch version 2026.5.25
+git tag 2026.5.25
+git push origin 2026.5.25
 ```
 <!-- /sync:hermes-infoflow-version -->
 

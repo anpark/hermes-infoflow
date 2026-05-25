@@ -889,9 +889,12 @@ def make_history_handler():
                 return _json_error(
                     "Current Infoflow message context is required to authorize target access."
                 )
-            if current_target is not None and not _same_target(explicit_target, current_target):
-                if not current_is_admin:
-                    return _json_error("Only admin can query history outside the current conversation.")
+            if (
+                current_target is not None
+                and not _same_target(explicit_target, current_target)
+                and not current_is_admin
+            ):
+                return _json_error("Only admin can query history outside the current conversation.")
 
         records: list[Any]
         if message_id:

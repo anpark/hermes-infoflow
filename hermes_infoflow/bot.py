@@ -22,6 +22,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .identity import bot_key, private_peer_key, self_key, sender_key, user_key
 from .itypes import (
     IncomingMessage,
     ProcessResult,
@@ -32,16 +33,15 @@ from .itypes import (
     coerce_reply_target,
     reply_target_to_dict,
 )
-from .identity import bot_key, private_peer_key, self_key, sender_key, user_key
 from .message_content import render_message_content
 from .message_store import MessageStore
 from .policy import (
     Action,
     GroupPolicy,
     PolicyDecision,
-    evaluate_inbound,
     _resolve_for_group,
     _watch_regex_match,
+    evaluate_inbound,
 )
 from .reactions import ReactionController, ReactionRunToken
 from .recall import (
@@ -924,9 +924,7 @@ class Bot:
 
         trig = decision.trigger_reason or ""
         eligible = False
-        if trig == "bot-mentioned":
-            eligible = True
-        elif trig.startswith("watchMentions:") or trig.startswith("watchRegex#"):
+        if trig == "bot-mentioned" or trig.startswith("watchMentions:") or trig.startswith("watchRegex#"):
             eligible = True
         elif trig == "followUp":
             if msg.is_reply_to_bot:

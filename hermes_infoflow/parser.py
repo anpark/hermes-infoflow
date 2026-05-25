@@ -416,9 +416,8 @@ def _extract_body_parts(body_items: list[BodyItem]) -> tuple[str, bool, list[str
         elif t in ("REPLYDATA", "REPLY"):
             if item.messageid:
                 has_structural_body = True
-        elif t == "IMAGE":
-            if item.downloadurl:
-                image_urls.append(item.downloadurl)
+        elif t == "IMAGE" and item.downloadurl:
+            image_urls.append(item.downloadurl)
     return ("".join(raw_parts).strip(), has_structural_body, image_urls)
 
 

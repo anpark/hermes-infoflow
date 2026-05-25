@@ -22,6 +22,7 @@ gateway_base = pytest.importorskip("gateway.platforms.base")
 
 from hermes_infoflow import api as _api  # noqa: E402
 from hermes_infoflow import crypto as _crypto  # noqa: E402
+from hermes_infoflow import message_store as ms  # noqa: E402
 from hermes_infoflow.adapter import (  # noqa: E402
     GATEWAY_STARTED_NOTICE,
     InfoflowAdapter,
@@ -29,7 +30,6 @@ from hermes_infoflow.adapter import (  # noqa: E402
     MessageType,
     _inbound_mid,
 )
-from hermes_infoflow import message_store as ms  # noqa: E402
 from hermes_infoflow.bot import recall_inbound_message_id_hint_scope  # noqa: E402
 from hermes_infoflow.itypes import IncomingMessage, RecallResult, SentResult  # noqa: E402
 from hermes_infoflow.llm_format import format_created_time_ms  # noqa: E402

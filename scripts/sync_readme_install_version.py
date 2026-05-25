@@ -6,6 +6,11 @@ adapted for PyPI's lack of dist-tags. We use **PEP 440 prerelease**
 suffixes (e.g. ``0.1.0b1``) to mean "beta", and we ask the PyPI JSON API
 which versions actually exist.
 
+When preparing a stable release tag, pass ``--latest-from-current`` so the
+tagged README advertises the version being released before PyPI has indexed
+it. Without that flag, "latest" intentionally means the latest version already
+visible on PyPI.
+
 The README has three sync markers we maintain:
 
     <!-- sync:hermes-infoflow-version -->
@@ -158,6 +163,15 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Print what would change without writing.",
     )
+    parser.add_argument(
+        "--latest-from-current",
+        action="store_true",
+        help=(
+            "Use the current pyproject.toml version for latest/stable README "
+            "markers instead of fetching the latest version from PyPI. Intended "
+            "for preparing a stable release tag before PyPI contains it."
+        ),
+    )
     args = parser.parse_args(argv)
 
     readmes = [Path(p) for p in args.readme] if args.readme else [
@@ -172,7 +186,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     current = _read_current_version(pyproject)
-    streams = _resolve_streams(args.package)
+    if args.latest_from_current:
+        streams = {"latest": current, "beta": None}
+    else:
+        streams = _resolve_streams(args.package)
     streams["hermes-infoflow-version"] = current  # the "current" stream
 
     touched_any = False

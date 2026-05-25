@@ -173,7 +173,9 @@ except ImportError:
 
 # ── Plugin modules ────────────────────────────────────────────────────
 
+from .bot import Bot  # noqa: E402
 from .dashboard import get_tracker, normalize_chat_id
+from .identity import raw_id_from_key, sender_key
 from .iftools import (
     GROUP_MEMBERS_TOOL_SCHEMA,
     HISTORY_TOOL_SCHEMA,
@@ -185,7 +187,6 @@ from .iftools import (
     make_reply_handler,
 )
 from .itypes import IncomingMessage, ReplyInfo, reply_target_to_dict
-from .identity import raw_id_from_key, sender_key
 from .llm_format import (
     DMAttention,
     GroupAttention,
@@ -195,9 +196,9 @@ from .llm_format import (
     sender_line,
     unread_message_context_line,
 )
+from .media import IMAGE_LOAD_MAX_BYTES, prepare_infoflow_image_bytes
 from .message_content import render_message_content
 from .message_store import MessageStore
-from .media import IMAGE_LOAD_MAX_BYTES, prepare_infoflow_image_bytes
 from .outbound import prepare_outbound_message
 from .policy import (
     _DM_FORMAT_DOC,
@@ -242,7 +243,6 @@ from .utils import (
     gw_log,
 )
 from .webhook import WebhookServer
-from .bot import Bot  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -770,11 +770,9 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         return False
 
     def _is_effective_unread_record(self, chat_key: str, record: Any) -> bool:
-        if self._is_local_plugin_sent_record(chat_key, record):
-            return False
         # External sends through this bot identity have no local send record,
         # so they remain unread context for this plugin.
-        return True
+        return not self._is_local_plugin_sent_record(chat_key, record)
 
     def _unread_message_context_for_event(self, event: Any) -> _UnreadMessageContext:
         current = self._record_for_event(event)

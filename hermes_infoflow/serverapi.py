@@ -24,15 +24,15 @@ import contextlib
 import logging
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, StrEnum
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 
 import aiohttp
 
 from . import api as _api
 from .coerce import coerce_bool
-from .media import prepare_infoflow_image_bytes
 from .itypes import (
     BodyItem,
     GroupMember,
@@ -44,6 +44,7 @@ from .itypes import (
     SentResult,
     coerce_reply_target,
 )
+from .media import prepare_infoflow_image_bytes
 from .utils import _ImageLoadError
 
 if TYPE_CHECKING:

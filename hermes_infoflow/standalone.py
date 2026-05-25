@@ -56,6 +56,7 @@ def _sent_ids(result: SentResult) -> list[tuple[str, str]]:
     for mid, seq in zip(
         tuple(getattr(result, "continuation_message_ids", ()) or ()),
         tuple(getattr(result, "continuation_msgseqids", ()) or ()),
+        strict=False,
     ):
         if mid:
             ids.append((str(mid), str(seq or "")))
