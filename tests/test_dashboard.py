@@ -1024,6 +1024,40 @@ async def test_sse_dedup_when_event_arrives_between_snapshot_and_drain() -> None
 
 
 @pytest.mark.asyncio
+async def test_dashboard_sse_unsubscribes_when_snapshot_write_disconnects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("aiohttp")
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    tr = SessionTracker(buffer_size=50)
+    app = web.Application()
+    register_routes(app, tr, base_path="/webhook/infoflow")
+
+    sid = "dashboard-disconnect"
+    tr.push_event(sid, "session.start", {"model": "t"}, platform="infoflow")
+    tr.push_event(sid, "display.tool_line", {"line": "first"}, platform="infoflow")
+    calls: list[str] = []
+
+    async def _disconnecting_write_sse(*args: object, **kwargs: object) -> bool:
+        calls.append(str(kwargs.get("context") or ""))
+        return False
+
+    monkeypatch.setattr("hermes_infoflow.dashboard.write_sse", _disconnecting_write_sse)
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get(
+            f"/webhook/infoflow/dashboard/api/sessions/{sid}/events?cursor=0"
+        )
+        assert resp.status == 200
+        await resp.read()
+
+    assert sid not in tr._subscribers  # noqa: SLF001
+    assert calls == ["dashboard snapshot"]
+
+
+@pytest.mark.asyncio
 async def test_dashboard_routes_localhost_only() -> None:
     pytest.importorskip("aiohttp")
     from aiohttp import web

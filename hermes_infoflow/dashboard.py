@@ -21,6 +21,13 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from .sse import (
+    SSE_HEARTBEAT,
+    SSE_HEARTBEAT_INTERVAL_SECONDS,
+    SSE_RESPONSE_HEADERS,
+    write_sse,
+)
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_EVENT_BUFFER = 2000
@@ -1317,9 +1324,8 @@ def register_routes(app: Any, tracker: SessionTracker, *, base_path: str) -> Non
             return web.Response(status=404, text="session not found")
 
         cursor = int(request.rel_url.query.get("cursor", "0") or "0")
-        from .sessiontracker import _SSE_RESPONSE_HEADERS
 
-        response = web.StreamResponse(status=200, headers=_SSE_RESPONSE_HEADERS)
+        response = web.StreamResponse(status=200, headers=SSE_RESPONSE_HEADERS)
         await response.prepare(request)
 
         # Subscribe BEFORE building the snapshot so events that arrive
@@ -1335,15 +1341,30 @@ def register_routes(app: Any, tracker: SessionTracker, *, base_path: str) -> Non
                     ensure_ascii=False,
                     default=str,
                 )
-                await response.write(f"event: snapshot\ndata: {snap}\n\n".encode())
+                if not await write_sse(
+                    response,
+                    f"event: snapshot\ndata: {snap}\n\n".encode(),
+                    logger=logger,
+                    context="dashboard snapshot",
+                ):
+                    return response
                 for ev in detail["events"]:
                     cursor = max(cursor, int(ev.get("seq", 0)))
 
             while True:
                 try:
-                    ev = await asyncio.wait_for(q.get(), timeout=25.0)
+                    ev = await asyncio.wait_for(
+                        q.get(),
+                        timeout=SSE_HEARTBEAT_INTERVAL_SECONDS,
+                    )
                 except TimeoutError:
-                    await response.write(b": heartbeat\n\n")
+                    if not await write_sse(
+                        response,
+                        SSE_HEARTBEAT,
+                        logger=logger,
+                        context="dashboard heartbeat",
+                    ):
+                        break
                     continue
                 if ev is None:
                     break
@@ -1351,7 +1372,13 @@ def register_routes(app: Any, tracker: SessionTracker, *, base_path: str) -> Non
                     continue
                 cursor = ev.seq
                 payload = json.dumps(ev.to_dict(), ensure_ascii=False, default=str)
-                await response.write(f"data: {payload}\n\n".encode())
+                if not await write_sse(
+                    response,
+                    f"data: {payload}\n\n".encode(),
+                    logger=logger,
+                    context="dashboard live",
+                ):
+                    break
         finally:
             tracker.unsubscribe(sid, q)
 

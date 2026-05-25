@@ -21,16 +21,16 @@ from .dashboard import (
     sessiontracker_full_user_message_enabled,
 )
 from .settings import DEFAULT_API_HOST
+from .sse import (
+    SSE_HEARTBEAT,
+    SSE_HEARTBEAT_INTERVAL_SECONDS,
+    SSE_RESPONSE_HEADERS,
+    write_sse,
+)
 
 logger = logging.getLogger(__name__)
 
-# Headers for nginx (and other reverse proxies) to stream SSE without buffering.
-_SSE_RESPONSE_HEADERS = {
-    "Content-Type": "text/event-stream; charset=utf-8",
-    "Cache-Control": "no-cache, no-transform",
-    "Connection": "keep-alive",
-    "X-Accel-Buffering": "no",
-}
+_SSE_RESPONSE_HEADERS = SSE_RESPONSE_HEADERS
 
 TERMINAL_EVENT_KINDS = frozenset({
     "display.user",
@@ -943,7 +943,7 @@ def register_sessiontracker_routes(
         except ValueError as exc:
             return web.Response(status=400, text=str(exc))
 
-        response = web.StreamResponse(status=200, headers=_SSE_RESPONSE_HEADERS)
+        response = web.StreamResponse(status=200, headers=SSE_RESPONSE_HEADERS)
         await response.prepare(request)
 
         # Subscribe BEFORE backfill so events that arrive between the snapshot
@@ -960,13 +960,28 @@ def register_sessiontracker_routes(
             ):
                 seq_cursor = max(seq_cursor, int(block.get("seq", 0)))
                 payload = json.dumps(block, ensure_ascii=False, default=str)
-                await response.write(f"data: {payload}\n\n".encode())
+                if not await write_sse(
+                    response,
+                    f"data: {payload}\n\n".encode(),
+                    logger=logger,
+                    context="sessiontracker backfill",
+                ):
+                    return response
 
             while True:
                 try:
-                    ev = await asyncio.wait_for(q.get(), timeout=25.0)
+                    ev = await asyncio.wait_for(
+                        q.get(),
+                        timeout=SSE_HEARTBEAT_INTERVAL_SECONDS,
+                    )
                 except TimeoutError:
-                    await response.write(b": heartbeat\n\n")
+                    if not await write_sse(
+                        response,
+                        SSE_HEARTBEAT,
+                        logger=logger,
+                        context="sessiontracker heartbeat",
+                    ):
+                        break
                     continue
                 if ev is None:
                     break
@@ -982,7 +997,13 @@ def register_sessiontracker_routes(
                     continue
                 seq_cursor = ev.seq
                 payload = json.dumps(block, ensure_ascii=False, default=str)
-                await response.write(f"data: {payload}\n\n".encode())
+                if not await write_sse(
+                    response,
+                    f"data: {payload}\n\n".encode(),
+                    logger=logger,
+                    context="sessiontracker live",
+                ):
+                    break
         finally:
             tracker.unsubscribe(sid, q)
         return response

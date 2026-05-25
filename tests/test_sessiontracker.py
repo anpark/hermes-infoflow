@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -458,6 +459,65 @@ async def test_sessiontracker_routes_resolve_and_stream() -> None:
             "?session_id=st-sess&chatType=6&chatId=999",
         )
         assert resp.status == 403
+
+
+async def test_sessiontracker_stream_unsubscribes_when_live_write_disconnects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("aiohttp")
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    tr = SessionTracker(buffer_size=50)
+    sid = "st-disconnect"
+    tr.push_event(
+        sid,
+        "session.start",
+        {"model": "t"},
+        platform="infoflow",
+        chat_id="group:1",
+    )
+    app = web.Application()
+    register_sessiontracker_routes(app, tr, base_path="/webhook/infoflow")
+
+    calls: list[str] = []
+
+    async def _disconnecting_write_sse(*args: object, **kwargs: object) -> bool:
+        calls.append(str(kwargs.get("context") or ""))
+        return False
+
+    monkeypatch.setattr(
+        "hermes_infoflow.sessiontracker.write_sse",
+        _disconnecting_write_sse,
+    )
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get(
+            f"/webhook/infoflow/sessiontracker/api/stream"
+            f"?session_id={sid}&chatType=6&chatId=1",
+        )
+        assert resp.status == 200
+
+        for _ in range(20):
+            if sid in tr._subscribers:  # noqa: SLF001
+                break
+            await asyncio.sleep(0.01)
+        assert sid in tr._subscribers  # noqa: SLF001
+
+        tr.push_event(
+            sid,
+            "display.tool_line",
+            {"line": "late"},
+            platform="infoflow",
+            chat_id="group:1",
+        )
+        for _ in range(20):
+            if sid not in tr._subscribers:  # noqa: SLF001
+                break
+            await asyncio.sleep(0.01)
+
+        assert sid not in tr._subscribers  # noqa: SLF001
+        assert calls == ["sessiontracker live"]
+        resp.close()
 
 
 async def test_sessiontracker_history_full_user_message_requires_admin_viewer_code(
