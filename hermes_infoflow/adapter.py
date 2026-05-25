@@ -138,6 +138,12 @@ def _make_send_result(*, success: bool, message_id: str = "", error: str = "", r
         kwargs.pop("continuation_message_ids", None)
         return SendResult(**kwargs)
 
+
+def _metadata_reply_type(metadata: dict[str, Any] | None) -> str:
+    raw = str((metadata or {}).get("reply_type") or (metadata or {}).get("replytype") or "1")
+    return raw if raw in {"1", "2"} else "1"
+
+
 # ── Context var: propagate inbound mid → send() for tracing ────
 _inbound_mid: contextvars.ContextVar[str] = contextvars.ContextVar("inbound_mid", default="")
 
@@ -1431,6 +1437,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 reply_info = ReplyInfo(
                     message_id=reply_to,
                     preview=body[:MAX_PREVIEW_LENGTH],
+                    replytype=_metadata_reply_type(metadata),
                     sender_imid=get_inbound_sender_imid(reply_to),
                     sender_id=get_inbound_sender_id(reply_to),
                 )
@@ -1604,6 +1611,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 reply_info = ReplyInfo(
                     message_id=reply_to,
                     preview=body[:MAX_PREVIEW_LENGTH],
+                    replytype=_metadata_reply_type(metadata),
                     sender_imid=get_inbound_sender_imid(reply_to),
                     sender_id=get_inbound_sender_id(reply_to),
                 )
@@ -1908,6 +1916,14 @@ def register(ctx: Any) -> None:
             "- 群聊：`infoflow:group:<群组ID>`（如 `infoflow:group:4507088`）\n"
             "- 省略 target 则发送到当前会话\n"
             "\n"
+            "【发送图片】\n"
+            "需要发送本地/生成图片时，先把图片保存到 `~/.hermes/cache/images/` "
+            "或 `~/.hermes/image_cache/`，然后在发送内容中写 "
+            "`MEDIA:<本地图片绝对路径>`。如流插件会读取图片字节并调用原生图片消息 API；"
+            "绝不要把 `MEDIA:` 或本地路径当普通文本发送给用户。"
+            "普通图片发送使用 `send_message`；需要引用回复时使用 `infoflow_reply`，"
+            "把说明文字和 `MEDIA:<路径>` 一起放入 `message`。\n"
+            "\n"
             "【@提及】群聊中两种方式均可：\n"
             "① 直接在消息文本中写 `@uuapName`（人）、"
             "`@机器人显示名` 或 `@agentId`（机器人）、"
@@ -1947,7 +1963,9 @@ def register(ctx: Any) -> None:
             "只回复其它任务结果，不要提及撤回已成功\n"
             "\n"
             "【引用回复】使用 `infoflow_reply` 引用某条消息并附带原文预览。"
-            "若省略 `reply_to`，自动引用触发本轮对话的那条用户消息。\n"
+            "若省略 `reply_to`，自动引用触发本轮对话的那条用户消息。"
+            "引用回复图片时在 `message` 内包含 `MEDIA:<本地图片绝对路径>`，"
+            "不要发送路径正文。\n"
             "\n"
             "【群成员】使用 `infoflow_get_group_members` 查询群成员列表（人类与机器人），"
             "便于在 @ 提及前确认 user_id、agent_id 或机器人显示名。\n"

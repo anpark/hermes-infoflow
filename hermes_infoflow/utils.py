@@ -61,7 +61,12 @@ def _csv_env(name: str) -> list[str]:
 
 def _allowed_media_roots() -> list[Path]:
     """Directories we'll accept ``file://`` outbound images from."""
+    hermes_home = Path(os.getenv("HERMES_HOME") or (Path.home() / ".hermes"))
     roots = [
+        hermes_home / "cache" / "images",
+        hermes_home / "cache" / "screenshots",
+        hermes_home / "image_cache",
+        hermes_home / "browser_screenshots",
         Path.home() / ".hermes" / "media",
         Path(tempfile.gettempdir()),
         Path("/tmp"),

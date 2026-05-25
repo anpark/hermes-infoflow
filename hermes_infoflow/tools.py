@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 from collections.abc import Callable
 from datetime import datetime
@@ -187,6 +188,9 @@ REPLY_TOOL_SCHEMA = {
         "引用回复如流中的某条消息，回复内容会附带原消息的文本预览。"
         "与普通 `send_message` 的区别在于：这里发出的消息会显示"
         "「引用了某条消息」的卡片样式。\n\n"
+        "发送本地图片时，可在 `message` 中加入 `MEDIA:<本地图片绝对路径>`；"
+        "工具会读取图片字节并调用如流原生图片消息 API，不会把本地路径作为正文发出。"
+        "不要把 `MEDIA:` 或本地文件路径当普通文本发送。\n\n"
         "使用场景：\n"
         "- 需要针对特定历史消息进行回应时\n"
         "- 需要让对方明确知道你在回复哪条消息时\n\n"
@@ -204,7 +208,10 @@ REPLY_TOOL_SCHEMA = {
             },
             "message": {
                 "type": "string",
-                "description": "回复的消息正文内容，支持 Markdown",
+                "description": (
+                    "回复的消息正文内容，支持 Markdown。需要发送本地图片时追加 "
+                    "`MEDIA:<本地图片绝对路径>`；工具会按图片字节发送，不会发送路径文本。"
+                ),
             },
             "reply_to": {
                 "type": "string",
@@ -378,6 +385,140 @@ _HISTORY_DATETIME_RE = re.compile(
 
 def _json_error(message: str) -> str:
     return tool_result_json({"success": False, "error": message})
+
+
+_MEDIA_DIRECTIVE_RE = re.compile(
+    r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|[^\s`"']+)[`"']?'''
+)
+
+
+def _strip_media_directives(text: str) -> str:
+    cleaned = _MEDIA_DIRECTIVE_RE.sub("", text)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _extract_reply_media(message: str) -> tuple[list[tuple[str, bool]], str, bool]:
+    """Extract media paths from an infoflow_reply body.
+
+    Returns ``(media_files, cleaned_text, malformed_media_directive)``. Any
+    ``MEDIA:`` text must be consumed or rejected so local paths cannot leak as
+    markdown if Hermes' full extractor is unavailable or cannot parse it.
+    """
+    if "MEDIA:" not in message:
+        return [], message, False
+
+    try:
+        from gateway.platforms.base import BasePlatformAdapter  # type: ignore[import-not-found]
+
+        media_files, cleaned = BasePlatformAdapter.extract_media(message)
+    except Exception:
+        media_files = []
+        has_voice_tag = "[[audio_as_voice]]" in message
+        cleaned = message.replace("[[audio_as_voice]]", "").replace("[[as_document]]", "")
+        for match in _MEDIA_DIRECTIVE_RE.finditer(message):
+            path = match.group("path").strip()
+            if len(path) >= 2 and path[0] == path[-1] and path[0] in "`\"'":
+                path = path[1:-1].strip()
+            path = path.lstrip("`\"'").rstrip("`\"',.;:)}]")
+            if path:
+                media_files.append((os.path.expanduser(path), has_voice_tag))
+        cleaned = _strip_media_directives(cleaned) if media_files else cleaned
+
+    cleaned = _strip_media_directives(cleaned) if "MEDIA:" in cleaned else cleaned.strip()
+    malformed = "MEDIA:" in message and not media_files
+    return media_files, cleaned, malformed
+
+
+def _sanitize_media_error(error: Any, media_files: list[tuple[str, bool]]) -> str:
+    text = str(error or "image reply failed")
+    for raw_path, _is_voice in media_files:
+        raw = str(raw_path or "")
+        if raw:
+            text = text.replace(raw, "[local image path]")
+            text = text.replace(os.path.expanduser(raw), "[local image path]")
+    if "MEDIA:" in text:
+        text = _MEDIA_DIRECTIVE_RE.sub("MEDIA:[local image path]", text)
+    return text
+
+
+async def _preflight_reply_media(adapter: Any, media_files: list[tuple[str, bool]]) -> str | None:
+    load_image_bytes = getattr(adapter, "_load_image_bytes", None)
+    if not callable(load_image_bytes):
+        return None
+
+    from .media import prepare_infoflow_image_bytes  # noqa: E402
+    from .utils import _ImageLoadError  # noqa: E402
+
+    for media_path, is_voice in media_files:
+        if is_voice:
+            return "infoflow_reply only supports image MEDIA attachments"
+        try:
+            raw = await load_image_bytes(str(media_path))
+            prepare_infoflow_image_bytes(raw)
+        except _ImageLoadError as exc:
+            return _sanitize_media_error(exc, media_files)
+        except Exception as exc:
+            return _sanitize_media_error(exc, media_files)
+    return None
+
+
+async def _send_reply_media(
+    *,
+    adapter: Any,
+    target: str,
+    message: str,
+    reply_to: str,
+    reply_type: str,
+) -> str | None:
+    media_files, cleaned_message, malformed_media = _extract_reply_media(message)
+    if malformed_media:
+        return tool_result_json({
+            "error": (
+                "MEDIA directive must point to a supported local image path; "
+                "not sending local path text"
+            )
+        })
+    if not media_files:
+        return None
+
+    preflight_error = await _preflight_reply_media(adapter, media_files)
+    if preflight_error:
+        return tool_result_json({"error": preflight_error})
+
+    sent_ids: list[str] = []
+    last_message_id: str | None = None
+    for index, (media_path, _is_voice) in enumerate(media_files):
+        caption = cleaned_message if index == 0 and cleaned_message else None
+        result = await _with_temp_session(adapter, adapter.send_image_file(
+            chat_id=target,
+            image_path=str(media_path),
+            caption=caption,
+            reply_to=reply_to,
+            metadata={"reply_type": reply_type},
+        ))
+        if not result.success:
+            return tool_result_json({
+                "error": _sanitize_media_error(
+                    result.error or "image reply failed",
+                    media_files,
+                )
+            })
+        for mid in tuple(getattr(result, "continuation_message_ids", ()) or ()):
+            if mid:
+                sent_ids.append(str(mid))
+        if result.message_id:
+            last_message_id = str(result.message_id)
+            sent_ids.append(last_message_id)
+
+    payload: dict[str, Any] = {
+        "success": True,
+        "message_id": last_message_id,
+        "media_count": len(media_files),
+    }
+    if sent_ids:
+        payload["message_ids"] = sent_ids
+    return tool_result_json(payload)
 
 
 def _clamp_int(value: Any, default: int, minimum: int, maximum: int) -> int:
@@ -566,6 +707,16 @@ def make_reply_handler():
         # Strip ``infoflow:`` prefix if present (adapter expects raw chat_id).
         if target.startswith("infoflow:"):
             target = target[len("infoflow:"):]
+
+        media_result = await _send_reply_media(
+            adapter=adapter,
+            target=target,
+            message=message,
+            reply_to=reply_to,
+            reply_type=reply_type,
+        )
+        if media_result is not None:
+            return media_result
 
         result = await _with_temp_session(adapter, adapter.send(
             chat_id=target,
