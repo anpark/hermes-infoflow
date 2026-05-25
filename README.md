@@ -68,14 +68,14 @@ pipx run hermes-infoflow-tools normalize --port 9000
 
 > 推荐用 `pipx run` 或 `uvx`，免去全局污染。
 
-正式版（stable，固定 tools 包版本 + 固定插件包版本）：
+正式版（stable，固定 tools 包版本 + 固定插件包版本；刚发布时建议带 `--no-cache` 避免 pipx/uv 旧缓存）：
 
 <!-- sync:hermes-infoflow-version:latest -->
 ```bash
 # 二选一：extract 模式
-pipx run --spec hermes-infoflow-tools==2026.5.26 hermes-infoflow-tools update --version 2026.5.26 --mode extract --port 9000
+pipx run --no-cache --spec hermes-infoflow-tools==2026.5.26 hermes-infoflow-tools update --version 2026.5.26 --mode extract --port 9000
 # 二选一：pip 兼容别名
-pipx run --spec hermes-infoflow-tools==2026.5.26 hermes-infoflow-tools update --version 2026.5.26 --mode pip --port 9000
+pipx run --no-cache --spec hermes-infoflow-tools==2026.5.26 hermes-infoflow-tools update --version 2026.5.26 --mode pip --port 9000
 ```
 <!-- /sync:hermes-infoflow-version:latest -->
 
@@ -143,7 +143,7 @@ hermes-infoflow-deploy --port 9000
 
 <!-- sync:hermes-infoflow-version:latest -->
 ```bash
-pipx run --spec hermes-infoflow==2026.5.26 hermes-infoflow-deploy --port 9000
+pipx run --no-cache --spec hermes-infoflow==2026.5.26 hermes-infoflow-deploy --port 9000
 ```
 <!-- /sync:hermes-infoflow-version:latest -->
 
@@ -512,6 +512,7 @@ curl -s https://pypi.org/pypi/hermes-infoflow/json | python -m json.tool | head 
 
 # 2) 强制忽略本地缓存重拉
 pip install --no-cache-dir --force-reinstall --upgrade hermes-infoflow==<version>
+pipx run --no-cache --spec hermes-infoflow-tools==<version> hermes-infoflow-tools update --version <version> --mode extract --port 9000
 
 # 3) 看 GH Actions publish job 是否真的成功了
 gh run list --workflow publish.yml --limit 3

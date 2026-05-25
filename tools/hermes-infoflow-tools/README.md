@@ -14,11 +14,12 @@ pipx run hermes-infoflow-tools update --version <version>
 pipx run hermes-infoflow-tools update --version <version> --port 9000
 ```
 
-Pin both the installer package and the plugin package to a stable version:
+Pin both the installer package and the plugin package to a stable version. For
+newly published versions, `--no-cache` avoids stale pipx/uv resolver cache:
 
 <!-- sync:hermes-infoflow-version:latest -->
 ```bash
-pipx run --spec hermes-infoflow-tools==2026.5.26 hermes-infoflow-tools update --version 2026.5.26 --mode extract --port 9000
+pipx run --no-cache --spec hermes-infoflow-tools==2026.5.26 hermes-infoflow-tools update --version 2026.5.26 --mode extract --port 9000
 ```
 <!-- /sync:hermes-infoflow-version:latest -->
 
