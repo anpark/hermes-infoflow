@@ -38,6 +38,7 @@ TERMINAL_EVENT_KINDS = frozenset({
     "display.tool_progress",
     "display.hermes",
     "display.hermes_stream",
+    "display.thinking_stream",
     "display.status",
     "display.interim",
     "outbound.infoflow",
@@ -45,6 +46,10 @@ TERMINAL_EVENT_KINDS = frozenset({
     "session.start",
     "session.end",
 })
+
+GROUP_CHAT_TYPES = frozenset({2, 3, 5, 6})
+DM_CHAT_TYPES = frozenset({1, 7})
+SUPPORTED_CHAT_TYPES = GROUP_CHAT_TYPES | DM_CHAT_TYPES
 
 _PROGRESS_LINE_RE = re.compile(r"^[┊\s]*[🔍⚙️💻🌐📁📝🧠✨]")
 
@@ -85,7 +90,7 @@ async def resolve_user_id_by_code_cached(
     """Resolve OAuth code to uuap, caching successful lookups in-process."""
     stripped = code.strip()
     if not stripped:
-        raise ValueError("code is required for chatType=7")
+        raise ValueError("code is required for private chatType=1/7")
 
     cache_key = _code_cache_key(stripped, account)
     now = time.monotonic()
@@ -142,6 +147,16 @@ def format_terminal_line(
         stream_id = payload.get("stream_id") or ""
         return {
             "line_kind": "hermes",
+            "text": str(text),
+            "stream_id": str(stream_id),
+            "final": bool(payload.get("final")),
+        }
+
+    if kind == "display.thinking_stream":
+        text = payload.get("text") or ""
+        stream_id = payload.get("stream_id") or ""
+        return {
+            "line_kind": "thinking",
             "text": str(text),
             "stream_id": str(stream_id),
             "final": bool(payload.get("final")),
@@ -237,16 +252,16 @@ async def resolve_target(
 ) -> dict[str, Any]:
     """Resolve URL query params to canonical chat_id and optional session_id."""
     raw_chat_id = (chat_id or "").strip()
-    if chat_type == 2:
+    if chat_type in GROUP_CHAT_TYPES:
         if not raw_chat_id:
-            raise ValueError("chatId is required for chatType=2")
+            raise ValueError("chatId is required for group chatType=2/3/5/6")
         canonical = f"group:{raw_chat_id}"
         label = f"群 {raw_chat_id}"
-    elif chat_type == 7:
+    elif chat_type in DM_CHAT_TYPES:
         if not (code or "").strip():
-            raise ValueError("code is required for chatType=7")
+            raise ValueError("code is required for private chatType=1/7")
         if account is None:
-            raise ValueError("Infoflow API account is required for chatType=7")
+            raise ValueError("Infoflow API account is required for private chatType=1/7")
         user_id = await resolve_user_id_by_code_cached(
             account, code, http_session=http_session,
         )
@@ -293,13 +308,13 @@ async def canonical_for_stream_access(
     reuse the same query string. When *session_id* is already known to the tracker,
     derive the canonical uuap from session metadata instead of calling getuserinfo again.
     """
-    if chat_type == 2:
+    if chat_type in GROUP_CHAT_TYPES:
         raw = (chat_id or "").strip()
         if not raw:
-            raise ValueError("chatId is required for chatType=2")
+            raise ValueError("chatId is required for group chatType=2/3/5/6")
         return f"group:{raw}"
 
-    if chat_type != 7:
+    if chat_type not in DM_CHAT_TYPES:
         raise ValueError(f"unsupported chatType={chat_type}")
 
     sid = (session_id or "").strip()
@@ -315,9 +330,9 @@ async def canonical_for_stream_access(
                 return cid
 
     if not (code or "").strip():
-        raise ValueError("code is required for chatType=7 when session is unknown")
+        raise ValueError("code is required for private chatType=1/7 when session is unknown")
     if account is None:
-        raise ValueError("Infoflow API account is required for chatType=7")
+        raise ValueError("Infoflow API account is required for private chatType=1/7")
     return await resolve_user_id_by_code_cached(account, code)
 
 
@@ -388,7 +403,7 @@ def _account_for_sessiontracker_request(
     chat_type: int,
     code: str,
 ) -> tuple[InfoflowAccountAPI | None, str | None]:
-    if chat_type == 7:
+    if chat_type in DM_CHAT_TYPES:
         try:
             return _read_infoflow_account(), None
         except ValueError as exc:
@@ -424,12 +439,12 @@ def _require_sessiontracker_params(handler: Callable[..., Any]) -> Callable[...,
             chat_type, chat_id, code = _parse_query(request)
         except ValueError as exc:
             return web.Response(status=400, text=str(exc))
-        if chat_type == 7 and not code.strip():
-            return web.Response(status=400, text="code is required for chatType=7")
-        if chat_type == 2 and not chat_id.strip():
-            return web.Response(status=400, text="chatId is required for chatType=2")
-        if chat_type not in (2, 7):
-            return web.Response(status=400, text="chatType must be 2 or 7")
+        if chat_type in DM_CHAT_TYPES and not code.strip():
+            return web.Response(status=400, text="code is required for private chatType=1/7")
+        if chat_type in GROUP_CHAT_TYPES and not chat_id.strip():
+            return web.Response(status=400, text="chatId is required for group chatType=2/3/5/6")
+        if chat_type not in SUPPORTED_CHAT_TYPES:
+            return web.Response(status=400, text="chatType must be one of 1,2,3,5,6,7")
         return await handler(request, chat_type=chat_type, chat_id=chat_id, code=code)
     return wrapped
 
@@ -459,6 +474,12 @@ h1 { margin: 0; font-size: 14px; font-weight: 600; }
 .hermes-title { color: #7eb8ff; font-size: 12px; margin-bottom: 6px; }
 .hermes-body { white-space: pre-wrap; word-break: break-word; }
 .hermes-body .caret { color: #7eb8ff; opacity: 0.6; animation: blink 1s steps(2, start) infinite; }
+.thinking-box { border-left: 2px solid #56616f; border-radius: 4px; margin: 6px 0;
+  padding: 6px 10px; background: #101318; color: #8b949e; }
+.thinking-box.streaming { border-left-color: #7a8491; }
+.thinking-title { color: #8b949e; font-size: 12px; margin-bottom: 4px; }
+.thinking-body { white-space: pre-wrap; word-break: break-word; }
+.thinking-body .caret { color: #8b949e; opacity: 0.6; animation: blink 1s steps(2, start) infinite; }
 @keyframes blink { to { visibility: hidden; } }
 .interim-line { color: var(--interim); font-style: italic; margin: 6px 0; white-space: pre-wrap;
   word-break: break-word; }
@@ -534,6 +555,7 @@ function esc(s) {
 }
 
 const streamBoxes = new Map();
+const thinkingBoxes = new Map();
 const progressLines = new Map();
 
 function ensureEmptyHintRemoved() {
@@ -562,6 +584,26 @@ function renderHermesBox(text, { streaming = false, withCaret = false } = {}) {
   box.appendChild(head);
   box.appendChild(body);
   box.appendChild(foot);
+  return { box, body };
+}
+
+function renderThinkingBox(text, { streaming = false, withCaret = false } = {}) {
+  const box = document.createElement('div');
+  box.className = 'thinking-box' + (streaming ? ' streaming' : '');
+  const head = document.createElement('div');
+  head.className = 'thinking-title';
+  head.textContent = '╭─ thinking ─────────────────';
+  const body = document.createElement('div');
+  body.className = 'thinking-body';
+  body.textContent = text || '';
+  if (withCaret) {
+    const caret = document.createElement('span');
+    caret.className = 'caret';
+    caret.textContent = '▍';
+    body.appendChild(caret);
+  }
+  box.appendChild(head);
+  box.appendChild(body);
   return { box, body };
 }
 
@@ -603,6 +645,28 @@ function appendBlock(block) {
   } else if (kind === 'hermes') {
     const made = renderHermesBox(block.text || '', { streaming: false, withCaret: false });
     terminal.appendChild(made.box);
+  } else if (kind === 'thinking' && block.stream_id) {
+    let entry = thinkingBoxes.get(block.stream_id);
+    if (!entry) {
+      const made = renderThinkingBox(block.text || '', { streaming: !block.final, withCaret: !block.final });
+      terminal.appendChild(made.box);
+      entry = made;
+      thinkingBoxes.set(block.stream_id, entry);
+    } else {
+      entry.body.textContent = block.text || '';
+      if (block.final) {
+        entry.box.classList.remove('streaming');
+      } else {
+        const caret = document.createElement('span');
+        caret.className = 'caret';
+        caret.textContent = '▍';
+        entry.body.appendChild(caret);
+      }
+    }
+    if (block.final) thinkingBoxes.delete(block.stream_id);
+  } else if (kind === 'thinking') {
+    const made = renderThinkingBox(block.text || '', { streaming: false, withCaret: false });
+    terminal.appendChild(made.box);
   } else if (kind === 'interim') {
     const p = document.createElement('div');
     p.className = 'interim-line';
@@ -641,6 +705,7 @@ function appendBlock(block) {
 
 function resetRenderState() {
   streamBoxes.clear();
+  thinkingBoxes.clear();
   progressLines.clear();
 }
 

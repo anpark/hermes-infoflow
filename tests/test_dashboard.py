@@ -408,21 +408,63 @@ def test_on_stream_delta_pushes_hermes_stream(tracker: SessionTracker) -> None:
     assert snap[-1].payload["final"] is False
 
 
-def test_on_stream_delta_ignores_thinking(tracker: SessionTracker) -> None:
+def test_on_stream_delta_captures_thinking_stream(tracker: SessionTracker) -> None:
     hooks = make_plugin_hooks(tracker)
     hooks["on_stream_delta"](
         session_id="sess-th",
         platform="infoflow",
         model="m",
-        delta_text="<think>",
+        delta_text="step one. ",
         content_type="thinking",
         message_so_far="",
         stream_id="thinking-1",
     )
-    assert all(
-        e.kind != "display.hermes_stream"
-        for e in tracker.snapshot("sess-th")
+    hooks["on_stream_delta"](
+        session_id="sess-th",
+        platform="infoflow",
+        model="m",
+        delta_text="step two.",
+        content_type="thinking",
+        message_so_far="",
+        stream_id="thinking-1",
     )
+    hooks["on_stream_delta"](
+        session_id="sess-th",
+        platform="infoflow",
+        model="m",
+        delta_text="",
+        content_type="thinking",
+        message_so_far="",
+        stream_id="thinking-1",
+        final=True,
+    )
+    snap = tracker.snapshot("sess-th")
+    thinking = [e for e in snap if e.kind == "display.thinking_stream"]
+    assert len(thinking) == 3
+    assert thinking[0].payload["text"] == "step one. "
+    assert thinking[-1].payload["text"] == "step one. step two."
+    assert thinking[-1].payload["stream_id"] == "thinking-1"
+    assert thinking[-1].payload["final"] is True
+    assert all(e.kind != "display.hermes_stream" for e in snap)
+
+
+def test_pre_api_request_pushes_status_line(tracker: SessionTracker) -> None:
+    hooks = make_plugin_hooks(tracker)
+    hooks["pre_api_request"](
+        session_id="sess-api",
+        platform="infoflow",
+        model="claude-sonnet-4-6",
+        api_call_count=2,
+        approx_input_tokens=12345,
+        tool_count=17,
+    )
+    events = [e for e in tracker.snapshot("sess-api") if e.kind == "display.status"]
+    assert len(events) == 1
+    line = events[0].payload["line"]
+    assert "requesting claude-sonnet-4-6" in line
+    assert "call #2" in line
+    assert "~12,345 input tokens" in line
+    assert "17 tools" in line
 
 
 def test_post_llm_call_finalizes_stream_box_when_streaming(tracker: SessionTracker) -> None:

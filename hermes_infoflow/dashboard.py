@@ -469,6 +469,7 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
     # All access happens from the agent's single asyncio loop, so plain
     # dicts are fine (no lock needed for add/discard/pop atomic ops).
     _stream_state: dict[str, dict[str, Any]] = {}
+    _thinking_state: dict[tuple[str, str], dict[str, Any]] = {}
     _last_streamed_text: dict[str, str] = {}
     # Tools that have an active on_tool_progress(start) for this session.
     # post_tool_call fires *between* start and end (start -> post -> end),
@@ -479,6 +480,8 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
 
     def _drop_session_state(sid: str) -> None:
         _stream_state.pop(sid, None)
+        for key in [key for key in _thinking_state if key[0] == sid]:
+            _thinking_state.pop(key, None)
         _last_streamed_text.pop(sid, None)
         _tool_progress_started.pop(sid, None)
 
@@ -711,6 +714,43 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
         )
 
     @_safe
+    def pre_api_request(**kw: Any) -> None:
+        sid = kw.get("session_id") or ""
+        if not sid:
+            return
+        plat = _platform_str(kw.get("platform"))
+        model = str(kw.get("model") or "")
+        parts = [f"⚕ requesting {model}" if model else "⚕ requesting model"]
+
+        call_count = kw.get("api_call_count")
+        if call_count is not None:
+            parts.append(f"call #{call_count}")
+
+        approx_tokens = kw.get("approx_input_tokens")
+        if approx_tokens is not None:
+            try:
+                token_text = f"{int(approx_tokens):,}"
+            except (TypeError, ValueError):
+                token_text = str(approx_tokens)
+            parts.append(f"~{token_text} input tokens")
+
+        tool_count = kw.get("tool_count")
+        if tool_count is not None:
+            try:
+                tool_text = f"{int(tool_count):,}"
+            except (TypeError, ValueError):
+                tool_text = str(tool_count)
+            parts.append(f"{tool_text} tools")
+
+        tracker.push_event(
+            sid,
+            "display.status",
+            {"line": " │ ".join(parts)},
+            platform=plat,
+            model=model,
+        )
+
+    @_safe
     def pre_gateway_dispatch(**kw: Any) -> None:
         event = kw.get("event")
         gateway = kw.get("gateway")
@@ -778,12 +818,63 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
         if not sid:
             return
         content_type = str(kw.get("content_type") or "text")
-        if content_type != "text":
-            return
         final = bool(kw.get("final"))
         stream_id = str(kw.get("stream_id") or "")
         plat = _platform_str(kw.get("platform"))
         model = str(kw.get("model") or "")
+
+        if content_type == "thinking":
+            state_key = (sid, stream_id or "thinking")
+            active = _thinking_state.get(state_key)
+            if final:
+                text = (
+                    kw.get("message_so_far")
+                    or (active.get("text") if active else "")
+                    or kw.get("delta_text")
+                    or ""
+                )
+                _thinking_state.pop(state_key, None)
+                if not text:
+                    return
+                tracker.push_event(
+                    sid,
+                    "display.thinking_stream",
+                    {
+                        "text": _trunc(text, MAX_TEXT_PREVIEW),
+                        "stream_id": state_key[1],
+                        "model": kw.get("model"),
+                        "final": True,
+                    },
+                    platform=plat,
+                    model=model,
+                )
+                return
+
+            message_so_far = kw.get("message_so_far") or ""
+            delta_text = kw.get("delta_text") or ""
+            if message_so_far:
+                text = str(message_so_far)
+            elif delta_text:
+                text = str((active or {}).get("text") or "") + str(delta_text)
+            else:
+                return
+            _thinking_state[state_key] = {"stream_id": state_key[1], "text": text}
+            tracker.push_event(
+                sid,
+                "display.thinking_stream",
+                {
+                    "text": _trunc(text, MAX_TEXT_PREVIEW),
+                    "stream_id": state_key[1],
+                    "model": kw.get("model"),
+                    "final": False,
+                },
+                platform=plat,
+                model=model,
+            )
+            return
+
+        if content_type != "text":
+            return
 
         if final:
             active = _stream_state.pop(sid, None)
@@ -931,6 +1022,7 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
         "post_llm_call": post_llm_call,
         "pre_tool_call": pre_tool_call,
         "post_tool_call": post_tool_call,
+        "pre_api_request": pre_api_request,
         "post_api_request": post_api_request,
         "pre_gateway_dispatch": pre_gateway_dispatch,
         "on_stream_delta": on_stream_delta,

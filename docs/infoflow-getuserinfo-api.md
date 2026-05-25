@@ -1,6 +1,6 @@
 # Infoflow getuserinfo API (私聊 code → uuap)
 
-用于 Session Tracker 页面在 `chatType=7`（私聊/服务号）时，将 URL 中的 `code` 解析为对话对象的 `UserId`（uuapName）。
+用于 Session Tracker 页面在 `chatType=1/7`（私聊/服务号）时，将 URL 中的 `code` 解析为对话对象的 `UserId`（uuapName）。
 
 ## 请求
 
@@ -48,8 +48,8 @@ Body（JSON）：
 
 | chatType | 含义 | chatId | code |
 |----------|------|--------|------|
-| `2` | 群聊 | 群 ID | 不需要 |
-| `7` | 私聊（服务号） | 如流侧 chat 标识 | **必填**，经本接口解析为 `UserId` |
+| `2/3/5/6` | 群聊 | 群 ID | 不需要 |
+| `1/7` | 私聊（服务号） | 如流侧 chat 标识 | **必填**，经本接口解析为 `UserId` |
 
 示例：
 

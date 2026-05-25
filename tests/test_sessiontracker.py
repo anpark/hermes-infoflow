@@ -95,14 +95,25 @@ def test_format_terminal_line_display_kinds() -> None:
         "final": False,
     }
 
-    interim_ev = SessionEvent(6, 0.0, "display.interim", {"text": "thinking…"})
+    thinking_ev = SessionEvent(
+        6, 0.0, "display.thinking_stream",
+        {"text": "reasoning", "stream_id": "th1", "final": False},
+    )
+    assert format_terminal_line(thinking_ev) == {
+        "line_kind": "thinking",
+        "text": "reasoning",
+        "stream_id": "th1",
+        "final": False,
+    }
+
+    interim_ev = SessionEvent(7, 0.0, "display.interim", {"text": "thinking…"})
     assert format_terminal_line(interim_ev) == {
         "line_kind": "interim",
         "text": "thinking…",
     }
 
     progress_ev = SessionEvent(
-        7, 0.0, "display.tool_progress",
+        8, 0.0, "display.tool_progress",
         {"line": "┊ ⚡ search", "tool_call_id": "c1", "stage": "start"},
     )
     assert format_terminal_line(progress_ev) == {
@@ -137,20 +148,28 @@ def test_format_terminal_line_suppressed_group_status() -> None:
     assert block["text"].startswith("📦 Preflight compression:")
 
 
+@pytest.mark.parametrize("chat_type", [2, 3, 5, 6])
 @pytest.mark.asyncio
-async def test_resolve_target_group(tracker: SessionTracker, account: InfoflowAccountAPI) -> None:
+async def test_resolve_target_group(
+    tracker: SessionTracker,
+    account: InfoflowAccountAPI,
+    chat_type: int,
+) -> None:
     tracker.bind_chat("group:4507088", "sess-g1")
     info = await resolve_target(
-        tracker, chat_type=2, chat_id="4507088", code="", account=account,
+        tracker, chat_type=chat_type, chat_id="4507088", code="", account=account,
     )
     assert info["canonical_chat_id"] == "group:4507088"
     assert info["session_id"] == "sess-g1"
     assert "群" in info["label"]
 
 
+@pytest.mark.parametrize("chat_type", [1, 7])
 @pytest.mark.asyncio
 async def test_resolve_target_dm_mock_getuserinfo(
-    tracker: SessionTracker, account: InfoflowAccountAPI,
+    tracker: SessionTracker,
+    account: InfoflowAccountAPI,
+    chat_type: int,
 ) -> None:
     with patch(
         "hermes_infoflow.sessiontracker.get_user_info_by_code",
@@ -159,7 +178,7 @@ async def test_resolve_target_dm_mock_getuserinfo(
     ) as mock_gu:
         info = await resolve_target(
             tracker,
-            chat_type=7,
+            chat_type=chat_type,
             chat_id="3950087625",
             code="abc123",
             account=account,
@@ -345,6 +364,21 @@ async def test_stream_access_uses_session_meta_when_code_expired(
     assert session_matches_target(tracker, "sess-dm", "chengbo05")
 
 
+@pytest.mark.asyncio
+async def test_stream_access_accepts_chat_type_6_group(
+    tracker: SessionTracker,
+) -> None:
+    canonical = await canonical_for_stream_access(
+        tracker,
+        session_id="sess-group",
+        chat_type=6,
+        chat_id="4507088",
+        code="",
+        account=None,
+    )
+    assert canonical == "group:4507088"
+
+
 def test_session_matches_target(tracker: SessionTracker) -> None:
     tracker.bind_chat("group:9", "sess-9")
     assert session_matches_target(tracker, "sess-9", "group:9")
@@ -381,18 +415,23 @@ async def test_sessiontracker_routes_resolve_and_stream() -> None:
 
     async with TestClient(TestServer(app)) as client:
         resp = await client.get(
-            "/webhook/infoflow/sessiontracker?chatType=2&chatId=1",
+            "/webhook/infoflow/sessiontracker?chatType=6&chatId=1",
         )
         assert resp.status == 200
         assert "Session Tracker" in await resp.text()
 
         resp = await client.get(
-            "/webhook/infoflow/sessiontracker/api/resolve?chatType=2&chatId=1",
+            "/webhook/infoflow/sessiontracker/api/resolve?chatType=6&chatId=1",
         )
         assert resp.status == 200
         body = await resp.json()
         assert body["canonical_chat_id"] == "group:1"
         assert body["session_id"] == "st-sess"
+
+        resp = await client.get(
+            "/webhook/infoflow/sessiontracker?chatType=4&chatId=1",
+        )
+        assert resp.status == 400
 
         resp = await client.get(
             "/webhook/infoflow/sessiontracker/api/resolve?chatType=7&chatId=1",
@@ -401,7 +440,7 @@ async def test_sessiontracker_routes_resolve_and_stream() -> None:
 
         resp = await client.get(
             "/webhook/infoflow/sessiontracker/api/history"
-            "?session_id=st-sess&chatType=2&chatId=1",
+            "?session_id=st-sess&chatType=6&chatId=1",
         )
         assert resp.status == 200
         body = await resp.json()
@@ -409,14 +448,14 @@ async def test_sessiontracker_routes_resolve_and_stream() -> None:
 
         resp = await client.get(
             "/webhook/infoflow/sessiontracker/api/stream"
-            "?session_id=st-sess&chatType=2&chatId=1",
+            "?session_id=st-sess&chatType=6&chatId=1",
         )
         assert resp.status == 200
         assert resp.content_type == "text/event-stream"
 
         resp = await client.get(
             "/webhook/infoflow/sessiontracker/api/stream"
-            "?session_id=st-sess&chatType=2&chatId=999",
+            "?session_id=st-sess&chatType=6&chatId=999",
         )
         assert resp.status == 403
 

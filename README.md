@@ -274,12 +274,12 @@ http://127.0.0.1:26521/webhook/infoflow/dashboard
 
 ### 展示粒度（与 CLI 的差异）
 
-仪表盘通过 hermes-agent **插件 hooks** 收集事件（`pre_llm_call`、`post_llm_call`、`pre_tool_call`、`post_tool_call`、`on_session_*` 等），属于 **turn 级别** 时间线：
+仪表盘通过 hermes-agent **插件 hooks** 收集事件（`pre_llm_call`、`post_llm_call`、`pre_api_request`、`post_api_request`、`pre_tool_call`、`post_tool_call`、`on_stream_delta`、`on_tool_progress`、`on_session_*` 等），主要作为 **turn / event 级别** 时间线：
 
 - 每次 LLM 请求/回复各一条
 - 每次 tool 调用开始/结束各一条（可展开 args/result）
 
-这与 `hermes` 交互式 CLI / TUI 的 **逐 token 流式** 输出不同。CLI 的 `thinking.delta` / `message.delta` 运行在独立的 TUI 进程内，gateway 进程中的 platform 插件无法在不修改 hermes-agent 的前提下订阅同等粒度的流式事件。
+这与 `hermes` 交互式 CLI / TUI 的原生渲染仍有差异：插件只消费 hermes-agent 已暴露的 hook，不能直接读取 TUI 进程内的渲染状态；可见回复逐 token 是否实时出现取决于 gateway 是否发出对应 `on_stream_delta`。
 
 关闭仪表盘：`INFOFLOW_DASHBOARD_ENABLED=false`。
 
@@ -292,8 +292,8 @@ http://127.0.0.1:26521/webhook/infoflow/dashboard
 ### 访问地址
 
 ```
-/webhook/infoflow/sessiontracker?chatType=2&chatId=<群ID>
-/webhook/infoflow/sessiontracker?chatType=7&chatId=<占位>&code=<私聊code>
+/webhook/infoflow/sessiontracker?chatType=2|3|5|6&chatId=<群ID>
+/webhook/infoflow/sessiontracker?chatType=1|7&chatId=<占位>&code=<私聊code>
 ```
 
 示例（私聊需有效 `code`，由如流 OAuth 回调提供）：
@@ -302,8 +302,8 @@ http://127.0.0.1:26521/webhook/infoflow/dashboard
 https://<your-domain>/webhook/infoflow/sessiontracker?chatType=7&chatId=3950087625&code=2cecba82ba9686cb75596bfbe5637f03
 ```
 
-- `chatType=2`：群聊，`chatId` 为群号 → 目标 `group:{chatId}`
-- `chatType=7`：私聊，必须带 `code`；插件调用 Infoflow `getuserinfo` 解析为 uuap（`UserId`）作为 DM 目标
+- `chatType=2/3/5/6`：群聊，`chatId` 为群号 → 目标 `group:{chatId}`
+- `chatType=1/7`：私聊，必须带 `code`；插件调用 Infoflow `getuserinfo` 解析为 uuap（`UserId`）作为 DM 目标
 
 详见 [docs/infoflow-getuserinfo-api.md](docs/infoflow-getuserinfo-api.md)。
 
@@ -326,26 +326,28 @@ https://<your-domain>/webhook/infoflow/sessiontracker?chatType=7&chatId=39500876
 | 访问 | 仅 localhost | 可经反代（`code_auth`：私聊需有效 code） |
 | 视图 | Session 列表 + 事件时间线 | 单目标 CLI 终端 + 自动滚动 |
 
-### 展示粒度（Phase A）
+### 展示粒度
 
-当前 **不改 hermes-agent**，通过插件 hooks + outbound 启发式复刻 CLI 输出：
+当前 **不改 hermes-agent**，通过既有插件 hooks + outbound 启发式复刻 CLI 输出：
 
+- `pre_api_request`：大模型请求发起前的 model / iteration / input token / tools 状态行
+- `on_stream_delta`：Hermes 可见回复流式框；`content_type=thinking` 时展示 thinking 过程
+- `on_tool_progress`：tool start/end 原地更新
+- `on_interim_assistant`：tool 前的 interim 助手句
 - `post_tool_call`：尽量用 `agent.display.get_cute_tool_message` 生成 tool 行
 - `post_llm_call`：Hermes 回复框
-- `post_api_request`：模型 / token 状态行
+- `post_api_request`：模型 / token 完成状态行
 - `outbound.infoflow` 中含 tool emoji 的短文本当作 progress 镜像
 
-**局限**：无逐 token 流式、无 thinking spinner；interim 句仅在最终 `post_llm_call` 出现。
+**局限**：可见助手逐 token 是否实时显示仍取决于 gateway 侧是否实际发出 `on_stream_delta(content_type=text)`；当前改动不会强制改变 hermes-agent 的 streaming 配置。
 
 ### Phase B（可选，需改 hermes-agent）
 
-在 `hermes_cli/plugins.py` 增加并在 `gateway/run.py` 调用：
+仅当需要新增 hook 或改变 gateway streaming 行为时才需要改 hermes-agent，例如强制所有平台都发出可见回复逐 token delta。相关 hook 目前已存在并被插件消费：
 
 - `on_tool_progress` — gateway tool progress 回调
 - `on_stream_delta` — 流式 delta
 - `on_interim_assistant` —  interim 助手句
-
-注册后 Session Tracker 可接近 CLI/TUI 体验。
 
 调试注入到 Hermes 的完整 user message：`INFOFLOW_SESSIONTRACKER_FULL_USER_MESSAGE=true`。只有 Session Tracker URL 中的 `code` 解析为 `INFOFLOW_ADMIN_USER` 时才展示完整内容；非 admin 或未带 `code` 的群聊页面仍只展示 `[Message]` 后正文。
 
