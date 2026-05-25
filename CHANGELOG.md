@@ -8,6 +8,8 @@ versioning (with prerelease suffixes such as `0.1.0b1` for betas).
 
 ## [Unreleased]
 
+## [2026.5.26b1] - 2026-05-25
+
 ### Fixed
 
 - `hermes-infoflow-tools update`, `hermes-infoflow-deploy`, `scripts/deploy.sh`,

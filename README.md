@@ -84,9 +84,9 @@ Beta 版（PEP 440 prerelease；精确指定版本即可安装）：
 <!-- sync:hermes-infoflow-version:beta -->
 ```bash
 # 二选一：extract 模式
-pipx run --spec hermes-infoflow-tools==0.2.2b1 hermes-infoflow-tools update --version 0.2.2b1 --mode extract --port 9000
+pipx run --spec hermes-infoflow-tools==2026.5.26b1 hermes-infoflow-tools update --version 2026.5.26b1 --mode extract --port 9000
 # 二选一：pip 兼容别名
-pipx run --spec hermes-infoflow-tools==0.2.2b1 hermes-infoflow-tools update --version 0.2.2b1 --mode pip --port 9000
+pipx run --spec hermes-infoflow-tools==2026.5.26b1 hermes-infoflow-tools update --version 2026.5.26b1 --mode pip --port 9000
 ```
 <!-- /sync:hermes-infoflow-version:beta -->
 
@@ -134,7 +134,7 @@ Beta 版：
 
 <!-- sync:hermes-infoflow-version:beta -->
 ```bash
-python -m pip install --upgrade 'hermes-infoflow==0.2.2b1'
+python -m pip install --upgrade 'hermes-infoflow==2026.5.26b1'
 hermes-infoflow-deploy --port 9000
 ```
 <!-- /sync:hermes-infoflow-version:beta -->
@@ -149,7 +149,7 @@ pipx run --spec hermes-infoflow==2026.5.25 hermes-infoflow-deploy --port 9000
 
 <!-- sync:hermes-infoflow-version:beta -->
 ```bash
-pipx run --spec hermes-infoflow==0.2.2b1 hermes-infoflow-deploy --port 9000
+pipx run --spec hermes-infoflow==2026.5.26b1 hermes-infoflow-deploy --port 9000
 ```
 <!-- /sync:hermes-infoflow-version:beta -->
 
@@ -480,7 +480,7 @@ git push origin main <X.Y.Z>
 ```bash
 hatch version <X.Y.ZbN>
 hatch version <X.Y.ZbN> --pyproject tools/hermes-infoflow-tools/pyproject.toml
-python scripts/sync_readme_install_version.py
+python scripts/sync_readme_install_version.py --beta-from-current
 # ...同上 commit/tag/push...
 ```
 
@@ -495,9 +495,9 @@ pip install hermes-infoflow==<X.Y.ZbN>           # 显式锁定
 
 <!-- sync:hermes-infoflow-version -->
 ```bash
-hatch version 2026.5.25
-git tag 2026.5.25
-git push origin 2026.5.25
+hatch version 2026.5.26b1
+git tag 2026.5.26b1
+git push origin 2026.5.26b1
 ```
 <!-- /sync:hermes-infoflow-version -->
 

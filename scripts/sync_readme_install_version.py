@@ -11,6 +11,9 @@ tagged README advertises the version being released before PyPI has indexed
 it. Without that flag, "latest" intentionally means the latest version already
 visible on PyPI.
 
+When preparing a prerelease tag, pass ``--beta-from-current`` so beta install
+examples advertise the version being released before PyPI has indexed it.
+
 The README has three sync markers we maintain:
 
     <!-- sync:hermes-infoflow-version -->
@@ -172,6 +175,14 @@ def main(argv: list[str] | None = None) -> int:
             "for preparing a stable release tag before PyPI contains it."
         ),
     )
+    parser.add_argument(
+        "--beta-from-current",
+        action="store_true",
+        help=(
+            "Use the current pyproject.toml version for beta README markers. "
+            "Intended for preparing a prerelease tag before PyPI contains it."
+        ),
+    )
     args = parser.parse_args(argv)
 
     readmes = [Path(p) for p in args.readme] if args.readme else [
@@ -190,6 +201,8 @@ def main(argv: list[str] | None = None) -> int:
         streams = {"latest": current, "beta": None}
     else:
         streams = _resolve_streams(args.package)
+    if args.beta_from_current:
+        streams["beta"] = current
     streams["hermes-infoflow-version"] = current  # the "current" stream
 
     touched_any = False

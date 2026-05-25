@@ -26,7 +26,7 @@ Beta / prerelease: use the exact PEP 440 version:
 
 <!-- sync:hermes-infoflow-version:beta -->
 ```bash
-pipx run --spec hermes-infoflow-tools==0.2.2b1 hermes-infoflow-tools update --version 0.2.2b1 --mode extract --port 9000
+pipx run --spec hermes-infoflow-tools==2026.5.26b1 hermes-infoflow-tools update --version 2026.5.26b1 --mode extract --port 9000
 ```
 <!-- /sync:hermes-infoflow-version:beta -->
 
