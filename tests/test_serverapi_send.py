@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 
 from hermes_infoflow import serverapi as serverapi_mod
 from hermes_infoflow.parser import BodyItem as ParserBodyItem
 from hermes_infoflow.parser import InboundMessage
 from hermes_infoflow.serverapi import ServerAPI
+
+_TINY_PNG_BYTES = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1Pe"
+    "AAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+)
 
 
 def _settings() -> dict[str, object]:
@@ -57,7 +63,7 @@ def test_send_image_to_dm_returns_caption_as_continuation(monkeypatch) -> None:
     api = ServerAPI(settings=_settings())
 
     result = asyncio.run(
-        api.send_image_to_dm("alice", b"image-bytes", caption="caption", session=object())
+        api.send_image_to_dm("alice", _TINY_PNG_BYTES, caption="caption", session=object())
     )
 
     assert calls == ["markdown", "image"]
@@ -88,7 +94,7 @@ def test_send_image_to_group_does_not_guess_caption_message_id(monkeypatch) -> N
     api = ServerAPI(settings=_settings())
 
     result = asyncio.run(
-        api.send_image_to_group("4507088", b"image-bytes", caption="caption", session=object())
+        api.send_image_to_group("4507088", _TINY_PNG_BYTES, caption="caption", session=object())
     )
 
     assert result.success is True
@@ -117,7 +123,7 @@ def test_send_image_to_group_partial_image_success_is_not_caption(monkeypatch) -
     api = ServerAPI(settings=_settings())
 
     result = asyncio.run(
-        api.send_image_to_group("4507088", b"image-bytes", caption="caption", session=object())
+        api.send_image_to_group("4507088", _TINY_PNG_BYTES, caption="caption", session=object())
     )
 
     assert result.success is False

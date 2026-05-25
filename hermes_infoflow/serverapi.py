@@ -32,6 +32,7 @@ import aiohttp
 
 from . import api as _api
 from .coerce import coerce_bool
+from .media import prepare_infoflow_image_bytes
 from .itypes import (
     BodyItem,
     GroupMember,
@@ -43,6 +44,7 @@ from .itypes import (
     SentResult,
     coerce_reply_target,
 )
+from .utils import _ImageLoadError
 
 if TYPE_CHECKING:
     from .parser import InboundMessage
@@ -585,7 +587,12 @@ class ServerAPI:
         session: aiohttp.ClientSession | None = None,
     ) -> SentResult:
         """Send an image (optionally with caption) to a group."""
-        b64 = base64.b64encode(image_bytes).decode("ascii")
+        try:
+            prepared_image = prepare_infoflow_image_bytes(image_bytes)
+        except _ImageLoadError as exc:
+            return SentResult(success=False, error=str(exc))
+
+        b64 = base64.b64encode(prepared_image.data).decode("ascii")
         contents: list[_api.ContentItem] = [_api.ContentItem("image", b64)]
         if caption:
             contents.insert(0, _api.ContentItem("markdown", caption))
@@ -636,7 +643,12 @@ class ServerAPI:
         session: aiohttp.ClientSession | None = None,
     ) -> SentResult:
         """Send an image to a user (DM). Caption and image sent separately."""
-        b64 = base64.b64encode(image_bytes).decode("ascii")
+        try:
+            prepared_image = prepare_infoflow_image_bytes(image_bytes)
+        except _ImageLoadError as exc:
+            return SentResult(success=False, error=str(exc))
+
+        b64 = base64.b64encode(prepared_image.data).decode("ascii")
 
         caption_items: list[_api.ContentItem] = []
         image_items: list[_api.ContentItem] = [_api.ContentItem("image", b64)]

@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import ipaddress as _ipaddress
 import logging
 import os
 import re
@@ -36,6 +37,8 @@ import socket as _socket
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin as _urljoin
+from urllib.parse import urlparse as _urlparse
 
 _PROGRESS_LINE_RE = re.compile(r"^[┊\s]*[🔍⚙️💻🌐📁📝🧠✨]")
 _GROUP_STATUS_REDIRECT_PREFIXES = (
@@ -184,6 +187,7 @@ from .llm_format import (
 )
 from .message_content import render_message_content
 from .message_store import MessageStore
+from .media import IMAGE_LOAD_MAX_BYTES, prepare_infoflow_image_bytes
 from .outbound import prepare_outbound_message
 from .policy import (
     _DM_FORMAT_DOC,
@@ -1584,7 +1588,8 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         session = self._effective_session(self._http_session)
         kind, group_id, dm_user = self._parse_target(chat_id)
         try:
-            image_bytes = await self._load_image_bytes(image_url)
+            raw_image_bytes = await self._load_image_bytes(image_url)
+            prepared_image = prepare_infoflow_image_bytes(raw_image_bytes)
         except _ImageLoadError as exc:
             return SendResult(success=False, error=str(exc), retryable=False)
 
@@ -1602,7 +1607,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         bot_result = await self._bot.send_image(
             group_id=str(group_id) if group_id is not None else None,
             dm_user_id=dm_user or None,
-            image_bytes=image_bytes,
+            image_bytes=prepared_image.data,
             caption=caption,
             reply_info=reply_info,
             session=session,
@@ -1626,6 +1631,9 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 "success": bot_result.success,
                 "message_id": bot_result.message_id,
                 "error": bot_result.error,
+                "image_mime": prepared_image.mime_type,
+                "image_bytes": prepared_image.final_size,
+                "image_compressed": prepared_image.compressed,
             },
         )
 
@@ -1645,6 +1653,25 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             ),
             error=bot_result.error,
             retryable=False,
+        )
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: str | None = None,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        """Send a local image file natively without exposing its local path."""
+        del kwargs
+        return await self.send_image(
+            chat_id=chat_id,
+            image_url=image_path,
+            caption=caption,
+            reply_to=reply_to,
+            metadata=metadata,
         )
 
     # ------------------------------------------------------------------
@@ -1703,34 +1730,98 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         candidate = _resolve_safe_local_path(image_url)
         if candidate is None:
             raise _ImageLoadError(
-                f"refusing to read image from {image_url!r}: not inside an allowed media root"
+                "refusing to read local image: not inside an allowed media root"
             )
         try:
+            size = candidate.stat().st_size
+            if size > IMAGE_LOAD_MAX_BYTES:
+                raise _ImageLoadError(
+                    f"local image payload exceeds {IMAGE_LOAD_MAX_BYTES} bytes; aborting"
+                )
             return candidate.read_bytes()
+        except _ImageLoadError:
+            raise
         except OSError as exc:
-            raise _ImageLoadError(f"failed to read image {candidate}: {exc}") from exc
+            reason = getattr(exc, "strerror", None) or exc.__class__.__name__
+            raise _ImageLoadError(f"failed to read local image: {reason}") from exc
 
     async def _fetch_url_bytes(
-        self, url: str, *, max_bytes: int = 25 * 1024 * 1024,
+        self, url: str, *, max_bytes: int = IMAGE_LOAD_MAX_BYTES,
     ) -> bytes:
-        ok, reason = _is_safe_outbound_url(url)
-        if not ok:
-            raise _ImageLoadError(f"refusing to fetch image: {reason}")
         own_session = self._http_session is None
         session = self._http_session or aiohttp.ClientSession()
         try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=30.0)) as resp:
-                if resp.status >= 400:
-                    raise _ImageLoadError(f"image fetch HTTP {resp.status} for {url[:80]}")
-                buf = bytearray()
-                async for chunk in resp.content.iter_chunked(64 * 1024):
-                    buf.extend(chunk)
-                    if len(buf) > max_bytes:
-                        raise _ImageLoadError(f"image payload exceeds {max_bytes} bytes; aborting")
-                return bytes(buf)
+            current_url = url
+            for _ in range(6):
+                await self._assert_safe_fetch_url(current_url)
+                async with session.get(
+                    current_url,
+                    timeout=aiohttp.ClientTimeout(total=30.0),
+                    allow_redirects=False,
+                ) as resp:
+                    if 300 <= resp.status < 400:
+                        location = resp.headers.get("Location")
+                        if not location:
+                            raise _ImageLoadError("image fetch redirect missing Location")
+                        current_url = _urljoin(current_url, location)
+                        continue
+
+                    if resp.status >= 400:
+                        raise _ImageLoadError(f"image fetch HTTP {resp.status}")
+
+                    buf = bytearray()
+                    async for chunk in resp.content.iter_chunked(64 * 1024):
+                        buf.extend(chunk)
+                        if len(buf) > max_bytes:
+                            raise _ImageLoadError(
+                                f"image payload exceeds {max_bytes} bytes; aborting"
+                            )
+                    return bytes(buf)
+
+            raise _ImageLoadError("image fetch exceeded redirect limit")
         finally:
             if own_session:
                 await session.close()
+
+    async def _assert_safe_fetch_url(self, url: str) -> None:
+        ok, reason = _is_safe_outbound_url(url)
+        if not ok:
+            raise _ImageLoadError(f"refusing to fetch image: {reason}")
+
+        parsed = _urlparse(url)
+        host = parsed.hostname
+        if not host:
+            raise _ImageLoadError("refusing to fetch image: URL has no hostname")
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        try:
+            infos = await asyncio.get_running_loop().getaddrinfo(
+                host,
+                port,
+                type=_socket.SOCK_STREAM,
+            )
+        except OSError as exc:
+            raise _ImageLoadError("refusing to fetch image: DNS lookup failed") from exc
+
+        if not infos:
+            raise _ImageLoadError("refusing to fetch image: DNS lookup returned no addresses")
+
+        for info in infos:
+            sockaddr = info[4]
+            ip_text = sockaddr[0]
+            try:
+                ip = _ipaddress.ip_address(ip_text)
+            except ValueError:
+                continue
+            if (
+                ip.is_private
+                or ip.is_loopback
+                or ip.is_link_local
+                or ip.is_multicast
+                or ip.is_reserved
+            ):
+                raise _ImageLoadError(
+                    "refusing to fetch image: hostname resolves to a non-public IP"
+                )
 
     # ------------------------------------------------------------------
     # Chat info

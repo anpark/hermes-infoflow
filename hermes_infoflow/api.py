@@ -49,25 +49,70 @@ def gw_log() -> logging.Logger:
 def _truncate_image_payload(payload_str: str, max_bytes: int = 500) -> str:
     """Truncate base64 image content in JSON payload for logging.
 
-    Detects ``"content": "<base64...>"`` inside image body items and replaces
-    the value with a placeholder so the log line stays readable.
+    Replaces image base64 content with a placeholder so log lines stay readable.
     """
-    # Fast path: no image content at all
-    if '"content"' not in payload_str:
+    # Fast path: no image content at all.
+    if '"IMAGE"' not in payload_str and '"image"' not in payload_str:
         return payload_str
     try:
         obj = json.loads(payload_str)
-        body = obj.get("message", {}).get("body", [])
-        for item in body:
-            if isinstance(item, dict) and item.get("type") == "IMAGE":
-                img = item.get("image", {})
-                if isinstance(img, dict) and isinstance(img.get("content"), str):
-                    raw_len = len(img["content"])
-                    img["content"] = f"<base64 {raw_len} bytes>"
+        _redact_image_payload_obj(obj)
         return json.dumps(obj, ensure_ascii=False)
     except Exception:
         # Fallback: return original if parsing fails
-        return payload_str[:2000]
+        return payload_str[:max_bytes]
+
+
+def _redact_image_value(value: str) -> str:
+    return f"<base64 {len(value)} chars>"
+
+
+def _redact_image_payload_obj(obj: Any) -> None:
+    if not isinstance(obj, dict):
+        return
+
+    image = obj.get("image")
+    if isinstance(image, dict) and isinstance(image.get("content"), str):
+        image["content"] = _redact_image_value(image["content"])
+
+    message = obj.get("message")
+    if isinstance(message, dict):
+        _redact_image_body_items(message.get("body"))
+
+
+def _redact_image_body_items(body: Any) -> None:
+    if not isinstance(body, list):
+        return
+    for item in body:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("type", "")).upper() != "IMAGE":
+            continue
+        if isinstance(item.get("content"), str):
+            item["content"] = _redact_image_value(item["content"])
+        image = item.get("image")
+        if isinstance(image, dict) and isinstance(image.get("content"), str):
+            image["content"] = _redact_image_value(image["content"])
+
+
+def _content_items_for_log(contents: list[Any]) -> list[tuple[str, str]]:
+    safe: list[tuple[str, str]] = []
+    for item in contents:
+        item_type = str(getattr(item, "type", ""))
+        content = str(getattr(item, "content", ""))
+        if item_type.lower() == "image":
+            content = _redact_image_value(content)
+        safe.append((item_type, content))
+    return safe
+
+
+def _body_items_for_log(body_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    safe: list[dict[str, Any]] = []
+    for item in body_items:
+        copied = dict(item)
+        _redact_image_body_items([copied])
+        safe.append(copied)
+    return safe
 
 
 DEFAULT_TIMEOUT_SECONDS = 30.0
@@ -592,7 +637,11 @@ async def send_group_message(
         return {"ok": False, "error": "contents array is empty"}
 
     body_items, has_markdown = _build_group_body_items(contents)
-    logger.info("[infoflow:debug] contents=%s body_items=%s", [(c.type, c.content) for c in contents], body_items)
+    logger.info(
+        "[infoflow:debug] contents=%s body_items=%s",
+        _content_items_for_log(contents),
+        _body_items_for_log(body_items),
+    )
     if not body_items:
         return {"ok": False, "error": "no valid content for group message"}
 

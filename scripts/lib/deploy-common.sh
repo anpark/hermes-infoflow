@@ -94,7 +94,7 @@ echo "==> Verifying runtime dependencies"
 DEP_CHECK_SCRIPT=$(cat <<'PYEOF'
 import importlib, sys
 missing = []
-for mod in ("cryptography", "aiohttp", "yaml"):
+for mod in ("cryptography", "aiohttp", "yaml", "PIL"):
     try:
         importlib.import_module(mod)
     except ImportError:
@@ -106,8 +106,9 @@ print("OK")
 PYEOF
 )
 
-# Pip package names (``yaml`` imports from the ``pyyaml`` distribution).
-PLUGIN_PIP_PACKAGES=(cryptography aiohttp pyyaml)
+# Pip package names (``yaml`` imports from the ``pyyaml`` distribution and
+# ``PIL`` imports from the ``Pillow`` distribution).
+PLUGIN_PIP_PACKAGES=(cryptography aiohttp pyyaml "Pillow>=10")
 
 # Set HERMES_DEPLOY_AUTO_PIP=0 to refuse automatic ``pip install`` / ``pipx inject``.
 HERMES_DEPLOY_AUTO_PIP="${HERMES_DEPLOY_AUTO_PIP:-1}"
@@ -483,13 +484,13 @@ auto_install_plugin_deps() {
   local pipx_py=""
   local target_real="$target"
   local pipx_real=""
-  local pip_args=()
+  local pip_user_arg=""
 
   if [[ "$HERMES_DEPLOY_AUTO_PIP" == "0" ]]; then
     return 1
   fi
 
-  echo "==> Auto-installing plugin dependencies (cryptography, aiohttp, pyyaml)"
+  echo "==> Auto-installing plugin dependencies (${PLUGIN_PIP_PACKAGES[*]})"
 
   # Best case: target deps belong in hermes-agent's pipx venv.
   if pipx_has_hermes_agent && pipx_py="$(detect_pipx_hermes_python)"; then
@@ -515,8 +516,19 @@ auto_install_plugin_deps() {
   fi
 
   if ! python_has_pip "$target"; then
-    print_no_pip_guidance "$target"
-    return 1
+    echo "  - $target has no working pip; attempting ensurepip bootstrap"
+    echo "$ $target -m ensurepip --upgrade"
+    if [[ "$DRY_RUN" == "true" ]]; then
+      return 0
+    fi
+    if ! "$target" -m ensurepip --upgrade; then
+      print_no_pip_guidance "$target"
+      return 1
+    fi
+    if ! python_has_pip "$target"; then
+      print_no_pip_guidance "$target"
+      return 1
+    fi
   fi
 
   # Only use --user for a plain system interpreter (not a venv / pipx path).
@@ -524,16 +536,27 @@ auto_install_plugin_deps() {
     && [[ "$target" != *"/pipx/"* ]] \
     && [[ "$target" != *"/venv/"* ]] \
     && [[ "$target" != *"/.venv/"* ]]; then
-    pip_args+=(--user)
+    pip_user_arg="--user"
   fi
 
-  echo "$ $target -m pip install ${pip_args[*]:-} ${PLUGIN_PIP_PACKAGES[*]}"
+  if [[ -n "$pip_user_arg" ]]; then
+    echo "$ $target -m pip install $pip_user_arg ${PLUGIN_PIP_PACKAGES[*]}"
+  else
+    echo "$ $target -m pip install ${PLUGIN_PIP_PACKAGES[*]}"
+  fi
   if [[ "$DRY_RUN" == "true" ]]; then
     return 0
   fi
-  if ! "$target" -m pip install "${pip_args[@]}" "${PLUGIN_PIP_PACKAGES[@]}"; then
-    echo "  - pip install failed for $target" >&2
-    return 1
+  if [[ -n "$pip_user_arg" ]]; then
+    if ! "$target" -m pip install "$pip_user_arg" "${PLUGIN_PIP_PACKAGES[@]}"; then
+      echo "  - pip install failed for $target" >&2
+      return 1
+    fi
+  else
+    if ! "$target" -m pip install "${PLUGIN_PIP_PACKAGES[@]}"; then
+      echo "  - pip install failed for $target" >&2
+      return 1
+    fi
   fi
   return 0
 }
@@ -608,7 +631,7 @@ else
     fi
     echo
     echo "✗ One or more required Python packages are missing." >&2
-    echo "  Required: cryptography, aiohttp, pyyaml" >&2
+    echo "  Required: ${PLUGIN_PIP_PACKAGES[*]}" >&2
     echo "  Tried interpreters: ${CANDIDATE_PYTHONS[*]:-<none>}" >&2
     echo "  Hermes-linked interpreters: ${HERMES_LINKED_PYTHONS[*]:-<none>}" >&2
     if [[ "$HERMES_DEPLOY_AUTO_PIP" == "0" ]]; then
@@ -624,13 +647,13 @@ else
     echo "    3) install manually:" >&2
     if [[ -n "${install_target:-}" ]]; then
       if python_has_pip "$install_target"; then
-        echo "         ${install_target} -m pip install cryptography aiohttp pyyaml" >&2
+        echo "         ${install_target} -m pip install ${PLUGIN_PIP_PACKAGES[*]}" >&2
       else
         echo "         ${install_target} -m ensurepip --upgrade" >&2
-        echo "         ${install_target} -m pip install cryptography aiohttp pyyaml" >&2
+        echo "         ${install_target} -m pip install ${PLUGIN_PIP_PACKAGES[*]}" >&2
       fi
     else
-      echo "         python3 -m pip install --user cryptography aiohttp pyyaml" >&2
+      echo "         python3 -m pip install --user ${PLUGIN_PIP_PACKAGES[*]}" >&2
     fi
     exit 1
   fi

@@ -32,11 +32,12 @@ classifiers = [
     "Topic :: Communications :: Chat",
 ]
 dependencies = [
-    # All three are already required by hermes-agent itself, so the wheel does
-    # not add new runtime dependencies for normal users. Pinned loosely.
+    # Core Hermes deps are already required by hermes-agent itself. Pillow is
+    # needed for outbound Infoflow image validation/compression. Pinned loosely.
     "cryptography>=3.4",
     "aiohttp>=3.8",
     "PyYAML>=6.0",
+    "Pillow>=10",
 ]
 
 # hermes-agent discovers plugins through this entry-point group.

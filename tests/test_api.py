@@ -81,6 +81,40 @@ def test_build_group_body_items_handles_all_types() -> None:
     assert any(42 in b.get("atagentids", []) for b in at_items)
 
 
+def test_truncate_image_payload_redacts_private_image_content() -> None:
+    payload = json.dumps(
+        {"touser": "alice", "msgtype": "image", "image": {"content": "A" * 1200}}
+    )
+
+    redacted = api._truncate_image_payload(payload)
+
+    assert "A" * 100 not in redacted
+    assert "<base64 1200 chars>" in redacted
+
+
+def test_truncate_image_payload_redacts_group_image_content() -> None:
+    payload = json.dumps(
+        {"message": {"body": [{"type": "IMAGE", "content": "B" * 1300}]}}
+    )
+
+    redacted = api._truncate_image_payload(payload)
+
+    assert "B" * 100 not in redacted
+    assert "<base64 1300 chars>" in redacted
+
+
+def test_image_debug_log_helpers_redact_image_content() -> None:
+    contents = [api.ContentItem("image", "C" * 1400)]
+    body = [{"type": "IMAGE", "content": "D" * 1500}]
+
+    assert api._content_items_for_log(contents) == [
+        ("image", "<base64 1400 chars>")
+    ]
+    assert api._body_items_for_log(body) == [
+        {"type": "IMAGE", "content": "<base64 1500 chars>"}
+    ]
+
+
 def test_send_group_message_keeps_msgseqids_aligned(monkeypatch) -> None:
     """Each successful messageid must have a same-index msgseqid slot."""
     responses = [

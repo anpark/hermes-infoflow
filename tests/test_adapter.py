@@ -8,6 +8,7 @@ exercise the adapter end-to-end with a fake aiohttp request.
 from __future__ import annotations
 
 import asyncio
+import base64
 import inspect
 import json
 import os
@@ -35,6 +36,11 @@ from hermes_infoflow.llm_format import format_created_time_ms  # noqa: E402
 from hermes_infoflow.recall import _InboundContext, _register_inbound_context  # noqa: E402
 from hermes_infoflow.sent_store import SentMessageStore  # noqa: E402
 from tests._aes_helpers import aes_ecb_encrypt_b64url, aes_key_b64url  # noqa: E402
+
+_TINY_PNG_BYTES = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1Pe"
+    "AAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+)
 
 
 @pytest.fixture
@@ -770,6 +776,7 @@ def test_send_image_rejects_path_traversal(configured_env) -> None:
     result = asyncio.run(_go())
     assert result.success is False
     assert "media root" in (result.error or "")
+    assert "/etc/passwd" not in (result.error or "")
 
 
 def test_delete_message_by_count_uses_sent_store(configured_env, monkeypatch) -> None:
@@ -943,7 +950,7 @@ def test_send_image_private_sends_native_image(configured_env, monkeypatch, tmp_
     adapter._allowed_media_roots_for_test() if hasattr(adapter, "_allowed_media_roots_for_test") else None
     # Simplest: monkeypatch _load_image_bytes to return fixed bytes.
     async def fake_load(self, url):
-        return b"\x89PNG\r\n\x1a\n" + b"x" * 100
+        return _TINY_PNG_BYTES
     monkeypatch.setattr(InfoflowAdapter, "_load_image_bytes", fake_load)
 
     captured = {}
@@ -968,6 +975,75 @@ def test_send_image_private_sends_native_image(configured_env, monkeypatch, tmp_
     assert len(calls) == 2
     assert "image" not in calls[0]["types"]
     assert calls[1]["types"] == ["image"]
+
+
+def test_send_image_file_private_sends_native_image_without_path_text(
+    configured_env, monkeypatch, tmp_path
+) -> None:
+    adapter = InfoflowAdapter(_make_config())
+    image_path = tmp_path / "x.png"
+    image_path.write_bytes(_TINY_PNG_BYTES)
+
+    adapter.send = AsyncMock(side_effect=AssertionError("must not fallback to text send"))
+
+    captured = {}
+
+    async def fake_send_private(account, to_user, contents, *, session=None):
+        captured.setdefault("calls", []).append(
+            {"to_user": to_user, "types": [c.type for c in contents]}
+        )
+        return {"ok": True, "msgkey": "MSG-FILE-IMG"}
+
+    monkeypatch.setattr(_api, "send_private_message", fake_send_private)
+
+    async def _go():
+        return await adapter.send_image_file("alice", str(image_path), caption="see this")
+
+    result = asyncio.run(_go())
+
+    assert result.success is True
+    assert adapter.send.await_count == 0
+    calls = captured["calls"]
+    assert len(calls) == 2
+    assert calls[0]["types"] == ["markdown"]
+    assert calls[1]["types"] == ["image"]
+
+
+def test_send_image_file_rejects_unsafe_path_without_text_fallback(
+    configured_env, monkeypatch
+) -> None:
+    adapter = InfoflowAdapter(_make_config())
+    adapter.send = AsyncMock(side_effect=AssertionError("must not fallback to text send"))
+
+    async def _go():
+        return await adapter.send_image_file("alice", "/etc/passwd")
+
+    result = asyncio.run(_go())
+
+    assert result.success is False
+    assert "media root" in (result.error or "")
+    assert "/etc/passwd" not in (result.error or "")
+    assert adapter.send.await_count == 0
+
+
+def test_send_image_file_rejects_oversized_local_file_before_reading(
+    configured_env, monkeypatch, tmp_path
+) -> None:
+    adapter = InfoflowAdapter(_make_config())
+    image_path = tmp_path / "oversized.png"
+    image_path.write_bytes(_TINY_PNG_BYTES)
+    monkeypatch.setattr("hermes_infoflow.adapter.IMAGE_LOAD_MAX_BYTES", len(_TINY_PNG_BYTES) - 1)
+    adapter.send = AsyncMock(side_effect=AssertionError("must not fallback to text send"))
+
+    async def _go():
+        return await adapter.send_image_file("alice", str(image_path))
+
+    result = asyncio.run(_go())
+
+    assert result.success is False
+    assert "exceeds" in (result.error or "")
+    assert str(image_path) not in (result.error or "")
+    assert adapter.send.await_count == 0
 
 
 def test_fetch_url_bytes_rejects_internal_ip(configured_env) -> None:
