@@ -1,4 +1,4 @@
-"""Session Tracker Web UI — CLI-style live view for a single Hermes session."""
+"""Session Tracker Web UI — CLI-style live view for one Infoflow chat target."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from .api import InfoflowAccountAPI, InfoflowAPIError, get_user_info_by_code
 from .dashboard import (
     SessionEvent,
     SessionTracker,
+    TRACKER_SESSION_PREFIX,
     normalize_chat_id,
     sessiontracker_enabled,
     sessiontracker_full_user_message_enabled,
@@ -43,8 +44,6 @@ TERMINAL_EVENT_KINDS = frozenset({
     "display.interim",
     "outbound.infoflow",
     "tool.end",
-    "session.start",
-    "session.end",
 })
 
 GROUP_CHAT_TYPES = frozenset({2, 3, 5, 6})
@@ -270,22 +269,33 @@ async def resolve_target(
     else:
         raise ValueError(f"unsupported chatType={chat_type}")
 
-    session_id = tracker.lookup_session_id(canonical)
+    tracker_session_id = tracker.lookup_tracker_session_id(canonical)
+    hermes_session_id = tracker.latest_hermes_session_id(canonical)
     status = "waiting"
     meta = None
     terminal_lines = 0
-    if session_id:
-        if session_id.startswith("pending:"):
+    if tracker_session_id:
+        if tracker_session_id.startswith("pending:"):
             status = "waiting"
         else:
-            meta = tracker.get_meta(session_id)
-            status = (meta.status if meta is not None else None) or "active"
-            terminal_lines = count_terminal_lines(tracker, session_id)
+            meta = tracker.get_meta(tracker_session_id)
+            hermes_meta = tracker.get_meta(hermes_session_id) if hermes_session_id else None
+            if hermes_meta is not None and hermes_meta.status == "active":
+                status = "active"
+            elif not hermes_session_id:
+                status = "waiting"
+            elif meta is not None:
+                status = "idle"
+            else:
+                status = "waiting"
+            terminal_lines = count_terminal_lines(tracker, tracker_session_id)
 
     return {
         "label": label,
         "canonical_chat_id": canonical,
-        "session_id": session_id or "",
+        "session_id": tracker_session_id or "",
+        "tracker_session_id": tracker_session_id or "",
+        "hermes_session_id": hermes_session_id,
         "status": status,
         "chat_type": chat_type,
         "user_id": (meta.user_id if meta else "") or "",
@@ -304,9 +314,8 @@ async def canonical_for_stream_access(
 ) -> str:
     """Resolve DM/group target for stream/history without re-requiring a fresh OAuth code.
 
-    Infoflow ``code`` in the page URL often expires quickly; ``EventSource`` reconnects
-    reuse the same query string. When *session_id* is already known to the tracker,
-    derive the canonical uuap from session metadata instead of calling getuserinfo again.
+    Infoflow ``code`` in the page URL is the authority for private chats. The
+    ``session_id`` may select a tracker bucket, but never proves DM identity.
     """
     if chat_type in GROUP_CHAT_TYPES:
         raw = (chat_id or "").strip()
@@ -317,20 +326,8 @@ async def canonical_for_stream_access(
     if chat_type not in DM_CHAT_TYPES:
         raise ValueError(f"unsupported chatType={chat_type}")
 
-    sid = (session_id or "").strip()
-    if sid and not sid.startswith("pending:"):
-        meta = tracker.get_meta(sid)
-        if meta is not None:
-            uid = normalize_chat_id(meta.user_id or meta.chat_id or "")
-            if uid and not uid.startswith("group:"):
-                return uid
-        for ev in tracker.snapshot(sid, cursor=0):
-            cid = normalize_chat_id((ev.payload or {}).get("chat_id") or "")
-            if cid and not cid.startswith("group:"):
-                return cid
-
     if not (code or "").strip():
-        raise ValueError("code is required for private chatType=1/7 when session is unknown")
+        raise ValueError("code is required for private chatType=1/7")
     if account is None:
         raise ValueError("Infoflow API account is required for private chatType=1/7")
     return await resolve_user_id_by_code_cached(account, code)
@@ -344,6 +341,14 @@ def session_matches_target(
     """Return whether *session_id* belongs to the resolved *canonical_chat_id*."""
     if not session_id or not canonical_chat_id:
         return False
+    tracker_sid = tracker.tracker_session_id(canonical_chat_id)
+    if session_id == tracker_sid:
+        return True
+    if session_id.startswith(TRACKER_SESSION_PREFIX):
+        return (
+            normalize_chat_id(tracker.canonical_from_tracker_session_id(session_id))
+            == normalize_chat_id(canonical_chat_id)
+        )
     if session_id == f"pending:{canonical_chat_id}":
         return True
     if tracker._chat_to_session.get(canonical_chat_id) == session_id:  # noqa: SLF001
@@ -786,7 +791,8 @@ function updateMetaLine(info) {
   const lines = info.terminal_lines != null ? (' | lines: ' + info.terminal_lines) : '';
   document.getElementById('meta-line').textContent =
     (info.canonical_chat_id || '') + who + ' | session: ' +
-    (info.session_id || '(pending)') + ' | ' + (info.status || 'waiting') + lines;
+    (info.session_id || '(pending)') + ' | ' +
+    (info.status || 'waiting') + lines;
 }
 
 function updateEmptyHint(info) {

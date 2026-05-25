@@ -61,6 +61,18 @@ def test_format_terminal_line_llm_response_is_metadata() -> None:
     assert format_terminal_line(ev) is None
 
 
+def test_format_terminal_line_hides_hermes_session_lifecycle() -> None:
+    assert "session.start" not in TERMINAL_EVENT_KINDS
+    assert "session.end" not in TERMINAL_EVENT_KINDS
+    ev = SessionEvent(
+        1,
+        0.0,
+        "session.start",
+        {"hermes_session_id": "20260526_055257_11771cca", "model": "m"},
+    )
+    assert format_terminal_line(ev) is None
+
+
 def test_format_terminal_line_display_kinds() -> None:
     tool_ev = SessionEvent(1, 0.0, "display.tool_line", {"line": "┊ 💻 $ ls"})
     assert format_terminal_line(tool_ev) == {"line_kind": "tool", "text": "┊ 💻 $ ls"}
@@ -161,7 +173,8 @@ async def test_resolve_target_group(
         tracker, chat_type=chat_type, chat_id="4507088", code="", account=account,
     )
     assert info["canonical_chat_id"] == "group:4507088"
-    assert info["session_id"] == "sess-g1"
+    assert info["session_id"] == "chat:group:4507088"
+    assert info["hermes_session_id"] == "sess-g1"
     assert "群" in info["label"]
 
 
@@ -317,7 +330,7 @@ async def test_resolve_pending_status_waiting(tracker: SessionTracker) -> None:
     info = await resolve_target(
         tracker, chat_type=2, chat_id="99", code="", account=None,
     )
-    assert info["session_id"] == "pending:group:99"
+    assert info["session_id"] == "chat:group:99"
     assert info["status"] == "waiting"
 
 
@@ -333,36 +346,39 @@ def test_push_event_updates_chat_map_from_meta(tracker: SessionTracker) -> None:
 
 
 @pytest.mark.asyncio
-async def test_stream_access_uses_session_meta_when_code_expired(
+async def test_stream_access_dm_uses_code_not_tracker_session_id(
     tracker: SessionTracker,
+    account: InfoflowAccountAPI,
 ) -> None:
-    tracker.push_event(
-        "sess-dm",
-        "display.hermes",
-        {"text": "hi"},
-        platform="infoflow",
-        chat_id="chengbo05",
-    )
-    meta = tracker.get_meta("sess-dm")
-    assert meta is not None
-    meta.user_id = "chengbo05"
-    meta.chat_id = "chengbo05"
+    tracker.bind_chat("chengbo05", "sess-dm")
+    tracker_sid = tracker.tracker_session_id("chengbo05")
+
+    with pytest.raises(ValueError):
+        await canonical_for_stream_access(
+            tracker,
+            session_id=tracker_sid,
+            chat_type=7,
+            chat_id="3950087625",
+            code="",
+            account=account,
+        )
 
     with patch(
         "hermes_infoflow.sessiontracker.get_user_info_by_code",
         new_callable=AsyncMock,
-        side_effect=InfoflowAPIError("oauth_code超时或者失效"),
+        return_value="mallory",
     ):
         canonical = await canonical_for_stream_access(
             tracker,
-            session_id="sess-dm",
+            session_id=tracker_sid,
             chat_type=7,
             chat_id="3950087625",
-            code="expired-code",
-            account=None,
+            code="mallory-code",
+            account=account,
         )
-    assert canonical == "chengbo05"
-    assert session_matches_target(tracker, "sess-dm", "chengbo05")
+
+    assert canonical == "mallory"
+    assert not session_matches_target(tracker, tracker_sid, canonical)
 
 
 @pytest.mark.asyncio
@@ -427,7 +443,8 @@ async def test_sessiontracker_routes_resolve_and_stream() -> None:
         assert resp.status == 200
         body = await resp.json()
         assert body["canonical_chat_id"] == "group:1"
-        assert body["session_id"] == "st-sess"
+        assert body["session_id"] == "chat:group:1"
+        assert body["hermes_session_id"] == "st-sess"
 
         resp = await client.get(
             "/webhook/infoflow/sessiontracker?chatType=4&chatId=1",
@@ -441,7 +458,7 @@ async def test_sessiontracker_routes_resolve_and_stream() -> None:
 
         resp = await client.get(
             "/webhook/infoflow/sessiontracker/api/history"
-            "?session_id=st-sess&chatType=6&chatId=1",
+            "?session_id=chat:group:1&chatType=6&chatId=1",
         )
         assert resp.status == 200
         body = await resp.json()
@@ -449,14 +466,52 @@ async def test_sessiontracker_routes_resolve_and_stream() -> None:
 
         resp = await client.get(
             "/webhook/infoflow/sessiontracker/api/stream"
-            "?session_id=st-sess&chatType=6&chatId=1",
+            "?session_id=chat:group:1&chatType=6&chatId=1",
         )
         assert resp.status == 200
         assert resp.content_type == "text/event-stream"
 
         resp = await client.get(
             "/webhook/infoflow/sessiontracker/api/stream"
-            "?session_id=st-sess&chatType=6&chatId=999",
+            "?session_id=chat:group:1&chatType=6&chatId=999",
+        )
+        assert resp.status == 403
+
+
+@pytest.mark.asyncio
+async def test_sessiontracker_dm_history_rejects_guessed_tracker_session_id(
+    tracker: SessionTracker,
+    account: InfoflowAccountAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("aiohttp")
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    tracker.bind_chat("chengbo05", "dm-hermes")
+    tracker.push_event(
+        "dm-hermes",
+        "display.hermes",
+        {"text": "private"},
+        platform="infoflow",
+        chat_id="chengbo05",
+    )
+    monkeypatch.setattr(
+        "hermes_infoflow.sessiontracker._read_infoflow_account",
+        lambda: account,
+    )
+    monkeypatch.setattr(
+        "hermes_infoflow.sessiontracker.get_user_info_by_code",
+        AsyncMock(return_value="mallory"),
+    )
+
+    app = web.Application()
+    register_sessiontracker_routes(app, tracker, base_path="/webhook/infoflow")
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get(
+            "/webhook/infoflow/sessiontracker/api/history"
+            "?session_id=chat:chengbo05&chatType=7&chatId=3950087625&code=mallory-code",
         )
         assert resp.status == 403
 

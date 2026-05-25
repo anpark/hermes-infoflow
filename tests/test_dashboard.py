@@ -306,6 +306,62 @@ def test_pre_gateway_dispatch_display_user_keeps_non_infoflow_message_marker(
 
     display = next(e for e in tracker.snapshot("tg-sess-1") if e.kind == "display.user")
     assert display.payload["text"] == text
+    assert display.payload["chat_id"] == "tg-chat"
+    assert tracker.lookup_session_id("tg-chat") == "tg-sess-1"
+
+
+def test_post_gateway_session_resolved_ignores_non_infoflow_platform(
+    tracker: SessionTracker,
+) -> None:
+    hooks = make_plugin_hooks(tracker)
+    hooks["post_gateway_session_resolved"](
+        session_id="tg-sess-1",
+        platform="telegram",
+        chat_id="tg-chat",
+        chat_type="dm",
+        user_id="alice",
+        is_new_session=True,
+    )
+
+    assert tracker.get_meta("tg-sess-1") is None
+    assert tracker.lookup_tracker_session_id("alice") is None
+    assert tracker.lookup_tracker_session_id("tg-chat") is None
+
+
+def test_pre_gateway_dispatch_non_infoflow_does_not_create_tracker_bucket(
+    tracker: SessionTracker,
+) -> None:
+    source = types.SimpleNamespace(
+        platform=types.SimpleNamespace(value="telegram"),
+        chat_id="group:1",
+        chat_type="group",
+        user_id="alice",
+        user_name="Alice",
+    )
+    event = types.SimpleNamespace(source=source, text="telegram group message")
+    entry = types.SimpleNamespace(
+        session_id="tg-group-sess",
+        session_key="agent:main:telegram:group:1",
+    )
+    session_store = types.SimpleNamespace(_entries={"agent:main:telegram:group:1": entry})
+    session_store._ensure_loaded = lambda: None  # type: ignore[method-assign]
+    gateway = types.SimpleNamespace(
+        _session_key_for_source=lambda src: "agent:main:telegram:group:1",
+    )
+
+    hooks = make_plugin_hooks(tracker)
+    hooks["pre_gateway_dispatch"](
+        event=event,
+        gateway=gateway,
+        session_store=session_store,
+    )
+
+    assert tracker.lookup_session_id("group:1") == "tg-group-sess"
+    assert tracker.lookup_tracker_session_id("group:1") is None
+    assert [e.kind for e in tracker.snapshot("tg-group-sess")] == [
+        "inbound",
+        "display.user",
+    ]
 
 
 def test_pre_llm_call_binds_from_meta_chat_id(tracker: SessionTracker) -> None:
@@ -379,6 +435,235 @@ def test_lookup_prefers_session_with_terminal_lines(tracker: SessionTracker) -> 
     meta_rich.last_event_at = 500.0
 
     assert tracker.lookup_session_id("bob") == "rich-ended"
+
+
+def test_session_finalize_first_creates_ended_meta(tracker: SessionTracker) -> None:
+    hooks = make_plugin_hooks(tracker)
+    hooks["on_session_finalize"](session_id="old-finalized", platform="infoflow")
+    meta = tracker.get_meta("old-finalized")
+    assert meta is not None
+    assert meta.status == "ended"
+
+
+def test_tracker_session_aggregates_multiple_hermes_sessions(
+    tracker: SessionTracker,
+) -> None:
+    tracker.bind_chat("group:9", "old-hermes")
+    tracker.push_event(
+        "old-hermes",
+        "display.user",
+        {"text": "first"},
+        platform="infoflow",
+    )
+    tracker.push_event(
+        "old-hermes",
+        "session.end",
+        {"completed": True},
+        platform="infoflow",
+    )
+
+    tracker.bind_chat("group:9", "new-hermes")
+    tracker.push_event(
+        "new-hermes",
+        "session.start",
+        {"model": "m"},
+        platform="infoflow",
+    )
+    tracker.push_event(
+        "new-hermes",
+        "display.hermes",
+        {"text": "reply"},
+        platform="infoflow",
+    )
+
+    tracker_sid = tracker.lookup_tracker_session_id("group:9")
+    assert tracker_sid == "chat:group:9"
+    assert tracker.latest_hermes_session_id("group:9") == "new-hermes"
+
+    events = tracker.snapshot(tracker_sid or "")
+    assert [e.kind for e in events if e.kind.startswith("display.")] == [
+        "display.user",
+        "display.hermes",
+    ]
+    hermes_ids = [
+        e.payload.get("hermes_session_id")
+        for e in events
+        if e.kind in {"display.user", "display.hermes"}
+    ]
+    assert hermes_ids == ["old-hermes", "new-hermes"]
+
+
+def test_pre_gateway_dispatch_stale_session_aggregates_into_new_session(
+    tracker: SessionTracker,
+) -> None:
+    from types import SimpleNamespace
+
+    class _Platform:
+        value = "infoflow"
+
+    source = SimpleNamespace(
+        platform=_Platform(),
+        chat_id="group:9",
+        chat_type="group",
+        user_id="alice",
+        user_name="Alice",
+    )
+    event = SimpleNamespace(source=source, text="hello")
+    old_entry = SimpleNamespace(
+        session_id="old-hermes",
+        session_key="agent:main:infoflow:group:9",
+        suspended=False,
+    )
+
+    def _session_key_for_source(src: object) -> str:
+        return "agent:main:infoflow:group:9"
+
+    def _ensure_loaded() -> None:
+        return None
+
+    def _should_reset(entry: object, src: object) -> str:
+        return "idle"
+
+    session_store = SimpleNamespace(
+        _entries={"agent:main:infoflow:group:9": old_entry},
+    )
+    session_store._ensure_loaded = _ensure_loaded  # type: ignore[method-assign]
+    session_store._should_reset = _should_reset  # type: ignore[method-assign]
+    gateway = SimpleNamespace(_session_key_for_source=_session_key_for_source)
+
+    hooks = make_plugin_hooks(tracker)
+    hooks["pre_gateway_dispatch"](
+        event=event,
+        gateway=gateway,
+        session_store=session_store,
+    )
+    assert tracker.lookup_session_id("group:9") == "pending:group:9"
+
+    hooks["on_session_start"](
+        session_id="new-hermes",
+        model="m",
+        platform="infoflow",
+    )
+    hooks["post_llm_call"](
+        session_id="new-hermes",
+        assistant_response="ok",
+        model="m",
+        platform="infoflow",
+    )
+
+    tracker_sid = tracker.lookup_tracker_session_id("group:9")
+    assert tracker_sid == "chat:group:9"
+    assert tracker.latest_hermes_session_id("group:9") == "new-hermes"
+    events = tracker.snapshot(tracker_sid or "")
+    assert [e.kind for e in events if e.kind in {"display.user", "display.hermes"}] == [
+        "display.user",
+        "display.hermes",
+    ]
+
+
+def test_post_gateway_session_resolved_binds_concurrent_pending_chats(
+    tracker: SessionTracker,
+) -> None:
+    hooks = make_plugin_hooks(tracker)
+
+    hooks["pre_gateway_dispatch"](
+        event=types.SimpleNamespace(
+            source=types.SimpleNamespace(
+                platform=types.SimpleNamespace(value="infoflow"),
+                chat_id="group:1",
+                chat_type="group",
+                user_id="alice",
+                user_name="Alice",
+            ),
+            text="first",
+        ),
+        gateway=None,
+        session_store=None,
+    )
+    hooks["pre_gateway_dispatch"](
+        event=types.SimpleNamespace(
+            source=types.SimpleNamespace(
+                platform=types.SimpleNamespace(value="infoflow"),
+                chat_id="group:2",
+                chat_type="group",
+                user_id="bob",
+                user_name="Bob",
+            ),
+            text="second",
+        ),
+        gateway=None,
+        session_store=None,
+    )
+
+    hooks["post_gateway_session_resolved"](
+        session_id="hermes-1",
+        platform="infoflow",
+        chat_id="group:1",
+        chat_type="group",
+        user_id="alice",
+        is_new_session=True,
+    )
+    hooks["post_gateway_session_resolved"](
+        session_id="hermes-2",
+        platform="infoflow",
+        chat_id="group:2",
+        chat_type="group",
+        user_id="bob",
+        is_new_session=True,
+    )
+    hooks["post_llm_call"](
+        session_id="hermes-1",
+        assistant_response="reply one",
+        model="m",
+        platform="infoflow",
+    )
+    hooks["post_llm_call"](
+        session_id="hermes-2",
+        assistant_response="reply two",
+        model="m",
+        platform="infoflow",
+    )
+
+    events_1 = tracker.snapshot("chat:group:1")
+    events_2 = tracker.snapshot("chat:group:2")
+    assert [e.payload.get("text") for e in events_1 if e.kind.startswith("display.")] == [
+        "first",
+        "reply one",
+    ]
+    assert [e.payload.get("text") for e in events_2 if e.kind.startswith("display.")] == [
+        "second",
+        "reply two",
+    ]
+
+
+def test_post_gateway_session_resolved_updates_tracker_active_idle_state(
+    tracker: SessionTracker,
+) -> None:
+    hooks = make_plugin_hooks(tracker)
+    hooks["post_gateway_session_resolved"](
+        session_id="hermes-active",
+        platform="infoflow",
+        chat_id="group:9",
+        chat_type="group",
+        user_id="alice",
+        is_new_session=False,
+    )
+
+    tracker_meta = tracker.get_meta("chat:group:9")
+    hermes_meta = tracker.get_meta("hermes-active")
+    assert tracker_meta is not None
+    assert hermes_meta is not None
+    assert tracker_meta.status == "active"
+    assert hermes_meta.status == "active"
+
+    hooks["on_session_end"](
+        session_id="hermes-active",
+        platform="infoflow",
+        model="m",
+        completed=True,
+    )
+    assert tracker.get_meta("hermes-active").status == "ended"  # type: ignore[union-attr]
+    assert tracker.get_meta("chat:group:9").status == "idle"  # type: ignore[union-attr]
 
 
 def test_on_stream_delta_pushes_hermes_stream(tracker: SessionTracker) -> None:

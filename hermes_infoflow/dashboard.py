@@ -34,6 +34,7 @@ DEFAULT_EVENT_BUFFER = 2000
 MAX_TEXT_PREVIEW = 4000
 MAX_ARGS_PREVIEW = 8000
 LOCALHOST_ADDRS = frozenset({"127.0.0.1", "::1"})
+TRACKER_SESSION_PREFIX = "chat:"
 
 _tracker_singleton: SessionTracker | None = None
 
@@ -69,7 +70,7 @@ class SessionMeta:
     user_id: str = ""
     started_at: float = field(default_factory=time.time)
     last_event_at: float = field(default_factory=time.time)
-    status: str = "active"  # active | ended
+    status: str = "active"  # active | idle | ended
     n_events: int = 0
 
     def to_dict(self) -> dict[str, Any]:
@@ -101,16 +102,63 @@ class SessionTracker:
         self._events: dict[str, deque[SessionEvent]] = {}
         self._seq: dict[str, int] = {}
         self._chat_to_session: dict[str, str] = {}
+        self._hermes_to_chat: dict[str, str] = {}
         self._subscribers: dict[str, list[asyncio.Queue[SessionEvent | None]]] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
 
     def set_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
 
-    def bind_chat(self, chat_id: str, session_id: str) -> None:
+    def tracker_session_id(self, canonical_chat_id: str) -> str:
+        canonical = normalize_chat_id(canonical_chat_id)
+        return f"{TRACKER_SESSION_PREFIX}{canonical}" if canonical else ""
+
+    def is_tracker_session_id(self, session_id: str) -> bool:
+        return (session_id or "").startswith(TRACKER_SESSION_PREFIX)
+
+    def canonical_from_tracker_session_id(self, session_id: str) -> str:
+        sid = (session_id or "").strip()
+        if not self.is_tracker_session_id(sid):
+            return ""
+        return sid[len(TRACKER_SESSION_PREFIX):]
+
+    def bind_chat(
+        self,
+        chat_id: str,
+        session_id: str,
+        *,
+        aggregate: bool = True,
+    ) -> None:
+        chat_id = normalize_chat_id(chat_id)
         if not chat_id or not session_id:
             return
         self._chat_to_session[chat_id] = session_id
+        now = time.time()
+        if (
+            not session_id.startswith("pending:")
+            and not self.is_tracker_session_id(session_id)
+            and session_id not in self._meta
+        ):
+            self._meta[session_id] = SessionMeta(
+                session_id=session_id,
+                chat_id=chat_id,
+                started_at=now,
+                last_event_at=now,
+            )
+        if not session_id.startswith("pending:") and not self.is_tracker_session_id(session_id):
+            self._hermes_to_chat[session_id] = chat_id
+        tracker_sid = self.tracker_session_id(chat_id) if aggregate else ""
+        if tracker_sid and tracker_sid not in self._meta:
+            src_meta = self._meta.get(session_id)
+            self._meta[tracker_sid] = SessionMeta(
+                session_id=tracker_sid,
+                platform=(src_meta.platform if src_meta else "") or "",
+                model=(src_meta.model if src_meta else "") or "",
+                chat_id=chat_id,
+                started_at=now,
+                last_event_at=now,
+                status="idle",
+            )
         pending = f"pending:{chat_id}"
         if pending in self._meta and pending != session_id:
             pm = self._meta.pop(pending, None)
@@ -146,12 +194,51 @@ class SessionTracker:
         chat_id: str = "",
     ) -> SessionEvent | None:
         sid = (session_id or "").strip()
+        chat_id = normalize_chat_id(chat_id)
         if not sid and chat_id:
             sid = self.resolve_session_id(chat_id=chat_id)
         if not sid:
             return None
 
+        raw_payload = payload or {}
+        payload_chat = normalize_chat_id(str(raw_payload.get("chat_id") or ""))
+        canonical_chat = chat_id or payload_chat
+        if not canonical_chat:
+            canonical_chat = self._chat_for_session(sid)
+
         now = time.time()
+        ev = self._append_event(
+            sid,
+            kind,
+            raw_payload,
+            now=now,
+            platform=platform,
+            model=model,
+            chat_id=canonical_chat,
+        )
+        self._append_tracker_event(
+            source_sid=sid,
+            kind=kind,
+            payload=raw_payload,
+            now=now,
+            platform=platform,
+            model=model,
+            chat_id=canonical_chat,
+        )
+        return ev
+
+    def _append_event(
+        self,
+        sid: str,
+        kind: str,
+        payload: dict[str, Any],
+        *,
+        now: float,
+        platform: str = "",
+        model: str = "",
+        chat_id: str = "",
+    ) -> SessionEvent:
+        chat_id = normalize_chat_id(chat_id)
         meta = self._meta.get(sid)
         if meta is None:
             meta = SessionMeta(
@@ -163,6 +250,16 @@ class SessionTracker:
             )
             self._meta[sid] = meta
         meta.last_event_at = now
+        if kind in {"session.start", "llm.request", "tool.start"}:
+            meta.status = "active"
+        elif kind == "session.end":
+            meta.status = "idle" if self.is_tracker_session_id(sid) else "ended"
+        elif (
+            kind == "display.status"
+            and isinstance(payload, dict)
+            and "requesting" in str(payload.get("line") or "")
+        ):
+            meta.status = "active"
         if platform:
             meta.platform = platform
         effective_chat = chat_id or meta.chat_id
@@ -174,18 +271,76 @@ class SessionTracker:
         if model:
             meta.model = model
 
-        if effective_chat and not sid.startswith("pending:"):
-            self._chat_to_session[normalize_chat_id(effective_chat)] = sid
+        if effective_chat and not sid.startswith("pending:") and not self.is_tracker_session_id(sid):
+            canonical = normalize_chat_id(effective_chat)
+            self._chat_to_session[canonical] = sid
+            self._hermes_to_chat[sid] = canonical
 
         seq = self._seq.get(sid, 0) + 1
         self._seq[sid] = seq
-        safe_payload = _json_safe(payload or {})
+        safe_payload = _json_safe(payload)
         ev = SessionEvent(seq=seq, ts=now, kind=kind, payload=safe_payload)
         buf = self._events.setdefault(sid, deque(maxlen=self._buffer_size))
         buf.append(ev)
         meta.n_events = len(buf)
         self._notify(sid, ev)
         return ev
+
+    def _append_tracker_event(
+        self,
+        *,
+        source_sid: str,
+        kind: str,
+        payload: dict[str, Any],
+        now: float,
+        platform: str = "",
+        model: str = "",
+        chat_id: str = "",
+    ) -> None:
+        if self.is_tracker_session_id(source_sid):
+            return
+        event_platform = _platform_str(platform).lower()
+        if not event_platform:
+            meta = self._meta.get(source_sid)
+            if meta is not None:
+                event_platform = (meta.platform or "").lower()
+        if event_platform and event_platform != "infoflow":
+            return
+        canonical = normalize_chat_id(chat_id) or self._chat_for_session(source_sid)
+        if not canonical:
+            return
+        tracker_sid = self.tracker_session_id(canonical)
+        tracker_payload = dict(payload)
+        tracker_payload.setdefault("chat_id", canonical)
+        if source_sid and not source_sid.startswith("pending:"):
+            tracker_payload.setdefault("hermes_session_id", source_sid)
+        elif source_sid.startswith("pending:"):
+            tracker_payload.setdefault("pending_session_id", source_sid)
+        self._append_event(
+            tracker_sid,
+            kind,
+            tracker_payload,
+            now=now,
+            platform=platform,
+            model=model,
+            chat_id=canonical,
+        )
+
+    def _chat_for_session(self, session_id: str) -> str:
+        sid = (session_id or "").strip()
+        if not sid:
+            return ""
+        if self.is_tracker_session_id(sid):
+            return self.canonical_from_tracker_session_id(sid)
+        if sid.startswith("pending:"):
+            return normalize_chat_id(sid[len("pending:"):])
+        mapped = self._hermes_to_chat.get(sid)
+        if mapped:
+            return mapped
+        meta = self._meta.get(sid)
+        if meta is not None:
+            return normalize_chat_id(meta.chat_id or meta.user_id or "")
+        return ""
 
     def _n_events_update(self, sid: str) -> None:
         m = self._meta.get(sid)
@@ -229,7 +384,7 @@ class SessionTracker:
     def list_sessions(self, scope: str = "infoflow") -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         for sid, meta in self._meta.items():
-            if sid.startswith("pending:"):
+            if sid.startswith("pending:") or self.is_tracker_session_id(sid):
                 continue
             plat = (meta.platform or "").lower()
             if scope == "infoflow" and plat != "infoflow":
@@ -302,7 +457,7 @@ class SessionTracker:
         best_sid: str | None = None
         best_rank: tuple[int, float, int] = (-1, 0.0, -1)
         for sid, meta in self._meta.items():
-            if sid.startswith("pending:"):
+            if sid.startswith("pending:") or self.is_tracker_session_id(sid):
                 continue
             if (
                 not self.meta_matches_canonical(meta, canonical)
@@ -330,6 +485,55 @@ class SessionTracker:
         if pending in self._meta:
             return pending
         return None
+
+    def lookup_tracker_session_id(self, canonical_chat_id: str) -> str | None:
+        canonical = normalize_chat_id(canonical_chat_id)
+        if not canonical:
+            return None
+        sid = self.tracker_session_id(canonical)
+        if sid in self._meta or sid in self._events:
+            return sid
+        pending = f"pending:{canonical}"
+        if pending in self._meta or pending in self._events:
+            return sid
+        return None
+
+    def latest_hermes_session_id(self, canonical_chat_id: str) -> str:
+        canonical = normalize_chat_id(canonical_chat_id)
+        if not canonical:
+            return ""
+        best_sid = ""
+        best_rank: tuple[int, float] = (-1, 0.0)
+        for sid, meta in self._meta.items():
+            if sid.startswith("pending:") or self.is_tracker_session_id(sid):
+                continue
+            if (
+                not self.meta_matches_canonical(meta, canonical)
+                and not self._session_payload_matches(sid, canonical)
+            ):
+                continue
+            rank = (1 if meta.status == "active" else 0, meta.last_event_at)
+            if rank > best_rank:
+                best_rank = rank
+                best_sid = sid
+        return best_sid
+
+    def mark_session_idle(self, session_id: str) -> None:
+        sid = (session_id or "").strip()
+        if not sid:
+            return
+        now = time.time()
+        meta = self._meta.get(sid)
+        if meta is not None:
+            meta.status = "idle" if self.is_tracker_session_id(sid) else "ended"
+            meta.last_event_at = now
+        canonical = self._chat_for_session(sid)
+        tracker_sid = self.tracker_session_id(canonical)
+        if tracker_sid and tracker_sid != sid:
+            tracker_meta = self._meta.get(tracker_sid)
+            if tracker_meta is not None:
+                tracker_meta.status = "idle"
+                tracker_meta.last_event_at = now
 
 
 class contextlib_suppress:
@@ -438,6 +642,40 @@ def _platform_str(platform: Any) -> str:
     return str(platform)
 
 
+def _infoflow_canonical_chat_id(
+    chat_id: Any,
+    *,
+    chat_type: Any = "",
+    user_id: Any = "",
+) -> str:
+    cid = normalize_chat_id(str(chat_id or ""))
+    ctype = str(chat_type or "").strip().lower()
+    uid = normalize_chat_id(str(user_id or ""))
+
+    if cid.startswith("group:"):
+        return cid
+    if ctype in {"group", "2", "3", "5", "6"}:
+        return f"group:{cid}" if cid else ""
+    return uid or cid
+
+
+def _gateway_chat_id_for_tracker(
+    platform: Any,
+    chat_id: Any,
+    *,
+    chat_type: Any = "",
+    user_id: Any = "",
+) -> str:
+    plat = _platform_str(platform).lower()
+    if plat == "infoflow":
+        return _infoflow_canonical_chat_id(
+            chat_id,
+            chat_type=chat_type,
+            user_id=user_id,
+        )
+    return normalize_chat_id(str(chat_id or ""))
+
+
 def _peek_gateway_session(
     gateway: Any,
     session_store: Any,
@@ -457,8 +695,17 @@ def _peek_gateway_session(
         session_store._ensure_loaded()  # noqa: SLF001
         entry = session_store._entries.get(session_key)  # noqa: SLF001
         if entry is not None:
-            session_id = getattr(entry, "session_id", "") or ""
             session_key = getattr(entry, "session_key", "") or session_key
+            should_reset = bool(getattr(entry, "suspended", False))
+            if not should_reset and hasattr(session_store, "_should_reset"):
+                try:
+                    should_reset = bool(
+                        session_store._should_reset(entry, source)  # noqa: SLF001
+                    )
+                except Exception:
+                    should_reset = False
+            if not should_reset:
+                session_id = getattr(entry, "session_id", "") or ""
     except Exception:
         pass
     return session_id, session_key
@@ -518,9 +765,7 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
     def on_session_end(**kw: Any) -> None:
         sid = kw.get("session_id") or ""
         plat = _platform_str(kw.get("platform"))
-        meta = tracker.get_meta(sid)
-        if meta is not None:
-            meta.status = "ended"
+        tracker.mark_session_idle(sid)
         tracker.push_event(
             sid,
             "session.end",
@@ -538,9 +783,7 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
     def on_session_finalize(**kw: Any) -> None:
         sid = kw.get("session_id") or ""
         plat = _platform_str(kw.get("platform"))
-        meta = tracker.get_meta(sid)
-        if meta is not None:
-            meta.status = "ended"
+        tracker.mark_session_idle(sid)
         tracker.push_event(
             sid,
             "session.end",
@@ -555,7 +798,11 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
         plat = _platform_str(kw.get("platform"))
         meta = tracker.get_meta(sid) if sid else None
         if meta is not None and meta.chat_id and sid:
-            tracker.bind_chat(normalize_chat_id(meta.chat_id), sid)
+            tracker.bind_chat(
+                normalize_chat_id(meta.chat_id),
+                sid,
+                aggregate=((meta.platform or "").lower() in {"", "infoflow"}),
+            )
         tracker.push_event(
             sid,
             "llm.request",
@@ -758,6 +1005,50 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
         )
 
     @_safe
+    def post_gateway_session_resolved(**kw: Any) -> None:
+        sid = str(kw.get("session_id") or "").strip()
+        if not sid:
+            return
+
+        source = kw.get("source")
+        plat = _platform_str(
+            kw.get("platform")
+            or (getattr(source, "platform", None) if source is not None else None)
+        )
+        if plat.lower() != "infoflow":
+            return
+        raw_chat_id = kw.get("chat_id")
+        if raw_chat_id is None and source is not None:
+            raw_chat_id = getattr(source, "chat_id", "")
+        chat_type = kw.get("chat_type")
+        if chat_type is None and source is not None:
+            chat_type = getattr(source, "chat_type", "")
+        user_id = kw.get("user_id")
+        if user_id is None and source is not None:
+            user_id = getattr(source, "user_id", "")
+        chat_id = _gateway_chat_id_for_tracker(
+            plat,
+            raw_chat_id,
+            chat_type=chat_type,
+            user_id=user_id,
+        )
+        if not chat_id:
+            return
+
+        tracker.bind_chat(chat_id, sid)
+        now = time.time()
+        for meta_sid in (sid, tracker.tracker_session_id(chat_id)):
+            meta = tracker.get_meta(meta_sid)
+            if meta is None:
+                continue
+            meta.platform = plat or meta.platform
+            meta.chat_id = chat_id
+            meta.chat_type = str(chat_type or "")
+            meta.user_id = str(user_id or "")
+            meta.status = "active"
+            meta.last_event_at = now
+
+    @_safe
     def pre_gateway_dispatch(**kw: Any) -> None:
         event = kw.get("event")
         gateway = kw.get("gateway")
@@ -768,12 +1059,21 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
         if source is None:
             return
         plat = _platform_str(getattr(source, "platform", None))
-        chat_id = normalize_chat_id(getattr(source, "chat_id", "") or "")
         chat_type = getattr(source, "chat_type", "") or ""
         user_id = getattr(source, "user_id", "") or ""
+        chat_id = _gateway_chat_id_for_tracker(
+            plat,
+            getattr(source, "chat_id", "") or "",
+            chat_type=chat_type,
+            user_id=user_id,
+        )
         session_id, session_key = _peek_gateway_session(gateway, session_store, source)
         if session_id and chat_id:
-            tracker.bind_chat(chat_id, session_id)
+            tracker.bind_chat(
+                chat_id,
+                session_id,
+                aggregate=(plat.lower() == "infoflow"),
+            )
             meta = tracker.get_meta(session_id)
             if meta is not None:
                 meta.chat_id = chat_id
@@ -1031,6 +1331,7 @@ def make_plugin_hooks(tracker: SessionTracker) -> dict[str, Callable[..., Any]]:
         "post_tool_call": post_tool_call,
         "pre_api_request": pre_api_request,
         "post_api_request": post_api_request,
+        "post_gateway_session_resolved": post_gateway_session_resolved,
         "pre_gateway_dispatch": pre_gateway_dispatch,
         "on_stream_delta": on_stream_delta,
         "on_tool_progress": on_tool_progress,
