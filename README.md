@@ -215,8 +215,8 @@ bash scripts/deploy.sh --port 9000 # 指定 webhook 端口并写入 ~/.hermes/.e
 | `INFOFLOW_HOME_CHANNEL_NAME` | 同上 | Home channel 显示名 |
 | `INFOFLOW_REPLY_MODE` | `mention-and-watch` | `ignore` / `record` / `mention-only` / `mention-and-watch` / `proactive` |
 | `INFOFLOW_REQUIRE_MENTION` | `true` | 群消息是否仅在 @ 时响应 |
-| `INFOFLOW_WATCH_MENTIONS` | 无 | 逗号分隔；命中后即使没 @ 机器人也会触发 |
-| `INFOFLOW_WATCH_REGEX` | 无 | 正则匹配触发（多行或 `|||` 分隔） |
+| `INFOFLOW_WATCH_MENTIONS` | 无 | 单个用户名 / ID，或逗号分隔多个用户名 / ID；命中后即使没 @ 机器人也会触发 |
+| `INFOFLOW_WATCH_REGEX` | 无 | 单条正则匹配触发；多条正则使用 `INFOFLOW_WATCH_REGEX_*` |
 | `INFOFLOW_FOLLOW_UP` | `true` | 机器人回复后群聊 follow-up 窗口是否开启 |
 | `INFOFLOW_FOLLOW_UP_WINDOW` | `300` | follow-up 窗口秒数 |
 | `INFOFLOW_GROUPS` | 无 | 按群 ID 的 JSON 配置覆盖 |
@@ -228,6 +228,28 @@ bash scripts/deploy.sh --port 9000 # 指定 webhook 端口并写入 ~/.hermes/.e
 | `INFOFLOW_DASHBOARD_EVENT_BUFFER` | `2000` | 每个 session 在内存中保留的最大事件条数 |
 | `INFOFLOW_SESSIONTRACKER_ENABLED` | `true` | 是否启用 Session Tracker Web UI |
 | `INFOFLOW_SESSIONTRACKER_FULL_USER_MESSAGE` | `false` | Session Tracker 中通过 `code` 解析为 admin viewer 时，用户输入行是否显示完整 Hermes user message；非 admin 始终只显示 `[Message]` 后正文 |
+
+`INFOFLOW_WATCH_MENTIONS` 可以只写一个值，也可以用英文逗号分隔多个值：
+
+```dotenv
+# 单个用户
+INFOFLOW_WATCH_MENTIONS=chengbo05
+```
+
+```dotenv
+# 多个用户
+INFOFLOW_WATCH_MENTIONS=chengbo05,alice,12345
+```
+
+`INFOFLOW_WATCH_REGEX` 表示一条正则；需要多条正则时，为每条规则增加一个
+`INFOFLOW_WATCH_REGEX_` 前缀的环境变量。运行时会先读取
+`INFOFLOW_WATCH_REGEX`，再按变量名自然排序读取 `INFOFLOW_WATCH_REGEX_*`。
+
+```dotenv
+INFOFLOW_WATCH_REGEX=^(?=.*iphone)(?=.*crash)(?=.*异常).*$
+INFOFLOW_WATCH_REGEX_icode=^https://console\.cloud\.baidu-int\.com/devops/icode/repos/baidu(?:/[^/]+)*/reviews(?:/[^/]+)*$
+INFOFLOW_WATCH_REGEX_ios=iphone|ios|crash
+```
 
 `INFOFLOW_ROBOT_NAME` 仍按可选配置处理：当本地还没有持久化的
 `INFOFLOW_ROBOT_ID`，且机器人显示名缺失或已过期时，fresh install

@@ -30,11 +30,42 @@ MAX_MESSAGE_LENGTH = 2048  # matches OpenClaw textChunkLimit
 DEFAULT_BODY_LIMIT_BYTES = 20 * 1024 * 1024
 GROUP_TARGET_RE = re.compile(r"^(?:group:)?(\d+)$", re.IGNORECASE)
 MAX_PREVIEW_LENGTH = 100  # matches openclaw reply-dispatcher truncatePreview()
+WATCH_REGEX_ENV = "INFOFLOW_WATCH_REGEX"
+WATCH_REGEX_ENV_PREFIX = f"{WATCH_REGEX_ENV}_"
 
 
 # ---------------------------------------------------------------------------
 # Settings reader
 # ---------------------------------------------------------------------------
+
+
+def _watch_regex_env_values() -> list[str]:
+    """Return regex patterns configured via INFOFLOW_WATCH_REGEX env vars."""
+    patterns: list[str] = []
+    direct = os.getenv(WATCH_REGEX_ENV, "").strip()
+    if direct:
+        patterns.append(direct)
+
+    def sort_key(key: str) -> tuple[tuple[int, int | str], ...]:
+        suffix = key[len(WATCH_REGEX_ENV_PREFIX):]
+        parts: list[tuple[int, int | str]] = []
+        for part in re.split(r"(\d+)", suffix):
+            if not part:
+                continue
+            parts.append((0, int(part)) if part.isdigit() else (1, part))
+        return tuple(parts)
+
+    prefixed_keys = (
+        key
+        for key in os.environ
+        if key.startswith(WATCH_REGEX_ENV_PREFIX)
+        and len(key) > len(WATCH_REGEX_ENV_PREFIX)
+    )
+    for key in sorted(prefixed_keys, key=sort_key):
+        value = os.getenv(key, "").strip()
+        if value:
+            patterns.append(value)
+    return patterns
 
 
 def _read_account_settings(config: Any) -> dict[str, Any]:
@@ -46,6 +77,7 @@ def _read_account_settings(config: Any) -> dict[str, Any]:
     extra: dict[str, Any] = {}
     if config is not None:
         extra = dict(getattr(config, "extra", None) or {})
+    watch_regex_env = _watch_regex_env_values()
 
     def pick(env_name: str, key: str, default: Any = None) -> Any:
         env_val = os.getenv(env_name)
@@ -73,7 +105,9 @@ def _read_account_settings(config: Any) -> dict[str, Any]:
         "reply_mode": (pick("INFOFLOW_REPLY_MODE", "reply_mode", "mention-and-watch") or "mention-and-watch"),
         "require_mention_raw": pick("INFOFLOW_REQUIRE_MENTION", "require_mention", "true"),
         "watch_mentions_raw": pick("INFOFLOW_WATCH_MENTIONS", "watch_mentions", ""),
-        "watch_regex_raw": pick("INFOFLOW_WATCH_REGEX", "watch_regex", ""),
+        "watch_regex_raw": (
+            watch_regex_env if watch_regex_env else pick(WATCH_REGEX_ENV, "watch_regex", "")
+        ),
         "follow_up_raw": pick("INFOFLOW_FOLLOW_UP", "follow_up", "true"),
         "follow_up_window_raw": pick("INFOFLOW_FOLLOW_UP_WINDOW", "follow_up_window", "300"),
         "groups_raw": pick("INFOFLOW_GROUPS", "groups", None),
@@ -113,15 +147,14 @@ def _read_account_settings(config: Any) -> dict[str, Any]:
     else:
         settings["watch_mentions"] = [s.strip() for s in str(watch_raw).split(",") if s.strip()]
 
-    # CSV-ish (regex) — use a sentinel separator to allow commas inside patterns.
-    # Convention: separate patterns with newline OR ``|||`` (3 pipes); single
-    # pipes are commonly part of regex alternation so don't split on them.
+    # Regex watch patterns: INFOFLOW_WATCH_REGEX is one pattern, and each
+    # INFOFLOW_WATCH_REGEX_* env var contributes one additional pattern.
     regex_raw = settings.pop("watch_regex_raw") or ""
-    if isinstance(regex_raw, list):
+    if isinstance(regex_raw, (list, tuple)):
         settings["watch_regex"] = [str(x).strip() for x in regex_raw if str(x).strip()]
     else:
-        normalized = str(regex_raw).replace("|||", "\n")
-        settings["watch_regex"] = [s.strip() for s in normalized.split("\n") if s.strip()]
+        regex_text = str(regex_raw).strip()
+        settings["watch_regex"] = [regex_text] if regex_text else []
 
     # Per-group overrides. Accept either an already-decoded dict (config.extra)
     # or a JSON string (env var).
@@ -192,7 +225,6 @@ def _env_enablement() -> dict | None:
         ("INFOFLOW_REPLY_MODE", "reply_mode"),
         ("INFOFLOW_REQUIRE_MENTION", "require_mention"),
         ("INFOFLOW_WATCH_MENTIONS", "watch_mentions"),
-        ("INFOFLOW_WATCH_REGEX", "watch_regex"),
         ("INFOFLOW_FOLLOW_UP", "follow_up"),
         ("INFOFLOW_FOLLOW_UP_WINDOW", "follow_up_window"),
         ("INFOFLOW_GROUPS", "groups"),
@@ -202,6 +234,9 @@ def _env_enablement() -> dict | None:
         val = os.getenv(env_key, "").strip()
         if val:
             seed[settings_key] = val
+    watch_regex = _watch_regex_env_values()
+    if watch_regex:
+        seed["watch_regex"] = watch_regex
     home = os.getenv("INFOFLOW_HOME_CHANNEL", "").strip()
     if home:
         seed["home_channel"] = {

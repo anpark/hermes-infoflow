@@ -11,6 +11,7 @@ These cover the moving parts added in the OpenClaw parity pass:
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -139,6 +140,12 @@ def _cfg(extra: dict | None = None):
     return SimpleNamespace(extra=extra or {})
 
 
+def _clear_watch_regex_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key in list(os.environ):
+        if key == "INFOFLOW_WATCH_REGEX" or key.startswith("INFOFLOW_WATCH_REGEX_"):
+            monkeypatch.delenv(key, raising=False)
+
+
 def test_read_settings_default_port_without_env(monkeypatch) -> None:
     monkeypatch.delenv("INFOFLOW_PORT", raising=False)
     s = _read_account_settings(_cfg())
@@ -165,6 +172,21 @@ def test_env_enablement_uses_default_api_host(monkeypatch) -> None:
     assert seed["api_host"] == DEFAULT_API_HOST
 
 
+def test_env_enablement_includes_prefixed_watch_regex(monkeypatch) -> None:
+    _clear_watch_regex_env(monkeypatch)
+    monkeypatch.setenv("INFOFLOW_APP_KEY", "k")
+    monkeypatch.setenv("INFOFLOW_APP_SECRET", "s")
+    monkeypatch.setenv("INFOFLOW_CHECK_TOKEN", "tok")
+    monkeypatch.setenv("INFOFLOW_ENCODING_AES_KEY", "aes")
+    monkeypatch.setenv("INFOFLOW_WATCH_REGEX", "\\bdeploy\\b")
+    monkeypatch.setenv("INFOFLOW_WATCH_REGEX_001_ios", "iphone|ios|crash")
+
+    seed = _env_enablement()
+
+    assert seed is not None
+    assert seed["watch_regex"] == ["\\bdeploy\\b", "iphone|ios|crash"]
+
+
 def test_requirements_do_not_require_api_host(monkeypatch) -> None:
     monkeypatch.delenv("INFOFLOW_API_HOST", raising=False)
     monkeypatch.setenv("INFOFLOW_APP_KEY", "k")
@@ -174,16 +196,66 @@ def test_requirements_do_not_require_api_host(monkeypatch) -> None:
     assert _check_requirements() is True
 
 
-def test_read_settings_parses_watch_regex_via_separator(monkeypatch) -> None:
-    monkeypatch.delenv("INFOFLOW_WATCH_REGEX", raising=False)
+def test_read_settings_parses_single_watch_mention_from_env(monkeypatch) -> None:
+    monkeypatch.setenv("INFOFLOW_WATCH_MENTIONS", "chengbo05")
+    s = _read_account_settings(_cfg())
+    assert s["watch_mentions"] == ["chengbo05"]
+
+
+def test_read_settings_parses_comma_watch_mentions_from_env(monkeypatch) -> None:
+    monkeypatch.setenv("INFOFLOW_WATCH_MENTIONS", "chengbo05, alice, 12345")
+    s = _read_account_settings(_cfg())
+    assert s["watch_mentions"] == ["chengbo05", "alice", "12345"]
+
+
+def test_read_settings_parses_watch_regex_from_config_list(monkeypatch) -> None:
+    _clear_watch_regex_env(monkeypatch)
     s = _read_account_settings(_cfg({"watch_regex": ["\\bdeploy\\b", "ship\\s+it"]}))
     assert s["watch_regex"] == ["\\bdeploy\\b", "ship\\s+it"]
 
 
-def test_read_settings_parses_watch_regex_from_env(monkeypatch) -> None:
-    monkeypatch.setenv("INFOFLOW_WATCH_REGEX", "\\bdeploy\\b|||ship\\s+it")
+def test_read_settings_parses_single_watch_regex_from_env(monkeypatch) -> None:
+    _clear_watch_regex_env(monkeypatch)
+    monkeypatch.setenv("INFOFLOW_WATCH_REGEX", "\\bdeploy\\b")
     s = _read_account_settings(_cfg())
-    assert s["watch_regex"] == ["\\bdeploy\\b", "ship\\s+it"]
+    assert s["watch_regex"] == ["\\bdeploy\\b"]
+
+
+def test_read_settings_parses_prefixed_watch_regex_env(monkeypatch) -> None:
+    _clear_watch_regex_env(monkeypatch)
+    monkeypatch.setenv("INFOFLOW_WATCH_REGEX_ios", "iphone|ios|crash")
+    monkeypatch.setenv("INFOFLOW_WATCH_REGEX_icode", "^https://console\\.cloud")
+    s = _read_account_settings(_cfg())
+    assert s["watch_regex"] == ["^https://console\\.cloud", "iphone|ios|crash"]
+
+
+def test_read_settings_merges_direct_and_prefixed_watch_regex_env(monkeypatch) -> None:
+    _clear_watch_regex_env(monkeypatch)
+    monkeypatch.setenv("INFOFLOW_WATCH_REGEX", "\\bdeploy\\b")
+    monkeypatch.setenv("INFOFLOW_WATCH_REGEX_002_icode", "^https://console\\.cloud")
+    monkeypatch.setenv("INFOFLOW_WATCH_REGEX_001_ios", "iphone|ios|crash")
+    s = _read_account_settings(_cfg())
+    assert s["watch_regex"] == [
+        "\\bdeploy\\b",
+        "iphone|ios|crash",
+        "^https://console\\.cloud",
+    ]
+
+
+def test_read_settings_sorts_numbered_watch_regex_env_naturally(monkeypatch) -> None:
+    _clear_watch_regex_env(monkeypatch)
+    monkeypatch.setenv("INFOFLOW_WATCH_REGEX_10", "ten")
+    monkeypatch.setenv("INFOFLOW_WATCH_REGEX_2", "two")
+    monkeypatch.setenv("INFOFLOW_WATCH_REGEX_1", "one")
+    s = _read_account_settings(_cfg())
+    assert s["watch_regex"] == ["one", "two", "ten"]
+
+
+def test_read_settings_watch_regex_env_prefix_overrides_config(monkeypatch) -> None:
+    _clear_watch_regex_env(monkeypatch)
+    monkeypatch.setenv("INFOFLOW_WATCH_REGEX_icode", "^https://console\\.cloud")
+    s = _read_account_settings(_cfg({"watch_regex": ["config"]}))
+    assert s["watch_regex"] == ["^https://console\\.cloud"]
 
 
 def test_read_settings_parses_follow_up_window(monkeypatch) -> None:

@@ -120,12 +120,12 @@ optional_env:
     prompt: "Require mention? (true/false)"
     password: false
   - name: INFOFLOW_WATCH_MENTIONS
-    description: "Comma-separated names; @-mentioning any of them triggers the bot in mention-and-watch mode"
-    prompt: "Watch mentions (comma-separated)"
+    description: "Single name/id or comma-separated names/ids; @-mentioning any of them triggers the bot in mention-and-watch mode"
+    prompt: "Watch mentions (single or comma-separated)"
     password: false
   - name: INFOFLOW_WATCH_REGEX
-    description: "Regex patterns triggering the bot when matched in message text. Separate multiple patterns with newlines or '|||' (single '|' is preserved for regex alternation)."
-    prompt: "Watch regex patterns (newline / |||-separated)"
+    description: "Single regex triggering the bot when matched in message text. Add more patterns with INFOFLOW_WATCH_REGEX_* env vars."
+    prompt: "Watch regex pattern"
     password: false
   - name: INFOFLOW_FOLLOW_UP
     description: "Enable follow-up replies after bot responds (default true). When true, the bot continues to engage messages in the same group within the follow-up window."
