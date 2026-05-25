@@ -42,6 +42,7 @@ from enum import StrEnum
 from typing import Any
 
 from .itypes import IncomingMessage
+from .prompt_rules import INFOFLOW_DELIVERY_TOOL_RULES
 
 # All five OpenClaw modes are now first-class. Legacy aliases route to the
 # closest match, with a warning to encourage a config update.
@@ -593,21 +594,20 @@ _DM_FORMAT_DOC = """\
 - `permission` 是权限级别。
 """
 
-_INFOFLOW_TOOL_RULES_DOC = """\
+_INFOFLOW_TOOL_RULES_DOC = f"""\
 ## 工具行为规范
 
 工具或指令有明确行为要求时，以该要求为准，不受“必须回复”规则约束。
+
+{INFOFLOW_DELIVERY_TOOL_RULES}
 
 调用 `infoflow_recall_message`：
 - 成功且用户只要求撤回时，最终输出单独一行 `NO_REPLY`，不输出“已撤回/撤回成功”等确认文本。
 - 成功且同一条用户消息还要求其它任务时，只回复其它任务结果，不要提及撤回已成功。
 - 失败后在当前会话简短回复“撤回失败，消息可能已过期”。
 
-发送本地图片：
-- 生成图片时优先保存到 `~/.hermes/cache/images/` 或 `~/.hermes/image_cache/`，再用 `MEDIA:<本地图片绝对路径>` 发送。
+发送图片：
 - 普通发送用 `send_message`；需要引用/quote 原消息时，用 `infoflow_reply` 的 `message` 参数携带正文和 `MEDIA:<本地图片绝对路径>`。
-- `MEDIA:` 是给工具读取本地文件并上传图片字节的指令，绝不能把 `MEDIA:` 或本地路径当普通文本发给用户。
-- 如果工具提示路径不符合要求，应重新把图片写入 Hermes 图片缓存目录后重试，不要退化为发送路径文本。
 
 调用 `infoflow_get_message_history`：
 - 需要补足上下文时必须使用该工具。

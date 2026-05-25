@@ -212,6 +212,7 @@ from .policy import (
     PolicyDecision,
     normalize_reply_mode,
 )
+from .prompt_rules import INFOFLOW_DELIVERY_TOOL_RULES
 from .recall import get_inbound_body, get_inbound_sender_id, get_inbound_sender_imid
 from .recall_silence import RecallSilenceTracker
 from .sent_store import SentMessageStore
@@ -1916,11 +1917,8 @@ def register(ctx: Any) -> None:
             "- 群聊：`infoflow:group:<群组ID>`（如 `infoflow:group:4507088`）\n"
             "- 省略 target 则发送到当前会话\n"
             "\n"
-            "【发送图片】\n"
-            "需要发送本地/生成图片时，先把图片保存到 `~/.hermes/cache/images/` "
-            "或 `~/.hermes/image_cache/`，然后在发送内容中写 "
-            "`MEDIA:<本地图片绝对路径>`。如流插件会读取图片字节并调用原生图片消息 API；"
-            "绝不要把 `MEDIA:` 或本地路径当普通文本发送给用户。"
+            "【发送图片与外发工具】\n"
+            f"{INFOFLOW_DELIVERY_TOOL_RULES}\n"
             "普通图片发送使用 `send_message`；需要引用回复时使用 `infoflow_reply`，"
             "把说明文字和 `MEDIA:<路径>` 一起放入 `message`。\n"
             "\n"

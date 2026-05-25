@@ -55,6 +55,8 @@ def test_standalone_media_only_image_dm(monkeypatch, tmp_path) -> None:
 
     assert result["success"] is True
     assert result["message_id"] == "IMG"
+    assert result["delivered"] is True
+    assert result["suggested_final_response"] == "NO_REPLY"
     assert calls == [("image_dm", "alice", len(_TINY_PNG_BYTES))]
 
 
@@ -91,6 +93,8 @@ def test_standalone_text_and_image_group(monkeypatch, tmp_path) -> None:
 
     assert result["success"] is True
     assert result["message_id"] == "IMG"
+    assert result["delivered"] is True
+    assert result["suggested_final_response"] == "NO_REPLY"
     assert calls == [
         ("text_group", "4507088", "hello"),
         ("image_group", "4507088", len(_TINY_PNG_BYTES)),
@@ -109,3 +113,5 @@ def test_standalone_rejects_voice_media_without_path_leak(monkeypatch, tmp_path)
     assert "error" in result
     assert "only supports image" in result["error"]
     assert str(media_path) not in result["error"]
+    assert result.get("delivered") is not True
+    assert "suggested_final_response" not in result

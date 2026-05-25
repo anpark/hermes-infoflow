@@ -57,6 +57,8 @@ def test_infoflow_reply_media_sends_native_image_not_path_text(monkeypatch, tmp_
     assert result["success"] is True
     assert result["message_id"] == "IMG"
     assert result["media_count"] == 1
+    assert result["delivered"] is True
+    assert result["suggested_final_response"] == "NO_REPLY"
     assert calls[0] == ("preflight", str(image_path))
     assert calls[1][0] == "image"
     image_kwargs = calls[1][1]
@@ -96,6 +98,8 @@ def test_infoflow_reply_without_media_keeps_text_send(monkeypatch) -> None:
     result = json.loads(raw)
     assert result["success"] is True
     assert result["message_id"] == "TXT"
+    assert result["delivered"] is True
+    assert result["suggested_final_response"] == "NO_REPLY"
     assert calls == [{
         "chat_id": "chengbo05",
         "content": "普通引用回复",
@@ -136,6 +140,8 @@ def test_infoflow_reply_media_rejects_malformed_directive_without_path_leak(monk
         "[local image path]" in result["error"]
         or "not sending local path text" in result["error"]
     )
+    assert result.get("delivered") is not True
+    assert "suggested_final_response" not in result
 
 
 def test_infoflow_reply_media_sanitizes_image_errors(monkeypatch, tmp_path) -> None:
@@ -170,6 +176,8 @@ def test_infoflow_reply_media_sanitizes_image_errors(monkeypatch, tmp_path) -> N
     assert "error" in result
     assert str(image_path) not in result["error"]
     assert "[local image path]" in result["error"]
+    assert result.get("delivered") is not True
+    assert "suggested_final_response" not in result
 
 
 def test_image_cache_paths_are_allowed_media_roots(monkeypatch, tmp_path) -> None:

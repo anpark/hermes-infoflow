@@ -21,6 +21,7 @@ from hermes_infoflow.policy import (
     _WATCH_MENTION_PROMPT,
     _WATCH_REGEX_PROMPT,
 )
+from hermes_infoflow.prompt_rules import INFOFLOW_DELIVERY_TOOL_RULES
 
 # Render templates with placeholder values so {var} substitution doesn't
 # pollute the assertions below.
@@ -83,6 +84,15 @@ def test_recall_tool_rules_keep_silent_success_contract() -> None:
     assert "NO_REPLY" in _INFOFLOW_TOOL_RULES_DOC
     assert "其它任务" in _INFOFLOW_TOOL_RULES_DOC
     assert "撤回失败" in _INFOFLOW_TOOL_RULES_DOC
+
+
+def test_infoflow_tool_rules_include_shared_delivery_contract() -> None:
+    assert INFOFLOW_DELIVERY_TOOL_RULES in _INFOFLOW_TOOL_RULES_DOC
+    assert "外发工具规则" in INFOFLOW_DELIVERY_TOOL_RULES
+    assert "MEDIA:" in INFOFLOW_DELIVERY_TOOL_RULES
+    assert "本地路径" in INFOFLOW_DELIVERY_TOOL_RULES
+    assert "NO_REPLY" in INFOFLOW_DELIVERY_TOOL_RULES
+    assert "只发送 caption" in INFOFLOW_DELIVERY_TOOL_RULES
 
 
 def test_passive_template_keeps_recipient_gate() -> None:

@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from .llm_format import format_created_time_ms, format_dm_record, format_group_record
+from .prompt_rules import INFOFLOW_DELIVERY_TOOL_RULES, delivery_success_hint
 
 if TYPE_CHECKING:
     pass
@@ -191,6 +192,7 @@ REPLY_TOOL_SCHEMA = {
         "发送本地图片时，可在 `message` 中加入 `MEDIA:<本地图片绝对路径>`；"
         "工具会读取图片字节并调用如流原生图片消息 API，不会把本地路径作为正文发出。"
         "不要把 `MEDIA:` 或本地文件路径当普通文本发送。\n\n"
+        f"{INFOFLOW_DELIVERY_TOOL_RULES}\n\n"
         "使用场景：\n"
         "- 需要针对特定历史消息进行回应时\n"
         "- 需要让对方明确知道你在回复哪条消息时\n\n"
@@ -516,6 +518,7 @@ async def _send_reply_media(
         "message_id": last_message_id,
         "media_count": len(media_files),
     }
+    payload.update(delivery_success_hint())
     if sent_ids:
         payload["message_ids"] = sent_ids
     return tool_result_json(payload)
@@ -727,10 +730,12 @@ def make_reply_handler():
 
         if not result.success:
             return tool_result_json({"error": result.error or "reply failed"})
-        return tool_result_json({
+        payload = {
             "success": True,
             "message_id": str(result.message_id) if result.message_id else None,
-        })
+        }
+        payload.update(delivery_success_hint())
+        return tool_result_json(payload)
 
     return _handler
 

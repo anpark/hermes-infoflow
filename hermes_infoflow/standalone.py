@@ -8,6 +8,7 @@ from typing import Any
 
 from .itypes import SendOptions, SentResult
 from .media import IMAGE_LOAD_MAX_BYTES, prepare_infoflow_image_bytes
+from .prompt_rules import delivery_success_hint
 from .sent_store import SentMessageStore
 from .utils import _ImageLoadError, _resolve_safe_local_path
 
@@ -191,6 +192,7 @@ async def standalone_send(
             last_mid = str(result.message_id)
 
     response: dict[str, Any] = {"success": True, "message_id": last_mid or None}
+    response.update(delivery_success_hint())
     if all_message_ids:
         response["message_ids"] = all_message_ids
     return response

@@ -36,6 +36,9 @@ def test_register_registers_platform_and_tool() -> None:
     assert platform["cron_deliver_env_var"] == "INFOFLOW_HOME_CHANNEL"
     assert platform["max_message_length"] == 2048
     assert "infoflow" in (platform.get("install_hint") or "").lower() or platform.get("install_hint")
+    assert "外发工具规则" in platform["platform_hint"]
+    assert "MEDIA:" in platform["platform_hint"]
+    assert "NO_REPLY" in platform["platform_hint"]
     # Required env names align with the plugin.yaml manifest.
     required = set(platform["required_env"])
     assert required == {
