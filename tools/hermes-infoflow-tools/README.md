@@ -22,11 +22,12 @@ pipx run --spec hermes-infoflow-tools==2026.5.25 hermes-infoflow-tools update --
 ```
 <!-- /sync:hermes-infoflow-version:latest -->
 
-Beta / prerelease: use the exact PEP 440 version:
+Beta / prerelease: use the exact PEP 440 version. For newly published betas,
+`--no-cache` avoids stale pipx/uv resolver cache:
 
 <!-- sync:hermes-infoflow-version:beta -->
 ```bash
-pipx run --spec hermes-infoflow-tools==2026.5.26b1 hermes-infoflow-tools update --version 2026.5.26b1 --mode extract --port 9000
+pipx run --no-cache --spec hermes-infoflow-tools==2026.5.26b1 hermes-infoflow-tools update --version 2026.5.26b1 --mode extract --port 9000
 ```
 <!-- /sync:hermes-infoflow-version:beta -->
 

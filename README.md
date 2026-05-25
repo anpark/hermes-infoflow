@@ -79,14 +79,14 @@ pipx run --spec hermes-infoflow-tools==2026.5.25 hermes-infoflow-tools update --
 ```
 <!-- /sync:hermes-infoflow-version:latest -->
 
-Beta 版（PEP 440 prerelease；精确指定版本即可安装）：
+Beta 版（PEP 440 prerelease；精确指定版本，刚发布时建议带 `--no-cache` 避免 pipx/uv 旧缓存）：
 
 <!-- sync:hermes-infoflow-version:beta -->
 ```bash
 # 二选一：extract 模式
-pipx run --spec hermes-infoflow-tools==2026.5.26b1 hermes-infoflow-tools update --version 2026.5.26b1 --mode extract --port 9000
+pipx run --no-cache --spec hermes-infoflow-tools==2026.5.26b1 hermes-infoflow-tools update --version 2026.5.26b1 --mode extract --port 9000
 # 二选一：pip 兼容别名
-pipx run --spec hermes-infoflow-tools==2026.5.26b1 hermes-infoflow-tools update --version 2026.5.26b1 --mode pip --port 9000
+pipx run --no-cache --spec hermes-infoflow-tools==2026.5.26b1 hermes-infoflow-tools update --version 2026.5.26b1 --mode pip --port 9000
 ```
 <!-- /sync:hermes-infoflow-version:beta -->
 
@@ -149,7 +149,7 @@ pipx run --spec hermes-infoflow==2026.5.25 hermes-infoflow-deploy --port 9000
 
 <!-- sync:hermes-infoflow-version:beta -->
 ```bash
-pipx run --spec hermes-infoflow==2026.5.26b1 hermes-infoflow-deploy --port 9000
+pipx run --no-cache --spec hermes-infoflow==2026.5.26b1 hermes-infoflow-deploy --port 9000
 ```
 <!-- /sync:hermes-infoflow-version:beta -->
 
