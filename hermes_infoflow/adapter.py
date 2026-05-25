@@ -42,12 +42,18 @@ from urllib.parse import urlparse as _urlparse
 
 _PROGRESS_LINE_RE = re.compile(r"^[┊\s]*[🔍⚙️💻🌐📁📝🧠✨]")
 _GROUP_STATUS_REDIRECT_PREFIXES = (
+    "⏳ Still working",
     "⚡ Interrupting current task",
+    "⚠️ No activity",
+    "⚠️ No response from provider",
     "⚠️ Gateway shutting down",
     "⚠️ Gateway restarting",
     "Gateway shutting down",
     "Gateway restarting",
     "💾 Self-improvement review:",
+)
+_GROUP_STATUS_REDIRECT_PATTERNS = (
+    re.compile(r"^⚠️\s+.+\sstream\s+drop\b", re.IGNORECASE),
 )
 _GROUP_STATUS_TRACKER_ONLY_PREFIXES = (
     "📦 Preflight compression:",
@@ -84,6 +90,9 @@ def _group_status_redirect_kind(text: str) -> str:
     for prefix in _GROUP_STATUS_REDIRECT_PREFIXES:
         if t.startswith(prefix):
             return prefix
+    for pattern in _GROUP_STATUS_REDIRECT_PATTERNS:
+        if pattern.search(t):
+            return "stream drop"
     return ""
 
 

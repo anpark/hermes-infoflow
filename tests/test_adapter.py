@@ -1127,6 +1127,11 @@ def test_send_records_bot_reply_for_follow_up(configured_env, monkeypatch) -> No
 @pytest.mark.parametrize(
     "content",
     [
+        "⏳ Still working... (15 min elapsed — iteration 6/90, waiting for provider response (streaming))",
+        "⏳ Still working... (3 min elapsed — iteration 4/90, running: vision_analyze)",
+        "⚠️ custom stream drop (RemoteProtocolError) after 81.5s — reconnecting, retry 2/3",
+        "⚠️ No activity for 15 min. Send any message to keep working.",
+        "⚠️ No response from provider for 180s (stale stream detected, reconnecting)",
         "⚡ Interrupting current task. I'll respond to your message shortly.",
         "⚠️ Gateway shutting down — Your current task will be interrupted.",
         (
