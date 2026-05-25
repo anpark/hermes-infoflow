@@ -18,7 +18,7 @@ Pin both the installer package and the plugin package to a stable version:
 
 <!-- sync:hermes-infoflow-version:latest -->
 ```bash
-pipx run --spec hermes-infoflow-tools==2026.5.25 hermes-infoflow-tools update --version 2026.5.25 --mode extract --port 9000
+pipx run --spec hermes-infoflow-tools==2026.5.26 hermes-infoflow-tools update --version 2026.5.26 --mode extract --port 9000
 ```
 <!-- /sync:hermes-infoflow-version:latest -->
 

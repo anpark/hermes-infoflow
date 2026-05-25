@@ -1,3 +1,3 @@
 """hermes-infoflow-tools: installer/updater CLI for the hermes-infoflow plugin."""
 
-__version__ = "2026.5.26b1"
+__version__ = "2026.5.26"
