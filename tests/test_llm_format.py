@@ -15,19 +15,18 @@ from hermes_infoflow.llm_tags import quote_tag_value
 def test_unread_message_context_line_requires_reading_all_small_gap() -> None:
     line = unread_message_context_line(2)
     assert line.startswith("[Unread Message Context:")
-    assert "有 2 条未展示历史消息" in line
     assert "before_count=2、after_count=0" in line
-    assert "请完整阅读锚点前的 2 条未展示历史" in line
-    assert "返回结果会包含锚点消息本身" in line
+    assert "该范围内有未读历史消息" in line
+    assert "阅读参考上下文后再判断如何回复" in line
 
 
 def test_unread_message_context_line_caps_required_initial_read_for_large_gap() -> None:
     line = unread_message_context_line(12)
     assert line.startswith("[Unread Message Context:")
-    assert "有 12 条未展示历史消息" in line
+    assert "较大历史范围内有未读消息" in line
     assert "before_count=7、after_count=0" in line
-    assert "请至少阅读锚点前最近 7 条未展示历史" in line
-    assert "请继续扩大查询范围" in line
+    assert "先阅读参考上下文后再判断如何回复" in line
+    assert "再按需继续扩大历史范围" in line
 
 
 def test_structured_string_values_are_single_quoted() -> None:

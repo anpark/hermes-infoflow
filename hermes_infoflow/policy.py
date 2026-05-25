@@ -494,7 +494,7 @@ _INFOFLOW_MESSAGE_FORMAT_DOC = """\
 每条 Infoflow user message 都由插件重建为结构化消息。通用结构：
 
 ```
-[Unread Message Context: 有 N 条未展示历史消息。请优先调用 infoflow_get_message_history，使用当前 Message 标签中的 message_id 作为锚点，设置 before_count=...、after_count=0；返回结果会包含锚点消息本身，...]
+[Unread Message Context: 请优先调用 infoflow_get_message_history，使用当前 Message 标签中的 message_id 作为锚点，设置 before_count=...、after_count=0。该范围内有未读历史消息，请阅读参考上下文后再判断如何回复。]
 [Handling Strategy]
 针对本条消息的处理策略。
 [/Handling Strategy]
@@ -605,8 +605,8 @@ _INFOFLOW_TOOL_RULES_DOC = """\
 调用 `infoflow_get_message_history`：
 - 需要补足上下文时必须使用该工具。
 - 任何需要获取聊天历史记录的场景，都可以使用该工具。
-- 当当前 user message 出现 `[Unread Message Context: ...]` 且提示有未展示历史消息时，应优先调用该工具查看缺失历史。除非当前消息显然只是确认、感谢、表情等无需上下文的轻量回复，否则应结合历史记录再判断和回复。
-- Unread Message Context 提示中的 `before_count` 是必须优先阅读的锚点前历史条数：不超过 7 条时完整阅读；超过 7 条时至少阅读最近 7 条，如问题明显依赖更早上下文，应继续扩大查询范围。
+- 当当前 user message 出现 `[Unread Message Context: ...]` 时，应优先调用该工具查看提示指定的历史范围。除非当前消息显然只是确认、感谢、表情等无需上下文的轻量回复，否则应结合历史记录再判断和回复。
+- Unread Message Context 提示中的 `before_count` 是建议优先阅读的锚点前历史条数：提示为较大历史范围时，先按给出的 `before_count` 阅读最近上下文；如问题明显依赖更早消息或上下文不足，应继续扩大查询范围。
 - 可按 `start_time`/`end_time`、`message_id`、`message_id + before_count/after_count` 查询。
 - 只传 `message_id` 时返回该锚点消息本身；配合 `before_count`/`after_count` 时返回窗口，结果包含锚点消息本身，总数最多为 `before_count + 1 + after_count`。
 - `start_time`/`end_time` 必须使用严格格式 `YYYY.MM.DD HH.mm.ss`，例如 `2025.05.21 19.56.59`；起止时间都按包含计算。

@@ -336,13 +336,334 @@ def test_unread_message_context_line_injected_and_context_state_updated(
     asyncio.run(_go())
 
     assert event.text.startswith(
-        "[Unread Message Context: 有 1 条未展示历史消息。请优先调用 infoflow_get_message_history"
+        "[Unread Message Context: 请优先调用 infoflow_get_message_history"
     )
+    assert "before_count=1、after_count=0" in event.text
     assert event.raw_message["infoflow_unread_message_context_count"] == 1
+    assert event.raw_message["infoflow_unread_message_context_before_count"] == 1
+    assert event.raw_message["infoflow_effective_unread_message_count"] == 1
     state = store.get_llm_context_state(context_key)
     assert state is not None
     assert state.last_llm_visible_message_id == "M3"
     assert state.last_llm_visible_created_time == base_time + 3_000
+
+
+def test_unread_context_uses_span_from_first_effective_unread(
+    configured_env, monkeypatch, tmp_path,
+) -> None:
+    monkeypatch.setattr(ms, "_STATE_BASE_DIR", tmp_path)
+    cfg = _make_config()
+    cfg.extra = {"app_agent_id": "6471"}
+    adapter = InfoflowAdapter(cfg)
+    store = adapter._message_store
+    base_time = int(__import__("time").time() * 1000)
+
+    rows = [
+        ("M1", "user:alice", False, False, "visible before"),
+        ("M2", "bot:6471", True, True, "local async before unread"),
+        ("M3", "user:bob", False, False, "actual unread one"),
+        ("M4", "user:dana", False, False, "actual unread two"),
+        ("M5", "bot:6471", True, True, "local async after unread"),
+        ("M6", "bot:6471", True, True, "another local async after unread"),
+        ("M7", "user:carol", False, False, "current"),
+    ]
+    for idx, (mid, sender, is_outgoing, local_sent, content) in enumerate(rows, start=1):
+        store.persist_group(
+            message_id=mid,
+            group_id="4507088",
+            sender=sender,
+            self_id="bot:6471",
+            is_outgoing=is_outgoing,
+            local_sent=local_sent,
+            content=content,
+            created_time=base_time + idx * 1_000,
+        )
+
+    source = adapter.build_source(
+        chat_id="group:4507088",
+        chat_name="group:4507088",
+        chat_type="group",
+        user_id="carol",
+        user_name="carol",
+        message_id="M7",
+    )
+    event = MessageEvent(
+        text="[Attention: mentions_you=true]\n[Sender: type:'human'; user_id:'carol']\n"
+        "[Message: message_id:'M7']\ncurrent",
+        message_type=MessageType.TEXT,
+        source=source,
+        raw_message={"infoflow_standard_message": True},
+        message_id="M7",
+    )
+    context_key = adapter._llm_context_key_for_event(event)
+    store.update_llm_context_state(
+        llm_context_key=context_key,
+        chat_key="group:4507088",
+        message_id="M1",
+        created_time=base_time + 1_000,
+    )
+
+    async def _go():
+        await adapter.on_processing_start(event)
+
+    asyncio.run(_go())
+
+    assert "before_count=4、after_count=0" in event.text
+    assert "该范围内有未读历史消息" in event.text
+    assert event.raw_message["infoflow_unread_message_context_count"] == 4
+    assert event.raw_message["infoflow_unread_message_context_before_count"] == 4
+    assert event.raw_message["infoflow_effective_unread_message_count"] == 2
+
+
+def test_unread_context_skips_local_sent_only_gap(
+    configured_env, monkeypatch, tmp_path,
+) -> None:
+    monkeypatch.setattr(ms, "_STATE_BASE_DIR", tmp_path)
+    cfg = _make_config()
+    cfg.extra = {"app_agent_id": "6471"}
+    adapter = InfoflowAdapter(cfg)
+    store = adapter._message_store
+    base_time = int(__import__("time").time() * 1000)
+
+    for idx, (mid, local_sent) in enumerate(
+        (("M1", False), ("M2", True), ("M3", True), ("M4", False)),
+        start=1,
+    ):
+        store.persist_group(
+            message_id=mid,
+            group_id="4507088",
+            sender="bot:6471" if local_sent else "user:alice",
+            self_id="bot:6471",
+            is_outgoing=local_sent,
+            local_sent=local_sent,
+            content=mid,
+            created_time=base_time + idx * 1_000,
+        )
+
+    source = adapter.build_source(
+        chat_id="group:4507088",
+        chat_name="group:4507088",
+        chat_type="group",
+        user_id="alice",
+        user_name="alice",
+        message_id="M4",
+    )
+    event = MessageEvent(
+        text="[Attention: mentions_you=true]\n[Message: message_id:'M4']\ncurrent",
+        message_type=MessageType.TEXT,
+        source=source,
+        raw_message={"infoflow_standard_message": True},
+        message_id="M4",
+    )
+    context_key = adapter._llm_context_key_for_event(event)
+    store.update_llm_context_state(
+        llm_context_key=context_key,
+        chat_key="group:4507088",
+        message_id="M1",
+        created_time=base_time + 1_000,
+    )
+
+    async def _go():
+        await adapter.on_processing_start(event)
+
+    asyncio.run(_go())
+
+    assert "[Unread Message Context:" not in event.text
+    assert event.raw_message["infoflow_unread_message_context_count"] == 0
+    assert event.raw_message["infoflow_effective_unread_message_count"] == 0
+
+
+def test_unread_context_counts_external_self_echo_without_local_send_record(
+    configured_env, monkeypatch, tmp_path,
+) -> None:
+    monkeypatch.setattr(ms, "_STATE_BASE_DIR", tmp_path)
+    cfg = _make_config()
+    cfg.extra = {"app_agent_id": "6471"}
+    adapter = InfoflowAdapter(cfg)
+    store = adapter._message_store
+    base_time = int(__import__("time").time() * 1000)
+
+    store.persist_group(
+        message_id="M1",
+        group_id="4507088",
+        sender="user:alice",
+        content="visible before",
+        created_time=base_time + 1_000,
+    )
+    store.persist_group(
+        message_id="M2",
+        group_id="4507088",
+        sender="bot:6471",
+        self_id="bot:6471",
+        is_outgoing=True,
+        local_sent=False,
+        content="external send through same bot",
+        created_time=base_time + 2_000,
+    )
+    store.persist_group(
+        message_id="M3",
+        group_id="4507088",
+        sender="user:carol",
+        content="current",
+        created_time=base_time + 3_000,
+    )
+
+    source = adapter.build_source(
+        chat_id="group:4507088",
+        chat_name="group:4507088",
+        chat_type="group",
+        user_id="carol",
+        user_name="carol",
+        message_id="M3",
+    )
+    event = MessageEvent(
+        text="[Attention: mentions_you=true]\n[Sender: type:'human'; user_id:'carol']\n"
+        "[Message: message_id:'M3']\ncurrent",
+        message_type=MessageType.TEXT,
+        source=source,
+        raw_message={"infoflow_standard_message": True},
+        message_id="M3",
+    )
+    context_key = adapter._llm_context_key_for_event(event)
+    store.update_llm_context_state(
+        llm_context_key=context_key,
+        chat_key="group:4507088",
+        message_id="M1",
+        created_time=base_time + 1_000,
+    )
+
+    async def _go():
+        await adapter.on_processing_start(event)
+
+    asyncio.run(_go())
+
+    assert "before_count=1、after_count=0" in event.text
+    assert event.raw_message["infoflow_unread_message_context_before_count"] == 1
+    assert event.raw_message["infoflow_effective_unread_message_count"] == 1
+
+
+def test_unread_context_dm_uses_effective_span(configured_env, monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(ms, "_STATE_BASE_DIR", tmp_path)
+    adapter = InfoflowAdapter(_make_config())
+    store = adapter._message_store
+    base_time = int(__import__("time").time() * 1000)
+
+    rows = [
+        ("D1", "user:alice", False, False),
+        ("D2", "bot:6471", True, True),
+        ("D3", "user:alice", False, False),
+        ("D4", "bot:6471", True, True),
+        ("D5", "user:alice", False, False),
+    ]
+    for idx, (mid, sender, is_outgoing, local_sent) in enumerate(rows, start=1):
+        store.persist_dm(
+            message_id=mid,
+            peer="user:alice",
+            self_id="bot:6471",
+            sender=sender,
+            is_outgoing=is_outgoing,
+            local_sent=local_sent,
+            content=mid,
+            created_time=base_time + idx * 1_000,
+        )
+
+    source = adapter.build_source(
+        chat_id="alice",
+        chat_name="alice",
+        chat_type="dm",
+        user_id="alice",
+        user_name="alice",
+        message_id="D5",
+    )
+    event = MessageEvent(
+        text="[Attention: quotes_your_message=false]\n[Message: message_id:'D5']\ncurrent",
+        message_type=MessageType.TEXT,
+        source=source,
+        raw_message={"infoflow_standard_message": True},
+        message_id="D5",
+    )
+    context_key = adapter._llm_context_key_for_event(event)
+    store.update_llm_context_state(
+        llm_context_key=context_key,
+        chat_key="dm:user:alice",
+        message_id="D1",
+        created_time=base_time + 1_000,
+    )
+
+    async def _go():
+        await adapter.on_processing_start(event)
+
+    asyncio.run(_go())
+
+    assert "before_count=2、after_count=0" in event.text
+    assert event.raw_message["infoflow_effective_unread_message_count"] == 1
+
+
+def test_unread_context_dm_uses_legacy_sent_store_key_fallback(
+    configured_env, monkeypatch, tmp_path,
+) -> None:
+    monkeypatch.setattr(ms, "_STATE_BASE_DIR", tmp_path)
+    adapter = InfoflowAdapter(_make_config())
+    store = adapter._message_store
+    base_time = int(__import__("time").time() * 1000)
+
+    store.persist_dm(
+        message_id="D1",
+        peer="user:alice",
+        sender="user:alice",
+        content="visible before",
+        created_time=base_time + 1_000,
+    )
+    store.persist_dm(
+        message_id="D2",
+        peer="user:alice",
+        self_id="bot:6471",
+        sender="bot:6471",
+        is_outgoing=True,
+        local_sent=False,
+        content="legacy local send",
+        created_time=base_time + 2_000,
+    )
+    store.persist_dm(
+        message_id="D3",
+        peer="user:alice",
+        sender="user:alice",
+        content="current",
+        created_time=base_time + 3_000,
+    )
+    adapter._sent_store.record("alice", "D2")
+
+    source = adapter.build_source(
+        chat_id="alice",
+        chat_name="alice",
+        chat_type="dm",
+        user_id="alice",
+        user_name="alice",
+        message_id="D3",
+    )
+    event = MessageEvent(
+        text="[Attention: quotes_your_message=false]\n[Message: message_id:'D3']\ncurrent",
+        message_type=MessageType.TEXT,
+        source=source,
+        raw_message={"infoflow_standard_message": True},
+        message_id="D3",
+    )
+    context_key = adapter._llm_context_key_for_event(event)
+    store.update_llm_context_state(
+        llm_context_key=context_key,
+        chat_key="dm:user:alice",
+        message_id="D1",
+        created_time=base_time + 1_000,
+    )
+
+    async def _go():
+        await adapter.on_processing_start(event)
+
+    asyncio.run(_go())
+
+    assert "[Unread Message Context:" not in event.text
+    assert event.raw_message["infoflow_unread_message_context_before_count"] == 0
+    assert event.raw_message["infoflow_effective_unread_message_count"] == 0
 
 
 def test_handle_webhook_returns_echostr_synchronously(configured_env) -> None:

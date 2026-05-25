@@ -348,6 +348,7 @@ class Bot:
         self._register_context(
             msg,
             is_outgoing_hint=sent_echo or own_echo,
+            local_sent_hint=sent_echo,
             register_recall=not (sent_echo or own_echo),
         )
 
@@ -795,6 +796,7 @@ class Bot:
         msg: IncomingMessage,
         *,
         is_outgoing_hint: bool = False,
+        local_sent_hint: bool = False,
         register_recall: bool = True,
     ) -> None:
         """Register inbound context for recall + persist to message store."""
@@ -849,6 +851,7 @@ class Bot:
                 self_id=self_id,
                 sender=sender,
                 is_outgoing=is_outgoing,
+                local_sent=bool(local_sent_hint),
                 quotes_your_message=bool(reply_to_bot_id),
                 msg_id2=msg.msgid2 or "",
                 content=content,
@@ -865,6 +868,7 @@ class Bot:
                 sender=sender,
                 self_id=self_id,
                 is_outgoing=is_outgoing,
+                local_sent=bool(local_sent_hint),
                 mentions_you=msg.bot_was_mentioned,
                 matched_regex_pattern=self._matched_regex_pattern(msg),
                 mentions_everyone=bool(flags["mentions_everyone"]),
@@ -1628,6 +1632,7 @@ class Bot:
                     sender=me,
                     self_id=me,
                     is_outgoing=True,
+                    local_sent=True,
                     content=text,
                     created_time=int(time.time() * 1000),
                 )
@@ -1638,6 +1643,7 @@ class Bot:
                     self_id=me,
                     sender=me,
                     is_outgoing=True,
+                    local_sent=True,
                     content=text,
                     created_time=int(time.time() * 1000),
                 )

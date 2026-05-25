@@ -33,6 +33,7 @@ import logging
 import os
 import re
 import socket as _socket
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +57,12 @@ _GROUP_STATUS_TRACKER_ONLY_TEXT_PREFIXES = (
     "Configured compression model",
 )
 GATEWAY_STARTED_NOTICE = "gateway started"
+
+
+@dataclass(frozen=True)
+class _UnreadMessageContext:
+    history_before_count: int = 0
+    effective_unread_count: int = 0
 
 
 def _looks_like_progress_line(text: str) -> bool:
@@ -726,13 +733,39 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             return self._message_store.find_dm(message_id)
         return None
 
-    def _unread_message_context_count_for_event(self, event: Any) -> int:
+    def _is_local_plugin_sent_record(self, chat_key: str, record: Any) -> bool:
+        if bool(getattr(record, "local_sent", False)):
+            return True
+        message_id = str(getattr(record, "message_id", "") or "")
+        if not message_id:
+            return False
+        store_keys = [str(chat_key or "")]
+        peer = str(getattr(record, "peer", "") or "")
+        if chat_key.startswith("dm:user:"):
+            store_keys.append(chat_key.removeprefix("dm:user:"))
+        if peer.startswith("user:"):
+            store_keys.append(peer.removeprefix("user:"))
+        elif peer:
+            store_keys.append(peer)
+        for store_key in dict.fromkeys(k for k in store_keys if k):
+            if self._sent_store.find(store_key, message_id):
+                return True
+        return False
+
+    def _is_effective_unread_record(self, chat_key: str, record: Any) -> bool:
+        if self._is_local_plugin_sent_record(chat_key, record):
+            return False
+        # External sends through this bot identity have no local send record,
+        # so they remain unread context for this plugin.
+        return True
+
+    def _unread_message_context_for_event(self, event: Any) -> _UnreadMessageContext:
         current = self._record_for_event(event)
         if current is None:
-            return 0
+            return _UnreadMessageContext()
         chat_key, group_id, dm_user = self._chat_key_for_event(event)
         if not chat_key:
-            return 0
+            return _UnreadMessageContext()
         context_key = self._llm_context_key_for_event(event)
         state = self._message_store.get_llm_context_state(context_key)
         after_time = 0
@@ -741,22 +774,41 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             after_time = state.last_llm_visible_created_time
             after_mid = state.last_llm_visible_message_id
         if group_id:
-            return self._message_store.count_group_between(
+            records = self._message_store.group_between(
                 group_id,
                 after_created_time=after_time,
                 after_message_id=after_mid,
                 before_created_time=current.created_time,
                 before_message_id=current.message_id,
             )
-        if dm_user:
-            return self._message_store.count_dm_between(
+        elif dm_user:
+            records = self._message_store.dm_between(
                 dm_user,
                 after_created_time=after_time,
                 after_message_id=after_mid,
                 before_created_time=current.created_time,
                 before_message_id=current.message_id,
             )
-        return 0
+        else:
+            records = []
+
+        first_effective_idx: int | None = None
+        effective_count = 0
+        for idx, record in enumerate(records):
+            if not self._is_effective_unread_record(chat_key, record):
+                continue
+            effective_count += 1
+            if first_effective_idx is None:
+                first_effective_idx = idx
+        if first_effective_idx is None:
+            return _UnreadMessageContext()
+        return _UnreadMessageContext(
+            history_before_count=len(records) - first_effective_idx,
+            effective_unread_count=effective_count,
+        )
+
+    def _unread_message_context_count_for_event(self, event: Any) -> int:
+        return self._unread_message_context_for_event(event).history_before_count
 
     def _mark_event_llm_visible(self, event: Any) -> None:
         current = self._record_for_event(event)
@@ -1150,17 +1202,24 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         if raw_message.get("infoflow_unread_message_context_applied"):
             return
 
-        count = self._unread_message_context_count_for_event(event)
+        unread_context = self._unread_message_context_for_event(event)
+        count = unread_context.history_before_count
         raw_message["infoflow_unread_message_context_count"] = count
+        raw_message["infoflow_unread_message_context_before_count"] = count
+        raw_message["infoflow_effective_unread_message_count"] = (
+            unread_context.effective_unread_count
+        )
         raw_message["infoflow_unread_message_context_applied"] = True
         text = str(getattr(event, "text", "") or "")
         if count > 0:
             text = f"{unread_message_context_line(count)}\n{text}"
             event.text = text
         gw_log().info(
-            "[iflow:user_message] mid=%s unread_context_count=%d len=%d text=\n%s",
+            "[iflow:user_message] mid=%s unread_context_before_count=%d "
+            "effective_unread_count=%d len=%d text=\n%s",
             self._event_message_id(event) or "-",
             count,
+            unread_context.effective_unread_count,
             len(text),
             text,
         )
@@ -1710,10 +1769,10 @@ def register(ctx: Any) -> None:
             "也是历史查询和排序使用的时间（系统注入，可信）。"
             "结构化标签内字符串值使用单引号，布尔/数字保持裸值。"
             "需要引用回复时将该 ID 传给 `infoflow_reply`。\n"
-            "当 `[Unread Message Context: ...]` 出现并提示有未展示历史消息时，"
-            "说明本轮消息和上次你看到的消息之间还有缺失历史。"
+            "当 `[Unread Message Context: ...]` 出现时，"
+            "说明提示指定的历史范围内有未读消息。"
             "除非当前消息显然无需上下文，否则应按提示优先调用 "
-            "`infoflow_get_message_history` 阅读缺失历史，再结合上下文判断和回复。\n"
+            "`infoflow_get_message_history` 阅读参考上下文，再结合上下文判断和回复。\n"
             "\n"
             "【消息中的引用标签】\n"
             "当用户回复（reply）某条消息时，你收到的文本格式为：\n"

@@ -53,6 +53,66 @@ def test_old_schema_is_dropped_and_new_schema_created(
     assert found.content == "hello"
 
 
+def test_legacy_message_tables_are_migrated_for_local_sent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ms, "_STATE_BASE_DIR", tmp_path)
+    db_dir = tmp_path / "legacy-local-sent"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    db_path = db_dir / "messages.db"
+    created_time = int(time.time() * 1000)
+
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        """
+        CREATE TABLE group_messages (
+            message_id TEXT PRIMARY KEY,
+            group_id TEXT NOT NULL DEFAULT '',
+            sender TEXT NOT NULL DEFAULT '',
+            self TEXT NOT NULL DEFAULT '',
+            is_outgoing INTEGER NOT NULL DEFAULT 0,
+            mentions_you INTEGER NOT NULL DEFAULT 0,
+            matched_regex_pattern TEXT NOT NULL DEFAULT '',
+            mentions_everyone INTEGER NOT NULL DEFAULT 0,
+            quotes_your_message INTEGER NOT NULL DEFAULT 0,
+            mentions_other_people INTEGER NOT NULL DEFAULT 0,
+            quotes_other_peoples_message INTEGER NOT NULL DEFAULT 0,
+            msg_id2 TEXT NOT NULL DEFAULT '',
+            content TEXT NOT NULL DEFAULT '',
+            created_time INTEGER NOT NULL,
+            msg_time INTEGER NOT NULL DEFAULT 0,
+            raw_json TEXT NOT NULL DEFAULT ''
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO group_messages VALUES (
+            'legacy-group', '4507088', 'user:alice', '', 0, 0, '', 0, 0, 0,
+            0, '', 'kept', ?, 0, ''
+        )
+        """,
+        (created_time,),
+    )
+    conn.commit()
+    conn.close()
+
+    store = MessageStore(account_id="legacy-local-sent")
+    found = store.find_group("legacy-group")
+    assert found is not None
+    assert found.content == "kept"
+    assert found.local_sent is False
+
+    store.persist_group(
+        message_id="legacy-group",
+        group_id="4507088",
+        local_sent=True,
+    )
+    found = store.find_group("legacy-group")
+    assert found is not None
+    assert found.local_sent is True
+
+
 def test_group_upsert_preserves_first_seen_created_time_and_fills_echo(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -87,6 +147,7 @@ def test_group_upsert_preserves_first_seen_created_time_and_fills_echo(
     assert found is not None
     assert found.created_time == created_time
     assert found.is_outgoing is True
+    assert found.local_sent is False
     assert found.mentions_you is True
     assert found.msg_id2 == "300014580"
     assert found.content == "echo body"
@@ -274,6 +335,13 @@ def test_history_window_and_context_state(
         before_created_time=base_time + 3,
         before_message_id="m3",
     ) == 1
+    assert [r.message_id for r in store.group_between(
+        "4507088",
+        after_created_time=base_time + 1,
+        after_message_id="m1",
+        before_created_time=base_time + 3,
+        before_message_id="m3",
+    )] == ["m2"]
 
     state = store.update_llm_context_state(
         llm_context_key="agent:main:infoflow:group:4507088:alice",
@@ -287,3 +355,31 @@ def test_history_window_and_context_state(
     assert found.chat_key == "group:4507088"
     assert found.last_llm_visible_message_id == "m2"
     assert found.last_llm_visible_created_time == base_time + 2
+
+
+def test_message_store_persists_local_sent_flag(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(ms, "_STATE_BASE_DIR", tmp_path)
+    store = MessageStore(account_id="local-sent")
+    store.persist_group(
+        message_id="g1",
+        group_id="4507088",
+        sender="bot:6471",
+        is_outgoing=True,
+        local_sent=True,
+        content="plugin sent",
+    )
+    group = store.find_group("g1")
+    assert group is not None
+    assert group.local_sent is True
+
+    store.persist_dm(
+        message_id="d1",
+        peer="user:alice",
+        sender="bot:6471",
+        is_outgoing=True,
+        local_sent=True,
+        content="plugin sent dm",
+    )
+    dm = store.find_dm("d1")
+    assert dm is not None
+    assert dm.local_sent is True

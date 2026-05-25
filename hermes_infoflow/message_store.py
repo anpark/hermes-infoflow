@@ -5,8 +5,9 @@ platform message facts in a compact, queryable SQLite schema.  The LLM-facing
 message body is generated elsewhere and stored here as ``content`` so messages
 that are not dispatched to the model still have the same normalized body text.
 
-Schema compatibility policy: old message tables are not migrated.  If the
-local schema does not match this version, old tables are dropped and recreated.
+Schema compatibility policy: legacy schemas are migrated only for compatible
+additive changes.  If the local schema otherwise does not match this version,
+old tables are dropped and recreated.
 
 ``message_id`` is the authoritative primary key.  Callers intentionally skip
 messages without one instead of inventing local IDs, because echo callbacks
@@ -38,15 +39,15 @@ _ROW_LIMIT = 5000
 _DB_TIMEOUT_SECONDS = 30.0
 _DB_BUSY_TIMEOUT_MS = 5_000
 _STATE_BASE_DIR = Path("~/.hermes/state/infoflow")
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 
 _PRIVATE_COLUMNS = (
-    "message_id, peer, self, sender, is_outgoing, quotes_your_message, "
-    "msg_id2, content, created_time, msg_time, raw_json"
+    "message_id, peer, self, sender, is_outgoing, local_sent, "
+    "quotes_your_message, msg_id2, content, created_time, msg_time, raw_json"
 )
 _GROUP_COLUMNS = (
-    "message_id, group_id, sender, self, is_outgoing, mentions_you, "
-    "matched_regex_pattern, mentions_everyone, quotes_your_message, "
+    "message_id, group_id, sender, self, is_outgoing, local_sent, "
+    "mentions_you, matched_regex_pattern, mentions_everyone, quotes_your_message, "
     "mentions_other_people, quotes_other_peoples_message, msg_id2, content, "
     "created_time, msg_time, raw_json"
 )
@@ -79,6 +80,7 @@ class PrivateMessageRecord:
     self_id: str = ""
     sender: str = ""
     is_outgoing: bool = False
+    local_sent: bool = False
     quotes_your_message: bool = False
     msg_id2: str = ""
     content: str = ""
@@ -135,6 +137,7 @@ class GroupMessageRecord:
     sender: str = ""
     self_id: str = ""
     is_outgoing: bool = False
+    local_sent: bool = False
     mentions_you: bool = False
     matched_regex_pattern: str = ""
     mentions_everyone: bool = False
@@ -251,6 +254,7 @@ class MessageStore:
         self_id: str = "",
         sender: str = "",
         is_outgoing: bool | None = None,
+        local_sent: bool = False,
         quotes_your_message: bool = False,
         msg_id2: str = "",
         content: str = "",
@@ -283,6 +287,7 @@ class MessageStore:
             self_id=str(self_id or ""),
             sender=str(sender or ""),
             is_outgoing=bool(is_outgoing),
+            local_sent=bool(local_sent),
             quotes_your_message=bool(quotes_your_message),
             msg_id2=str(msg_id2 or msgid2 or ""),
             content=str(content or text or ""),
@@ -301,6 +306,7 @@ class MessageStore:
         sender: str = "",
         self_id: str = "",
         is_outgoing: bool | None = None,
+        local_sent: bool = False,
         mentions_you: bool = False,
         matched_regex_pattern: str = "",
         mentions_everyone: bool = False,
@@ -336,6 +342,7 @@ class MessageStore:
             sender=str(sender or ""),
             self_id=str(self_id or ""),
             is_outgoing=bool(is_outgoing),
+            local_sent=bool(local_sent),
             mentions_you=bool(mentions_you or bot_was_mentioned),
             matched_regex_pattern=str(matched_regex_pattern or ""),
             mentions_everyone=bool(mentions_everyone),
@@ -648,6 +655,52 @@ class MessageStore:
             before_message_id=before_message_id,
         )
 
+    def group_between(
+        self,
+        group_id: str,
+        *,
+        after_created_time: int = 0,
+        after_message_id: str = "",
+        before_created_time: int,
+        before_message_id: str,
+        limit: int | None = None,
+    ) -> list[GroupMessageRecord]:
+        rows = self._between_rows(
+            "group_messages",
+            _GROUP_COLUMNS,
+            "group_id",
+            str(group_id or ""),
+            after_created_time=after_created_time,
+            after_message_id=after_message_id,
+            before_created_time=before_created_time,
+            before_message_id=before_message_id,
+            limit=limit,
+        )
+        return [self._row_to_group(r) for r in rows]
+
+    def dm_between(
+        self,
+        dm_user_id: str,
+        *,
+        after_created_time: int = 0,
+        after_message_id: str = "",
+        before_created_time: int,
+        before_message_id: str,
+        limit: int | None = None,
+    ) -> list[PrivateMessageRecord]:
+        rows = self._between_rows(
+            "private_messages",
+            _PRIVATE_COLUMNS,
+            "peer",
+            _participant_key("user", dm_user_id),
+            after_created_time=after_created_time,
+            after_message_id=after_message_id,
+            before_created_time=before_created_time,
+            before_message_id=before_message_id,
+            limit=limit,
+        )
+        return [self._row_to_private(r) for r in rows]
+
     def get_llm_context_state(self, llm_context_key: str) -> LLMContextState | None:
         row = self._query_one(
             f"SELECT {_LLM_CONTEXT_COLUMNS} FROM llm_context_state "
@@ -769,6 +822,7 @@ class MessageStore:
             if self._schema_mismatch(conn):
                 self._drop_message_tables(conn)
             self._create_schema(conn)
+            self._migrate_schema(conn)
             self._db_initialized = True
         except sqlite3.Error as exc:
             logger.warning("[infoflow:message_store] schema init failed: %s", exc)
@@ -782,16 +836,16 @@ class MessageStore:
         }
         if "dm_messages" in tables:
             return True
-        expected: dict[str, set[str]] = {
+        current: dict[str, set[str]] = {
             "private_messages": {
                 "message_id", "peer", "self", "sender", "is_outgoing",
-                "quotes_your_message", "msg_id2", "content", "created_time",
-                "msg_time", "raw_json",
+                "local_sent", "quotes_your_message", "msg_id2", "content",
+                "created_time", "msg_time", "raw_json",
             },
             "group_messages": {
                 "message_id", "group_id", "sender", "self", "is_outgoing",
-                "mentions_you", "matched_regex_pattern", "mentions_everyone",
-                "quotes_your_message", "mentions_other_people",
+                "local_sent", "mentions_you", "matched_regex_pattern",
+                "mentions_everyone", "quotes_your_message", "mentions_other_people",
                 "quotes_other_peoples_message", "msg_id2", "content",
                 "created_time", "msg_time", "raw_json",
             },
@@ -804,13 +858,32 @@ class MessageStore:
                 "last_llm_visible_created_time", "updated_time",
             },
         }
-        for table, cols in expected.items():
+        legacy_message_cols = {
+            table: cols - {"local_sent"}
+            for table, cols in current.items()
+            if table in {"private_messages", "group_messages"}
+        }
+        for table, cols in current.items():
             if table not in tables:
                 continue
             existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+            if existing == cols:
+                continue
+            if existing == legacy_message_cols.get(table, set()):
+                continue
             if existing != cols:
                 return True
         return False
+
+    @staticmethod
+    def _migrate_schema(conn: sqlite3.Connection) -> None:
+        for table in ("private_messages", "group_messages"):
+            existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+            if existing and "local_sent" not in existing:
+                conn.execute(
+                    f"ALTER TABLE {table} "
+                    "ADD COLUMN local_sent INTEGER NOT NULL DEFAULT 0"
+                )
 
     @staticmethod
     def _drop_message_tables(conn: sqlite3.Connection) -> None:
@@ -833,6 +906,7 @@ class MessageStore:
                 self TEXT NOT NULL DEFAULT '',
                 sender TEXT NOT NULL DEFAULT '',
                 is_outgoing INTEGER NOT NULL DEFAULT 0,
+                local_sent INTEGER NOT NULL DEFAULT 0,
                 quotes_your_message INTEGER NOT NULL DEFAULT 0,
                 msg_id2 TEXT NOT NULL DEFAULT '',
                 content TEXT NOT NULL DEFAULT '',
@@ -850,6 +924,7 @@ class MessageStore:
                 sender TEXT NOT NULL DEFAULT '',
                 self TEXT NOT NULL DEFAULT '',
                 is_outgoing INTEGER NOT NULL DEFAULT 0,
+                local_sent INTEGER NOT NULL DEFAULT 0,
                 mentions_you INTEGER NOT NULL DEFAULT 0,
                 matched_regex_pattern TEXT NOT NULL DEFAULT '',
                 mentions_everyone INTEGER NOT NULL DEFAULT 0,
@@ -932,15 +1007,19 @@ class MessageStore:
                     """
                     INSERT INTO private_messages (
                         message_id, peer, self, sender, is_outgoing,
-                        quotes_your_message, msg_id2, content, created_time,
-                        msg_time, raw_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        local_sent, quotes_your_message, msg_id2, content,
+                        created_time, msg_time, raw_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(message_id) DO UPDATE SET
                         peer = CASE WHEN excluded.peer != '' THEN excluded.peer ELSE private_messages.peer END,
                         self = CASE WHEN excluded.self != '' THEN excluded.self ELSE private_messages.self END,
                         sender = CASE WHEN excluded.sender != '' THEN excluded.sender ELSE private_messages.sender END,
                         is_outgoing = CASE
                             WHEN private_messages.is_outgoing = 1 OR excluded.is_outgoing = 1 THEN 1
+                            ELSE 0
+                        END,
+                        local_sent = CASE
+                            WHEN private_messages.local_sent = 1 OR excluded.local_sent = 1 THEN 1
                             ELSE 0
                         END,
                         quotes_your_message = CASE
@@ -959,9 +1038,9 @@ class MessageStore:
                     """,
                     (
                         rec.message_id, rec.peer, rec.self_id, rec.sender,
-                        int(rec.is_outgoing), int(rec.quotes_your_message),
-                        rec.msg_id2, rec.content, rec.created_time,
-                        rec.msg_time, rec.raw_json,
+                        int(rec.is_outgoing), int(rec.local_sent),
+                        int(rec.quotes_your_message), rec.msg_id2,
+                        rec.content, rec.created_time, rec.msg_time, rec.raw_json,
                     ),
                 )
                 self._auto_cleanup_table(conn, "private_messages")
@@ -981,17 +1060,21 @@ class MessageStore:
                     """
                     INSERT INTO group_messages (
                         message_id, group_id, sender, self, is_outgoing,
-                        mentions_you, matched_regex_pattern, mentions_everyone,
-                        quotes_your_message, mentions_other_people,
-                        quotes_other_peoples_message, msg_id2, content,
-                        created_time, msg_time, raw_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        local_sent, mentions_you, matched_regex_pattern,
+                        mentions_everyone, quotes_your_message,
+                        mentions_other_people, quotes_other_peoples_message,
+                        msg_id2, content, created_time, msg_time, raw_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(message_id) DO UPDATE SET
                         group_id = CASE WHEN excluded.group_id != '' THEN excluded.group_id ELSE group_messages.group_id END,
                         sender = CASE WHEN excluded.sender != '' THEN excluded.sender ELSE group_messages.sender END,
                         self = CASE WHEN excluded.self != '' THEN excluded.self ELSE group_messages.self END,
                         is_outgoing = CASE
                             WHEN group_messages.is_outgoing = 1 OR excluded.is_outgoing = 1 THEN 1
+                            ELSE 0
+                        END,
+                        local_sent = CASE
+                            WHEN group_messages.local_sent = 1 OR excluded.local_sent = 1 THEN 1
                             ELSE 0
                         END,
                         mentions_you = CASE
@@ -1030,9 +1113,10 @@ class MessageStore:
                     """,
                     (
                         rec.message_id, rec.group_id, rec.sender, rec.self_id,
-                        int(rec.is_outgoing), int(rec.mentions_you),
-                        rec.matched_regex_pattern, int(rec.mentions_everyone),
-                        int(rec.quotes_your_message), int(rec.mentions_other_people),
+                        int(rec.is_outgoing), int(rec.local_sent),
+                        int(rec.mentions_you), rec.matched_regex_pattern,
+                        int(rec.mentions_everyone), int(rec.quotes_your_message),
+                        int(rec.mentions_other_people),
                         int(rec.quotes_other_peoples_message), rec.msg_id2,
                         rec.content, rec.created_time, rec.msg_time, rec.raw_json,
                     ),
@@ -1189,6 +1273,44 @@ class MessageStore:
         )
         return int(row[0] or 0) if row else 0
 
+    def _between_rows(
+        self,
+        table: str,
+        columns: str,
+        partition_column: str,
+        partition_value: str,
+        *,
+        after_created_time: int = 0,
+        after_message_id: str = "",
+        before_created_time: int,
+        before_message_id: str,
+        limit: int | None = None,
+    ) -> list[tuple]:
+        if table not in {"private_messages", "group_messages"}:
+            return []
+        if partition_column not in {"peer", "group_id"}:
+            return []
+        params: list[Any] = [
+            partition_value,
+            int(after_created_time or 0),
+            int(after_created_time or 0),
+            str(after_message_id or ""),
+            int(before_created_time or 0),
+            int(before_created_time or 0),
+            str(before_message_id or ""),
+        ]
+        sql = (
+            f"SELECT {columns} FROM {table} "
+            f"WHERE {partition_column} = ? AND "
+            "(created_time > ? OR (created_time = ? AND message_id > ?)) AND "
+            "(created_time < ? OR (created_time = ? AND message_id < ?)) "
+            "ORDER BY created_time ASC, message_id ASC"
+        )
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(max(1, int(limit)))
+        return self._query_all(sql, params)
+
     @staticmethod
     def _row_to_private(row: tuple) -> PrivateMessageRecord:
         return PrivateMessageRecord(
@@ -1197,12 +1319,13 @@ class MessageStore:
             self_id=str(row[2] or ""),
             sender=str(row[3] or ""),
             is_outgoing=bool(row[4]),
-            quotes_your_message=bool(row[5]),
-            msg_id2=str(row[6] or ""),
-            content=str(row[7] or ""),
-            created_time=int(row[8] or 0),
-            msg_time=int(row[9] or 0),
-            raw_json=str(row[10] or ""),
+            local_sent=bool(row[5]),
+            quotes_your_message=bool(row[6]),
+            msg_id2=str(row[7] or ""),
+            content=str(row[8] or ""),
+            created_time=int(row[9] or 0),
+            msg_time=int(row[10] or 0),
+            raw_json=str(row[11] or ""),
         )
 
     @staticmethod
@@ -1213,17 +1336,18 @@ class MessageStore:
             sender=str(row[2] or ""),
             self_id=str(row[3] or ""),
             is_outgoing=bool(row[4]),
-            mentions_you=bool(row[5]),
-            matched_regex_pattern=str(row[6] or ""),
-            mentions_everyone=bool(row[7]),
-            quotes_your_message=bool(row[8]),
-            mentions_other_people=bool(row[9]),
-            quotes_other_peoples_message=bool(row[10]),
-            msg_id2=str(row[11] or ""),
-            content=str(row[12] or ""),
-            created_time=int(row[13] or 0),
-            msg_time=int(row[14] or 0),
-            raw_json=str(row[15] or ""),
+            local_sent=bool(row[5]),
+            mentions_you=bool(row[6]),
+            matched_regex_pattern=str(row[7] or ""),
+            mentions_everyone=bool(row[8]),
+            quotes_your_message=bool(row[9]),
+            mentions_other_people=bool(row[10]),
+            quotes_other_peoples_message=bool(row[11]),
+            msg_id2=str(row[12] or ""),
+            content=str(row[13] or ""),
+            created_time=int(row[14] or 0),
+            msg_time=int(row[15] or 0),
+            raw_json=str(row[16] or ""),
         )
 
     @staticmethod

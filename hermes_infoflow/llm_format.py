@@ -138,17 +138,17 @@ def unread_message_context_line(count: int) -> str:
     n = max(0, int(count))
     read_count = min(n, UNREAD_MESSAGE_CONTEXT_REQUIRED_READ_LIMIT)
     if n <= UNREAD_MESSAGE_CONTEXT_REQUIRED_READ_LIMIT:
-        read_rule = f"请完整阅读锚点前的 {n} 条未展示历史"
-    else:
-        read_rule = (
-            f"请至少阅读锚点前最近 {read_count} 条未展示历史；"
-            "如问题明显依赖更早上下文，请继续扩大查询范围"
+        return (
+            "[Unread Message Context: 请优先调用 infoflow_get_message_history，"
+            "使用当前 Message 标签中的 message_id 作为锚点，"
+            f"设置 before_count={n}、after_count=0。"
+            "该范围内有未读历史消息，请阅读参考上下文后再判断如何回复。]"
         )
     return (
-        f"[Unread Message Context: 有 {n} 条未展示历史消息。"
+        "[Unread Message Context: 当前消息前较大历史范围内有未读消息。"
         "请优先调用 infoflow_get_message_history，使用当前 Message 标签中的 "
-        f"message_id 作为锚点，设置 before_count={read_count}、after_count=0；"
-        f"返回结果会包含锚点消息本身，{read_rule}，再结合上下文判断和回复。]"
+        f"message_id 作为锚点，设置 before_count={read_count}、after_count=0。"
+        "先阅读参考上下文后再判断如何回复；如果上下文仍不足，再按需继续扩大历史范围。]"
     )
 
 
