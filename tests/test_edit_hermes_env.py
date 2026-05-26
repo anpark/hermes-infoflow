@@ -47,6 +47,41 @@ def test_set_overwrites_existing(edit_env_module, tmp_path: Path) -> None:
     assert edit_env_module.read_key(env_file, "INFOFLOW_PORT") == "3333"
 
 
+def test_copy_key_if_missing_migrates_legacy_value(edit_env_module, tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("INFOFLOW_HOME_CHANNEL=legacy-user\n", encoding="utf-8")
+
+    changed = edit_env_module.copy_key_if_missing(
+        env_file,
+        "INFOFLOW_OP_CHANNEL",
+        "INFOFLOW_HOME_CHANNEL",
+    )
+
+    assert changed
+    assert edit_env_module.read_key(env_file, "INFOFLOW_HOME_CHANNEL") == "legacy-user"
+    assert edit_env_module.read_key(env_file, "INFOFLOW_OP_CHANNEL") == "legacy-user"
+
+
+def test_copy_key_if_missing_preserves_existing_target(
+    edit_env_module,
+    tmp_path: Path,
+) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "INFOFLOW_HOME_CHANNEL=legacy-user\nINFOFLOW_OP_CHANNEL=ops-user\n",
+        encoding="utf-8",
+    )
+
+    changed = edit_env_module.copy_key_if_missing(
+        env_file,
+        "INFOFLOW_OP_CHANNEL",
+        "INFOFLOW_HOME_CHANNEL",
+    )
+
+    assert changed is False
+    assert edit_env_module.read_key(env_file, "INFOFLOW_OP_CHANNEL") == "ops-user"
+
+
 def test_upsert_preserves_comments_and_other_keys(edit_env_module, tmp_path: Path) -> None:
     env_file = tmp_path / ".env"
     env_file.write_text(

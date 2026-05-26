@@ -37,7 +37,7 @@ def _dm_msg(**kwargs) -> IncomingMessage:
     return IncomingMessage(**defaults)
 
 
-def _bot() -> Bot:
+def _bot(*, admin_uid: str = "") -> Bot:
     policy = GroupPolicy()
     serverapi = MagicMock()
     serverapi.add_message_reaction = AsyncMock(
@@ -53,6 +53,7 @@ def _bot() -> Bot:
         sent_store=MagicMock(),
         dedup_set=set(),
         message_store=MagicMock(),
+        admin_uid=admin_uid,
     )
 
 
@@ -92,6 +93,29 @@ def test_reaction_handle_bot_mentioned() -> None:
     assert h["base_msg_id"] == "1865794273048386548"
     assert h["emoji_code"] == "d135"
     assert h["group_id"] == "4507088"
+
+
+def test_slash_command_auth_accepts_any_configured_admin() -> None:
+    bot = _bot(admin_uid="root,alice")
+
+    assert bot._check_slash_command_auth(  # noqa: SLF001
+        _group_msg(sender_id="alice", text="/new", bot_was_mentioned=True)
+    )
+    assert not bot._check_slash_command_auth(  # noqa: SLF001
+        _group_msg(sender_id="bob", text="/new", bot_was_mentioned=True)
+    )
+    assert not bot._check_slash_command_auth(  # noqa: SLF001
+        _group_msg(sender_id="root", text="/new", bot_was_mentioned=False)
+    )
+    assert not bot._check_slash_command_auth(  # noqa: SLF001
+        _group_msg(
+            sender_id="root",
+            sender_is_bot=True,
+            sender_agent_id="root",
+            text="/new",
+            bot_was_mentioned=True,
+        )
+    )
 
 
 def test_reaction_handle_watch_mentions() -> None:

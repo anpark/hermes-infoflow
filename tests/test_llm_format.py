@@ -6,6 +6,7 @@ from hermes_infoflow.llm_format import (
     GroupAttention,
     group_attention_line,
     message_line,
+    permission_for_sender,
     sender_line,
     unread_message_context_line,
 )
@@ -35,6 +36,13 @@ def test_structured_string_values_are_single_quoted() -> None:
         sender_line(sender_key="user:alice", name="Alice O'Brien", admin_uid="")
         == "[Sender: type:'human'; user_id:'alice'; name:'Alice O\\'Brien'; permission:'restricted']"
     )
+
+
+def test_sender_permission_accepts_any_admin_from_comma_list() -> None:
+    assert permission_for_sender("user:bob", "alice,bob") == "admin"
+    assert permission_for_sender("user:alice", " root,ALICE ") == "admin"
+    assert permission_for_sender("bot:bob", "alice,bob") == "restricted"
+    assert permission_for_sender("user:carol", "alice,bob") == "restricted"
 
 
 def test_attention_regex_pattern_is_quoted_but_booleans_are_bare() -> None:

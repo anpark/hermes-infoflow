@@ -199,10 +199,10 @@
 
 ### 3.2 Home Session
 
-- **定义**：admin 用户的私聊 DM
-- **配置**：`INFOFLOW_ADMIN_USER` 环境变量
-- **用途**：cron 任务默认投递、系统通知目标
-- **特性**：拥有完全权限，可执行所有操作
+- **定义**：运维通知通道，可为私聊 userid 或群聊 `group:{groupId}`
+- **配置**：`INFOFLOW_OP_CHANNEL` 环境变量
+- **用途**：cron 任务默认投递、Hermes home channel、启动/关闭/调试类通知目标
+- **权限**：`INFOFLOW_ADMIN_USER` 只负责权限判定，不决定 home session 或通知目标
 
 ### 3.3 对话历史
 

@@ -21,7 +21,7 @@ from .dashboard import (
     sessiontracker_enabled,
     sessiontracker_full_user_message_enabled,
 )
-from .settings import DEFAULT_API_HOST
+from .settings import DEFAULT_API_HOST, infoflow_admin_users_from_env
 from .sse import (
     SSE_HEARTBEAT,
     SSE_HEARTBEAT_INTERVAL_SECONDS,
@@ -394,14 +394,14 @@ async def _viewer_can_see_full_user_message(
 ) -> bool:
     if not sessiontracker_full_user_message_enabled():
         return False
-    admin = os.getenv("INFOFLOW_ADMIN_USER", "").strip().lower()
-    if not admin or not (code or "").strip() or account is None:
+    admins = infoflow_admin_users_from_env()
+    if not admins or not (code or "").strip() or account is None:
         return False
     try:
         viewer_user_id = await resolve_user_id_by_code_cached(account, code)
     except (InfoflowAPIError, ValueError):
         return False
-    return viewer_user_id.strip().lower() == admin
+    return viewer_user_id.strip().lower() in admins
 
 
 def _account_for_sessiontracker_request(
@@ -416,7 +416,7 @@ def _account_for_sessiontracker_request(
     if (
         (code or "").strip()
         and sessiontracker_full_user_message_enabled()
-        and os.getenv("INFOFLOW_ADMIN_USER", "").strip()
+        and infoflow_admin_users_from_env()
     ):
         try:
             return _read_infoflow_account(), None

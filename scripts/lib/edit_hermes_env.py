@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Upsert keys in ``~/.hermes/.env`` without disturbing other entries.
 
-Used by ``deploy-common.sh`` to seed or override ``INFOFLOW_PORT``. Parsing
+Used by ``deploy-common.sh`` to seed or override Infoflow env vars. Parsing
 matches ``scripts/sim/_env.py`` (``#`` comments, optional ``export`` prefix,
 surrounding quotes stripped on read).
 
@@ -9,6 +9,7 @@ Usage::
 
     python3 edit_hermes_env.py --set INFOFLOW_PORT=9000
     python3 edit_hermes_env.py --ensure INFOFLOW_PORT=26521
+    python3 edit_hermes_env.py --copy-if-missing INFOFLOW_OP_CHANNEL=INFOFLOW_HOME_CHANNEL
     python3 edit_hermes_env.py --env-file ~/.hermes/.env --set FOO=bar --dry-run
 """
 
@@ -151,6 +152,16 @@ def _parse_kv(spec: str) -> tuple[str, str]:
     return key, value.strip()
 
 
+def copy_key_if_missing(path: Path, target_key: str, source_key: str) -> bool:
+    """Copy ``source_key`` to ``target_key`` only when target is missing."""
+    if read_key(path, target_key) is not None:
+        return False
+    source_value = read_key(path, source_key)
+    if not source_value:
+        return False
+    return upsert_key(path, target_key, source_value)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -168,6 +179,11 @@ def main(argv: list[str] | None = None) -> int:
         metavar="KEY=DEFAULT",
         help="Set the key only if it is not already present",
     )
+    group.add_argument(
+        "--copy-if-missing",
+        metavar="TARGET_KEY=SOURCE_KEY",
+        help="Set TARGET_KEY to SOURCE_KEY's value only if TARGET_KEY is missing",
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -179,35 +195,56 @@ def main(argv: list[str] | None = None) -> int:
     if args.set:
         key, value = _parse_kv(args.set)
         action = "set"
-    else:
+    elif args.ensure:
         key, value = _parse_kv(args.ensure)
         action = "ensure"
+    else:
+        key, value = _parse_kv(args.copy_if_missing)
+        action = "copy-if-missing"
 
-    _validate_port(key, value)
+    if action != "copy-if-missing":
+        _validate_port(key, value)
 
     if args.dry_run:
         existing = read_key(env_path, key)
         if action == "set":
             print(f"[edit_hermes_env] (dry-run) would set {key}={value} in {env_path}")
-        elif existing is not None:
-            print(
-                f"[edit_hermes_env] (dry-run) would leave {key}={existing} in {env_path}"
-            )
+        elif action == "ensure":
+            if existing is not None:
+                print(
+                    f"[edit_hermes_env] (dry-run) would leave {key}={existing} in {env_path}"
+                )
+            else:
+                print(
+                    f"[edit_hermes_env] (dry-run) would ensure {key}={value} in {env_path}"
+                )
         else:
-            print(
-                f"[edit_hermes_env] (dry-run) would ensure {key}={value} in {env_path}"
-            )
+            source_value = read_key(env_path, value)
+            if existing is not None:
+                print(
+                    f"[edit_hermes_env] (dry-run) would leave {key}={existing} in {env_path}"
+                )
+            elif source_value:
+                print(
+                    f"[edit_hermes_env] (dry-run) would copy {value} to {key} in {env_path}"
+                )
+            else:
+                print(
+                    f"[edit_hermes_env] (dry-run) would leave {key} unset; {value} is missing"
+                )
         return 0
 
     if action == "set":
         changed = upsert_key(env_path, key, value)
-    else:
+    elif action == "ensure":
         changed = ensure_key(env_path, key, value)
+    else:
+        changed = copy_key_if_missing(env_path, key, value)
 
     if changed:
         print(f"[edit_hermes_env] updated {env_path} ({key}={read_key(env_path, key)})")
     else:
-        print(f"[edit_hermes_env] no change needed ({env_path}: {key} already set)")
+        print(f"[edit_hermes_env] no change needed ({env_path}: {key})")
     return 0
 
 

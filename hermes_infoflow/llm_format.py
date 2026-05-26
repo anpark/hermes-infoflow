@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Protocol
 
 from .llm_tags import string_field
+from .settings import parse_infoflow_admin_users
 
 
 def _bool_text(value: bool) -> str:
@@ -37,12 +38,14 @@ def participant_id_from_key(sender_key: str) -> str:
     return sender_key
 
 
-def permission_for_sender(sender_key: str, admin_uid: str = "") -> str:
-    admin = _clean(admin_uid).lower()
-    if not admin:
+def permission_for_sender(sender_key: str, admin_uid: object = "") -> str:
+    admins = parse_infoflow_admin_users(admin_uid)
+    if not admins:
+        return "restricted"
+    if participant_kind(_clean(sender_key)) != "human":
         return "restricted"
     raw_id = participant_id_from_key(sender_key).lower()
-    return "admin" if raw_id == admin else "restricted"
+    return "admin" if raw_id in admins else "restricted"
 
 
 def format_created_time_ms(created_time_ms: int) -> str:
@@ -105,7 +108,7 @@ def sender_line(
     *,
     sender_key: str,
     name: str = "",
-    admin_uid: str = "",
+    admin_uid: object = "",
 ) -> str:
     sender_key = _clean(sender_key)
     name = _clean(name)
@@ -184,7 +187,7 @@ def format_group_record(
     record: object,
     *,
     sender_name_lookup: ParticipantLookup | None = None,
-    admin_uid: str = "",
+    admin_uid: object = "",
 ) -> str:
     sender = _clean(getattr(record, "sender", ""))
     name = ""
@@ -217,7 +220,7 @@ def format_dm_record(
     record: object,
     *,
     sender_name_lookup: ParticipantLookup | None = None,
-    admin_uid: str = "",
+    admin_uid: object = "",
 ) -> str:
     sender = _clean(getattr(record, "sender", ""))
     name = ""

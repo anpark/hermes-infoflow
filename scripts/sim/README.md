@@ -24,7 +24,7 @@ These are read from `~/.hermes/.env` (or your shell):
 | `INFOFLOW_APP_SECRET` | from the Infoflow open-platform console |
 | `INFOFLOW_APP_AGENT_ID` | optional but required for some calls |
 | `INFOFLOW_CHECK_TOKEN` / `INFOFLOW_ENCODING_AES_KEY` | only used for inbound |
-| `INFOFLOW_TEST_GROUP_ID` | **the group used by these sim scripts** (default: `4507088`) |
+| `INFOFLOW_OP_GROUP` | **the single numeric group id used by these sim scripts** |
 
 ## Entry points
 
@@ -37,7 +37,7 @@ These are read from `~/.hermes/.env` (or your shell):
 All three accept the same flags:
 
 ```text
---group <id>            override INFOFLOW_TEST_GROUP_ID once
+--group <id>            override INFOFLOW_OP_GROUP once
 --text "..."            override the default timestamped marker
 --mention "@chengbo05"  prepend an @-mention to the text (repeatable)
 --mention-user <csv>    metadata.mention_user_ids

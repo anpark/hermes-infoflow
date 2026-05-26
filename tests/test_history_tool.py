@@ -141,7 +141,7 @@ def test_history_tool_allows_admin_explicit_target_time_query(
     store.persist_group(
         message_id="current",
         group_id="4507088",
-        sender="user:admin",
+        sender="user:carol",
         content="current",
         created_time=_ms(_today_at(9, 30)),
     )
@@ -153,7 +153,11 @@ def test_history_tool_allows_admin_explicit_target_time_query(
         created_time=_ms(today),
     )
 
-    monkeypatch.setattr(tools, "_get_live_adapter", lambda: _adapter_for(store))
+    monkeypatch.setattr(
+        tools,
+        "_get_live_adapter",
+        lambda: _adapter_for(store, admin_uid="admin,carol"),
+    )
     handler = tools.make_history_handler()
     with recall_inbound_message_id_hint_scope("current"):
         result = asyncio.run(handler({

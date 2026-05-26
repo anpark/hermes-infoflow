@@ -52,7 +52,7 @@ def main() -> int:
     parser.add_argument(
         "--group",
         default=None,
-        help="Override INFOFLOW_TEST_GROUP_ID for a one-shot run.",
+        help="Override INFOFLOW_OP_GROUP for a one-shot run.",
     )
     args = parser.parse_args()
     group_id = args.group or test_group_id()

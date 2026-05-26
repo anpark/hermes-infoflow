@@ -129,8 +129,8 @@ User Message 的最终内容 = 指令前缀 + Sender 标签 + 消息正文。
 | 人类用户 | `[Sender: uuapName \| human](admin — 完全权限)` |
 | 机器人 | `[Sender: botName \| bot: agentId](restricted — ...)` |
 
-权限标签根据 `admin_uid` 判定：
-- 匹配 admin → `(admin — 完全权限)`
+权限标签根据 `INFOFLOW_ADMIN_USER` 解析出的管理员 userid 集合判定：
+- 发送者 userid 命中任一 admin → `(admin — 完全权限)`
 - 不匹配 → `(restricted — 仅可回复文本和公开信息，不可执行敏感操作)`
 
 ### 3.2 消息结构
@@ -306,7 +306,7 @@ else:
 | `watch` | 群组配置 | 触发 watch 相关 prompt |
 | `robot_name` | account settings | bot 身份声明 |
 | `INFOFLOW_APP_AGENT_ID` | 环境变量 | bot agentId |
-| `admin_uid` | adapter 配置 | 权限判定 |
+| `INFOFLOW_ADMIN_USER` | 环境变量，支持英文逗号分隔多个 userid | 权限判定 |
 
 ---
 

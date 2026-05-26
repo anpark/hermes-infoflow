@@ -121,7 +121,7 @@ async def _run(args: argparse.Namespace) -> int:
     if args.group:
         targets.append(("group", args.group))
     if not targets:
-        raise SystemExit("provide --dm and/or --group, or set INFOFLOW_ADMIN_USER/INFOFLOW_TEST_GROUP_ID")
+        raise SystemExit("provide --dm and/or --group, or set INFOFLOW_OP_GROUP")
 
     sizes = [_parse_size(part) for part in args.sizes.split(",") if part.strip()]
     marker = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -163,8 +163,8 @@ async def _run(args: argparse.Namespace) -> int:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dm", default="", help="DM uuapName. Defaults to INFOFLOW_ADMIN_USER if set.")
-    parser.add_argument("--group", default="", help="Group id. Defaults to INFOFLOW_TEST_GROUP_ID if set.")
+    parser.add_argument("--dm", default="", help="DM uuapName.")
+    parser.add_argument("--group", default="", help="Group id. Defaults to INFOFLOW_OP_GROUP if set.")
     parser.add_argument("--sizes", default=DEFAULT_SIZES, help="Comma-separated binary sizes, e.g. 760K,1M.")
     parser.add_argument("--dry-run", action="store_true", help="Generate payload sizes without sending.")
     return parser
@@ -177,9 +177,6 @@ def main() -> int:
 
     parser = _build_parser()
     args = parser.parse_args()
-    if not args.dm:
-        import os
-        args.dm = os.environ.get("INFOFLOW_ADMIN_USER", "").strip()
     if not args.group:
         try:
             args.group = test_group_id()

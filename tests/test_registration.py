@@ -33,7 +33,7 @@ def test_register_registers_platform_and_tool() -> None:
     platform = ctx.platforms[0]
     assert platform["name"] == "infoflow"
     assert "Infoflow" in platform["label"]
-    assert platform["cron_deliver_env_var"] == "INFOFLOW_HOME_CHANNEL"
+    assert platform["cron_deliver_env_var"] == "INFOFLOW_OP_CHANNEL"
     assert platform["max_message_length"] == 2048
     assert "infoflow" in (platform.get("install_hint") or "").lower() or platform.get("install_hint")
     assert "外发工具规则" in platform["platform_hint"]

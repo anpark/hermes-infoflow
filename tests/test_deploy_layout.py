@@ -1012,6 +1012,33 @@ def test_deploy_preserves_existing_port(tmp_path: Path) -> None:
     assert _read_env_port(home / ".hermes" / ".env") == "7777"
 
 
+def test_deploy_migrates_legacy_home_channel_to_op_channel(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    result = _run_deploy(
+        home,
+        pre_env_lines="INFOFLOW_HOME_CHANNEL=legacy-user\n",
+    )
+    assert result.returncode == 0, result.stderr
+    env_file = home / ".hermes" / ".env"
+    assert _read_env_key(env_file, "INFOFLOW_HOME_CHANNEL") == "legacy-user"
+    assert _read_env_key(env_file, "INFOFLOW_OP_CHANNEL") == "legacy-user"
+
+
+def test_deploy_preserves_existing_op_channel_during_legacy_migration(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    result = _run_deploy(
+        home,
+        pre_env_lines=(
+            "INFOFLOW_HOME_CHANNEL=legacy-user\n"
+            "INFOFLOW_OP_CHANNEL=ops-user\n"
+        ),
+    )
+    assert result.returncode == 0, result.stderr
+    assert _read_env_key(home / ".hermes" / ".env", "INFOFLOW_OP_CHANNEL") == "ops-user"
+
+
 def test_deploy_preserves_existing_sessiontracker_full_user_message(
     tmp_path: Path,
 ) -> None:

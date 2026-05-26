@@ -211,8 +211,7 @@ bash scripts/deploy.sh --port 9000 # 指定 webhook 端口并写入 ~/.hermes/.e
 | `INFOFLOW_PORT` | `26521` | Webhook 监听端口 |
 | `INFOFLOW_HOST` | `0.0.0.0` | Webhook 监听地址 |
 | `INFOFLOW_WEBHOOK_PATH` | `/webhook/infoflow` | Webhook 路径 |
-| `INFOFLOW_HOME_CHANNEL` | 无 | cron `deliver=infoflow` 缺省目标，如 `bob` 或 `group:12345` |
-| `INFOFLOW_HOME_CHANNEL_NAME` | 同上 | Home channel 显示名 |
+| `INFOFLOW_OP_CHANNEL` | 无 | 单个运维通知通道，同时作为 Hermes home channel / cron `deliver=infoflow` 缺省目标；如 `bob`、`group:12345` 或纯数字群 ID |
 | `INFOFLOW_REPLY_MODE` | `mention-and-watch` | `ignore` / `record` / `mention-only` / `mention-and-watch` / `proactive` |
 | `INFOFLOW_REQUIRE_MENTION` | `true` | 群消息是否仅在 @ 时响应 |
 | `INFOFLOW_WATCH_MENTIONS` | 无 | 单个用户名 / ID，或逗号分隔多个用户名 / ID；命中后即使没 @ 机器人也会触发 |
@@ -220,7 +219,7 @@ bash scripts/deploy.sh --port 9000 # 指定 webhook 端口并写入 ~/.hermes/.e
 | `INFOFLOW_FOLLOW_UP` | `true` | 机器人回复后群聊 follow-up 窗口是否开启 |
 | `INFOFLOW_FOLLOW_UP_WINDOW` | `300` | follow-up 窗口秒数 |
 | `INFOFLOW_GROUPS` | 无 | 按群 ID 的 JSON 配置覆盖 |
-| `INFOFLOW_ADMIN_USER` | 无 | 管理员 uuapName（敏感工具权限） |
+| `INFOFLOW_ADMIN_USER` | 无 | 管理员 userid，支持英文逗号分隔多个（只用于权限判定，不接收运维通知） |
 | `INFOFLOW_ALLOWED_USERS` | 无 | 逗号分隔的 uuapName allowlist |
 | `INFOFLOW_ALLOW_ALL_USERS` | `false` | 允许所有人（仅开发） |
 | `HERMES_STATE_DIR` | `~/.hermes/state` | sent-messages.db 等状态目录 |
@@ -373,7 +372,7 @@ https://<your-domain>/webhook/infoflow/sessiontracker?chatType=7&chatId=39500876
 - `on_stream_delta` — 流式 delta
 - `on_interim_assistant` —  interim 助手句
 
-调试注入到 Hermes 的完整 user message：`INFOFLOW_SESSIONTRACKER_FULL_USER_MESSAGE=true`。只有 Session Tracker URL 中的 `code` 解析为 `INFOFLOW_ADMIN_USER` 时才展示完整内容；非 admin 或未带 `code` 的群聊页面仍只展示 `[Message]` 后正文。
+调试注入到 Hermes 的完整 user message：`INFOFLOW_SESSIONTRACKER_FULL_USER_MESSAGE=true`。只有 Session Tracker URL 中的 `code` 解析为 `INFOFLOW_ADMIN_USER` 中任一 userid 时才展示完整内容；非 admin 或未带 `code` 的群聊页面仍只展示 `[Message]` 后正文。
 
 关闭：`INFOFLOW_SESSIONTRACKER_ENABLED=false`。
 

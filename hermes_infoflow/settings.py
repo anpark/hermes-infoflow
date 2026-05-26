@@ -32,6 +32,9 @@ GROUP_TARGET_RE = re.compile(r"^(?:group:)?(\d+)$", re.IGNORECASE)
 MAX_PREVIEW_LENGTH = 100  # matches openclaw reply-dispatcher truncatePreview()
 WATCH_REGEX_ENV = "INFOFLOW_WATCH_REGEX"
 WATCH_REGEX_ENV_PREFIX = f"{WATCH_REGEX_ENV}_"
+OP_CHANNEL_ENV = "INFOFLOW_OP_CHANNEL"
+LEGACY_HOME_CHANNEL_ENV = "INFOFLOW_HOME_CHANNEL"
+ADMIN_USER_ENV = "INFOFLOW_ADMIN_USER"
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +69,97 @@ def _watch_regex_env_values() -> list[str]:
         if value:
             patterns.append(value)
     return patterns
+
+
+def _normalize_infoflow_target(target_ref: str) -> str:
+    """Normalize a user-facing Infoflow target into a Hermes chat_id."""
+    target = str(target_ref or "").strip()
+    if not target:
+        return ""
+    if target.lower().startswith("infoflow:"):
+        target = target.split(":", 1)[1].strip()
+    if target.lower().startswith("group:"):
+        group_id = target.split(":", 1)[1].strip()
+        if group_id.isdigit():
+            return f"group:{group_id}"
+        logger.warning("Ignoring invalid INFOFLOW_OP_CHANNEL item: %s", target)
+        return ""
+    if target.isdigit():
+        return f"group:{target}"
+    return target
+
+
+def parse_infoflow_op_channel(raw: Any) -> str:
+    """Parse the single ``INFOFLOW_OP_CHANNEL`` target.
+
+    Pure numeric values are group IDs; ``group:<id>`` is also accepted. Any
+    other non-empty value is treated as a DM uuapName.
+    """
+    value = str(raw or "").strip()
+    if "," in value:
+        logger.warning(
+            "%s supports one target only; ignoring value with comma.",
+            OP_CHANNEL_ENV,
+        )
+        return ""
+    return _normalize_infoflow_target(value)
+
+
+def infoflow_op_channel_from_env() -> str:
+    """Return the configured operation channel, with legacy home fallback."""
+    raw = os.getenv(OP_CHANNEL_ENV, "").strip()
+    if raw:
+        return parse_infoflow_op_channel(raw)
+
+    legacy = os.getenv(LEGACY_HOME_CHANNEL_ENV, "").strip()
+    if legacy:
+        logger.warning(
+            "%s is deprecated; use %s instead.",
+            LEGACY_HOME_CHANNEL_ENV,
+            OP_CHANNEL_ENV,
+        )
+        return parse_infoflow_op_channel(legacy)
+    return ""
+
+
+def infoflow_home_channel_from_env() -> dict[str, str] | None:
+    """Return the Hermes home_channel seeded from the operation target."""
+    target = infoflow_op_channel_from_env()
+    if not target:
+        return None
+    name = target
+    if not os.getenv(OP_CHANNEL_ENV, "").strip():
+        name = os.getenv("INFOFLOW_HOME_CHANNEL_NAME", "").strip() or target
+    return {"chat_id": target, "name": name}
+
+
+def parse_infoflow_admin_users(raw: Any) -> tuple[str, ...]:
+    """Parse ``INFOFLOW_ADMIN_USER`` into normalized admin user IDs."""
+    users: list[str] = []
+    seen: set[str] = set()
+    raw_items = raw if isinstance(raw, (list, tuple, set)) else (raw,)
+    for raw_item in raw_items:
+        for piece in str(raw_item or "").split(","):
+            user = piece.strip().lower()
+            if not user:
+                continue
+            if ":" in user:
+                logger.warning(
+                    "Ignoring invalid %s item: %s",
+                    ADMIN_USER_ENV,
+                    piece.strip(),
+                )
+                continue
+            if user in seen:
+                continue
+            seen.add(user)
+            users.append(user)
+    return tuple(users)
+
+
+def infoflow_admin_users_from_env() -> tuple[str, ...]:
+    """Return configured admin users from ``INFOFLOW_ADMIN_USER``."""
+    return parse_infoflow_admin_users(os.getenv(ADMIN_USER_ENV, ""))
 
 
 def _read_account_settings(config: Any) -> dict[str, Any]:
@@ -237,12 +331,9 @@ def _env_enablement() -> dict | None:
     watch_regex = _watch_regex_env_values()
     if watch_regex:
         seed["watch_regex"] = watch_regex
-    home = os.getenv("INFOFLOW_HOME_CHANNEL", "").strip()
+    home = infoflow_home_channel_from_env()
     if home:
-        seed["home_channel"] = {
-            "chat_id": home,
-            "name": os.getenv("INFOFLOW_HOME_CHANNEL_NAME", "").strip() or home,
-        }
+        seed["home_channel"] = home
     return seed
 
 
@@ -287,7 +378,7 @@ def _interactive_setup() -> None:  # pragma: no cover - manual flow
         "  INFOFLOW_ENCODING_AES_KEY=<your EncodingAESKey>\n"
         "Optional: INFOFLOW_API_HOST=https://api.im.baidu.com, "
         "INFOFLOW_APP_AGENT_ID, INFOFLOW_ROBOT_NAME, INFOFLOW_PORT, "
-        "INFOFLOW_HOME_CHANNEL"
+        "INFOFLOW_OP_CHANNEL"
     )
 
 
@@ -329,13 +420,16 @@ def _parse_infoflow_target(
 
 __all__ = [
     "DEFAULT_BODY_LIMIT_BYTES",
+    "ADMIN_USER_ENV",
     "DEFAULT_API_HOST",
     "DEFAULT_HOST",
     "DEFAULT_PORT",
     "DEFAULT_WEBHOOK_PATH",
     "GROUP_TARGET_RE",
+    "LEGACY_HOME_CHANNEL_ENV",
     "MAX_MESSAGE_LENGTH",
     "MAX_PREVIEW_LENGTH",
+    "OP_CHANNEL_ENV",
     "_check_requirements",
     "_env_enablement",
     "_interactive_setup",
@@ -343,4 +437,9 @@ __all__ = [
     "_parse_infoflow_target",
     "_read_account_settings",
     "_validate_config",
+    "infoflow_home_channel_from_env",
+    "infoflow_admin_users_from_env",
+    "infoflow_op_channel_from_env",
+    "parse_infoflow_admin_users",
+    "parse_infoflow_op_channel",
 ]

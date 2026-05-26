@@ -69,7 +69,6 @@ _GROUP_STATUS_TRACKER_ONLY_TEXT_PREFIXES = (
     "Compression aborted:",
     "Configured compression model",
 )
-GATEWAY_STARTED_NOTICE = "gateway started"
 
 
 @dataclass(frozen=True)
@@ -115,7 +114,7 @@ def _drop_leading_status_glyphs(text: str) -> str:
     return t
 
 
-def _format_group_status_admin_notice(
+def _format_group_status_ops_notice(
     *,
     group_id: str,
     content: str,
@@ -242,6 +241,8 @@ from .settings import (
     _parse_infoflow_target,
     _read_account_settings,
     _validate_config,
+    infoflow_admin_users_from_env,
+    infoflow_op_channel_from_env,
 )
 from .standalone import standalone_send
 from .utils import (
@@ -285,7 +286,9 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         super().__init__(config=config, platform=platform)
 
         self._settings = _read_account_settings(config)
-        self._admin_uid = os.getenv("INFOFLOW_ADMIN_USER", "").strip().lower()
+        self._admin_users = infoflow_admin_users_from_env()
+        self._admin_uid = ",".join(self._admin_users)
+        self._op_channel = infoflow_op_channel_from_env()
 
         # ── ServerAPI (Infoflow service layer) ─────────────────────────
         self._serverapi = ServerAPI(settings=self._settings)
@@ -485,7 +488,6 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             "[infoflow] Webhook listening on %s:%d%s",
             self._host, self._port, self._webhook_path,
         )
-        self._schedule_admin_gateway_started_notice()
         return True
 
     async def disconnect(self) -> None:
@@ -503,91 +505,77 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             self._http_session = None
             self._serverapi.http_session = None
 
-    def _schedule_admin_gateway_started_notice(self) -> None:
-        """Best-effort startup notice; never block or fail ``connect()``."""
-        if not self._admin_uid:
-            return
-
-        try:
-            task = asyncio.create_task(
-                self._notify_admin_gateway_started(
-                    session=self._effective_session(self._http_session),
-                )
-            )
-        except Exception as exc:
-            with contextlib.suppress(Exception):
-                gw_log().warning(
-                    "[infoflow] failed to schedule gateway startup notice "
-                    "admin=%s error=%s",
-                    self._admin_uid,
-                    exc,
-                    exc_info=True,
-                )
-            return
-
-        with contextlib.suppress(Exception):
-            self._background_tasks.add(task)
-            task.add_done_callback(self._background_tasks.discard)
-        with contextlib.suppress(Exception):
-            task.add_done_callback(self._consume_gateway_started_notice_task)
-
-    @staticmethod
-    def _consume_gateway_started_notice_task(task: asyncio.Task[Any]) -> None:
-        """Consume task errors so fire-and-forget startup notices stay isolated."""
-        try:
-            exc = task.exception()
-        except asyncio.CancelledError:
-            return
-        except Exception:
-            return
-        if exc is None:
-            return
-        with contextlib.suppress(Exception):
-            gw_log().warning(
-                "[infoflow] gateway startup notice task failed: %s",
-                exc,
-                exc_info=(type(exc), exc, exc.__traceback__),
-            )
-
-    async def _notify_admin_gateway_started(
+    async def _broadcast_ops_notice(
         self,
+        text: str,
         *,
         session: aiohttp.ClientSession | None = None,
-    ) -> None:
-        """Send a startup notice to the configured admin DM."""
-        if not self._admin_uid:
-            return
-
-        try:
-            await self._bot.send_message(
-                dm_user_id=self._admin_uid,
-                text=GATEWAY_STARTED_NOTICE,
-                session=session,
+        extra: dict[str, Any] | None = None,
+        log_context: str = "ops notice",
+    ) -> bool:
+        """Best-effort send to the configured operation channel."""
+        if not self._op_channel:
+            gw_log().info(
+                "[infoflow] no INFOFLOW_OP_CHANNEL configured for %s",
+                log_context,
             )
-        except Exception as exc:
-            with contextlib.suppress(Exception):
+            return False
+
+        from .bot import _reaction_promise_cv
+
+        target = self._op_channel
+        result_success = False
+        result_message_id = ""
+        result_error = ""
+        token = _reaction_promise_cv.set(None)
+        try:
+            kind, group_id, dm_user = self._parse_target(target)
+            try:
+                result = await self._bot.send_message(
+                    group_id=(
+                        str(group_id)
+                        if kind == "group" and group_id is not None
+                        else None
+                    ),
+                    dm_user_id=dm_user or None,
+                    text=text,
+                    session=session,
+                )
+                result_success = result.success
+                result_message_id = result.message_id
+                result_error = result.error
+            except Exception as exc:
+                result_error = str(exc)
                 gw_log().warning(
-                    "[infoflow] failed to send gateway startup notice "
-                    "admin=%s error=%s",
-                    self._admin_uid,
-                    exc,
+                    "[infoflow] failed to send %s target=%s error=%s",
+                    log_context,
+                    target,
+                    result_error,
                     exc_info=True,
                 )
-            return
 
-        with contextlib.suppress(Exception):
-            self._push_infoflow_event(
-                None,
-                kind="outbound.infoflow",
-                chat_id=self._admin_uid,
-                extra={
-                    "type": "text",
-                    "chars": len(GATEWAY_STARTED_NOTICE),
-                    "preview": GATEWAY_STARTED_NOTICE,
-                    "gateway_startup_notice": True,
-                    "attempted": True,
-                },
-            )
+            event_extra = {
+                "type": "text",
+                "chars": len(text or ""),
+                "success": result_success,
+                "message_id": result_message_id,
+                "error": result_error,
+                "preview": (text or "")[:200],
+                "ops_notice": True,
+                "op_channel": target,
+            }
+            if extra:
+                event_extra.update(extra)
+            with contextlib.suppress(Exception):
+                self._push_infoflow_event(
+                    None,
+                    kind="outbound.infoflow",
+                    chat_id=target,
+                    extra=event_extra,
+                )
+        finally:
+            _reaction_promise_cv.reset(token)
+        return result_success
 
     # ------------------------------------------------------------------
     # Inbound message callback (from webhook server)
@@ -1407,14 +1395,14 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             effective_status_kind = status_kind or tracker_only_status_kind
             redirected = False
             if status_kind:
-                redirected = await self._redirect_group_status_to_admin(
+                redirected = await self._broadcast_group_status_to_ops(
                     group_id=str(group_id),
                     content=content,
                     status_kind=status_kind,
                     session=session,
                 )
             gw_log().info(
-                "[iflow:send] suppressed group status target=%s kind=%s redirected_admin=%s",
+                "[iflow:send] suppressed group status target=%s kind=%s redirected_ops=%s",
                 chat_id,
                 effective_status_kind,
                 redirected,
@@ -1431,7 +1419,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     "error": "",
                     "suppressed_group_status": True,
                     "sessiontracker_only_status": bool(tracker_only_status_kind),
-                    "redirected_to_admin": redirected,
+                    "redirected_to_ops": redirected,
                     "preview": (content or "")[:200],
                 },
             )
@@ -1514,6 +1502,30 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             retryable=False,
         )
 
+    async def _broadcast_group_status_to_ops(
+        self,
+        *,
+        group_id: str,
+        content: str,
+        status_kind: str,
+        session: aiohttp.ClientSession | None = None,
+    ) -> bool:
+        """Forward suppressed Hermes runtime status to operation channels."""
+        notice = _format_group_status_ops_notice(
+            group_id=group_id,
+            content=content,
+            status_kind=status_kind,
+        )
+        return await self._broadcast_ops_notice(
+            notice,
+            session=session,
+            extra={
+                "ops_status_broadcast": True,
+                "source_group_id": group_id,
+            },
+            log_context=f"group status notice group={group_id}",
+        )
+
     async def _redirect_group_status_to_admin(
         self,
         *,
@@ -1522,71 +1534,13 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         status_kind: str,
         session: aiohttp.ClientSession | None = None,
     ) -> bool:
-        """Forward suppressed Hermes runtime status from a group to admin DM."""
-        if not self._admin_uid:
-            return False
-
-        notice = _format_group_status_admin_notice(
+        """Backward-compatible alias; status notices now go to ops channels."""
+        return await self._broadcast_group_status_to_ops(
             group_id=group_id,
             content=content,
             status_kind=status_kind,
+            session=session,
         )
-
-        # This is an out-of-band admin notice, not the final answer for the
-        # current group turn. Preserve the group's processing emoji until the
-        # actual queued/final response path clears it.
-        from .bot import _reaction_promise_cv
-
-        result_success = False
-        result_message_id = ""
-        result_error = ""
-        redirect_error_logged = False
-        token = _reaction_promise_cv.set(None)
-        try:
-            try:
-                result = await self._bot.send_message(
-                    dm_user_id=self._admin_uid,
-                    text=notice,
-                    session=session,
-                )
-                result_success = result.success
-                result_message_id = result.message_id
-                result_error = result.error
-            except Exception as exc:
-                result_error = str(exc)
-                gw_log().warning(
-                    "[iflow:send] failed to redirect group status to admin=%s group=%s error=%s",
-                    self._admin_uid,
-                    group_id,
-                    result_error,
-                    exc_info=True,
-                )
-                redirect_error_logged = True
-        finally:
-            _reaction_promise_cv.reset(token)
-        self._push_infoflow_event(
-            None,
-            kind="outbound.infoflow",
-            chat_id=self._admin_uid,
-            extra={
-                "type": "text",
-                "chars": len(notice),
-                "success": result_success,
-                "message_id": result_message_id,
-                "error": result_error,
-                "preview": notice[:200],
-                "admin_status_redirect": True,
-                "source_group_id": group_id,
-            },
-        )
-        if result_error and not result_success and not redirect_error_logged:
-            gw_log().warning(
-                "[iflow:send] failed to redirect group status to admin=%s group=%s error=%s",
-                self._admin_uid,
-                group_id,
-                result_error,
-            )
-        return result_success
 
     async def send_typing(self, chat_id: str, metadata: dict[str, Any] | None = None) -> None:
         return None
@@ -1905,7 +1859,7 @@ def register(ctx: Any) -> None:
         ),
         setup_fn=_interactive_setup,
         env_enablement_fn=_env_enablement,
-        cron_deliver_env_var="INFOFLOW_HOME_CHANNEL",
+        cron_deliver_env_var="INFOFLOW_OP_CHANNEL",
         standalone_sender_fn=standalone_send,
         allowed_users_env="INFOFLOW_ALLOWED_USERS",
         allow_all_env="INFOFLOW_ALLOW_ALL_USERS",

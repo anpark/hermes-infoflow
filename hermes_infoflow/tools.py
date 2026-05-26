@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 from .llm_format import format_created_time_ms, format_dm_record, format_group_record
 from .prompt_rules import INFOFLOW_DELIVERY_TOOL_RULES, delivery_success_hint
+from .settings import parse_infoflow_admin_users
 
 if TYPE_CHECKING:
     pass
@@ -619,11 +620,15 @@ def _same_target(a: tuple[str, str, str, str], b: tuple[str, str, str, str]) -> 
 
 
 def _record_is_admin(record: Any, admin_uid: str) -> bool:
-    admin = str(admin_uid or "").strip().lower()
-    if not admin:
+    admins = parse_infoflow_admin_users(admin_uid)
+    if not admins:
         return False
     sender = str(getattr(record, "sender", "") or "").strip().lower()
-    return sender == f"user:{admin}"
+    if sender.startswith("bot:"):
+        return False
+    if sender.startswith("user:"):
+        sender = sender.removeprefix("user:")
+    return sender in admins
 
 
 def _records_to_history_payload(adapter: Any, records: list[Any]) -> list[dict[str, str]]:
@@ -697,15 +702,16 @@ def make_reply_handler():
         if not target:
             try:
                 from gateway.run import _gateway_runner_ref  # type: ignore[import-not-found]
+                from gateway.config import Platform  # type: ignore[import-not-found]
                 runner = _gateway_runner_ref()
                 if runner and hasattr(runner, "config"):
-                    home = getattr(runner.config, "infoflow_home_channel", None)
+                    home = runner.config.get_home_channel(Platform("infoflow"))
                     if home:
-                        target = f"infoflow:{home}"
+                        target = f"infoflow:{home.chat_id}"
             except Exception:
                 pass
         if not target:
-            return tool_result_json({"error": "target is required (or set INFOFLOW_HOME_CHANNEL)"})
+            return tool_result_json({"error": "target is required (or set INFOFLOW_OP_CHANNEL)"})
 
         # Strip ``infoflow:`` prefix if present (adapter expects raw chat_id).
         if target.startswith("infoflow:"):

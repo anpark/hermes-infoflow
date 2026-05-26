@@ -53,6 +53,7 @@ from .recall import (
     reply_to_bot_from_current_inbound,
 )
 from .sent_store import SentMessageStore
+from .settings import parse_infoflow_admin_users
 from .utils import gw_log
 
 if TYPE_CHECKING:  # pragma: no cover — avoid circular import at runtime
@@ -219,7 +220,8 @@ class Bot:
         self._sent_store = sent_store
         self._dedup_set = dedup_set
         self._message_store = message_store
-        self._admin_uid = admin_uid.strip().lower()
+        self._admin_users = parse_infoflow_admin_users(admin_uid)
+        self._admin_uid = ",".join(self._admin_users)
         self._robot_id: str = str(settings.get("robot_id") or "")
         self._reaction_cleanup_tasks: set[asyncio.Task[Any]] = set()
         self._reaction_cleanup_tasks_by_run: dict[str, asyncio.Task[Any]] = {}
@@ -455,12 +457,12 @@ class Bot:
         """
         if not msg.is_group:
             return True
-        if not self._admin_uid:
+        if not self._admin_users:
+            return False
+        if msg.sender_is_bot:
             return False
         sender = (msg.sender_id or "").lower()
-        if msg.sender_is_bot:
-            sender = (getattr(msg, "sender_agent_id", "") or "").lower()
-        return sender == self._admin_uid and msg.bot_was_mentioned
+        return sender in self._admin_users and msg.bot_was_mentioned
 
     # -- enrich sender (moved from adapter.py) -----------------------------
 

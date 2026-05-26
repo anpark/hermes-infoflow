@@ -759,7 +759,6 @@ fi
 run_cmd "$PY" "$EDIT_SCRIPT" "${EDIT_ARGS[@]}"
 
 HERMES_ENV_FILE="$HERMES_HOME/.env"
-echo "==> Configuring INFOFLOW_PORT in $HERMES_ENV_FILE"
 EDIT_ENV_SCRIPT="$SELF_DIR/edit_hermes_env.py"
 if [[ ! -f "$EDIT_ENV_SCRIPT" ]]; then
   EDIT_ENV_SCRIPT="$PLUGIN_DIR/scripts/lib/edit_hermes_env.py"
@@ -768,6 +767,18 @@ if [[ ! -f "$EDIT_ENV_SCRIPT" ]]; then
   echo "✗ Cannot find edit_hermes_env.py" >&2
   exit 1
 fi
+
+echo "==> Migrating INFOFLOW_HOME_CHANNEL to INFOFLOW_OP_CHANNEL in $HERMES_ENV_FILE"
+ENV_ARGS=(
+  --env-file "$HERMES_ENV_FILE"
+  --copy-if-missing "INFOFLOW_OP_CHANNEL=INFOFLOW_HOME_CHANNEL"
+)
+if [[ "$DRY_RUN" == "true" ]]; then
+  ENV_ARGS+=(--dry-run)
+fi
+run_cmd "$PY" "$EDIT_ENV_SCRIPT" "${ENV_ARGS[@]}"
+
+echo "==> Configuring INFOFLOW_PORT in $HERMES_ENV_FILE"
 ENV_ARGS=(--env-file "$HERMES_ENV_FILE")
 if [[ -n "$PORT" ]]; then
   ENV_ARGS+=(--set "INFOFLOW_PORT=$PORT")

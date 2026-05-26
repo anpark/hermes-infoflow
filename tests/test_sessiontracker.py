@@ -583,7 +583,7 @@ async def test_sessiontracker_history_full_user_message_requires_admin_viewer_co
     from aiohttp.test_utils import TestClient, TestServer
 
     monkeypatch.setenv("INFOFLOW_SESSIONTRACKER_FULL_USER_MESSAGE", "true")
-    monkeypatch.setenv("INFOFLOW_ADMIN_USER", "admin")
+    monkeypatch.setenv("INFOFLOW_ADMIN_USER", "root,admin")
     monkeypatch.setenv("INFOFLOW_APP_KEY", "app-key")
     monkeypatch.setenv("INFOFLOW_APP_SECRET", "app-secret")
     monkeypatch.setenv("INFOFLOW_APP_AGENT_ID", "123")

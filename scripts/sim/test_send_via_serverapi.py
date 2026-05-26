@@ -77,7 +77,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--group", default=None,
-        help="Override INFOFLOW_TEST_GROUP_ID for a one-shot run.",
+        help="Override INFOFLOW_OP_GROUP for a one-shot run.",
     )
     parser.add_argument(
         "--text", default=None,

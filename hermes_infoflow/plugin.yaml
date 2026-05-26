@@ -76,8 +76,8 @@ optional_env:
     password: false
 
   - name: INFOFLOW_ADMIN_USER
-    description: "Admin user's uuapName — only this user has full access to sensitive tools"
-    prompt: "Admin user uuapName"
+    description: "Admin userid list, comma-separated — only these users have full access to sensitive tools"
+    prompt: "Admin userids, comma-separated"
     password: false
   - name: INFOFLOW_APP_AGENT_ID
     description: "Infoflow agent ID (required for private-chat recall)"
@@ -103,13 +103,9 @@ optional_env:
     description: "Webhook URL path (default /webhook/infoflow)"
     prompt: "Webhook path"
     password: false
-  - name: INFOFLOW_HOME_CHANNEL
-    description: "Default delivery target for cron jobs (uuapName or group:<id>)"
-    prompt: "Home channel target"
-    password: false
-  - name: INFOFLOW_HOME_CHANNEL_NAME
-    description: "Display name for the home channel"
-    prompt: "Home channel display name"
+  - name: INFOFLOW_OP_CHANNEL
+    description: "Single operation channel for notices and default delivery (uuapName or group:<id>; numeric value is a group)"
+    prompt: "Operation channel target"
     password: false
   - name: INFOFLOW_REPLY_MODE
     description: "Group reply mode: ignore / record / mention-only / mention-and-watch (default) / proactive"

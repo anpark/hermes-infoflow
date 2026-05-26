@@ -96,7 +96,7 @@ async def _run(args: argparse.Namespace) -> int:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--group", default=None, help="Override INFOFLOW_TEST_GROUP_ID.")
+    parser.add_argument("--group", default=None, help="Override INFOFLOW_OP_GROUP.")
     parser.add_argument("--text", default=None, help="Message body.")
     parser.add_argument(
         "--mention", action="append", default=[],

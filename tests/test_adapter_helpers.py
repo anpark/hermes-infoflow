@@ -20,7 +20,7 @@ import pytest
 
 from hermes_infoflow import recall as ad
 from hermes_infoflow.adapter import (
-    _format_group_status_admin_notice,
+    _format_group_status_ops_notice,
     _group_status_redirect_kind,
 )
 from hermes_infoflow.recall import (
@@ -37,6 +37,9 @@ from hermes_infoflow.settings import (
     _env_enablement,
     _parse_infoflow_target,
     _read_account_settings,
+    infoflow_home_channel_from_env,
+    parse_infoflow_admin_users,
+    parse_infoflow_op_channel,
 )
 
 # ---------------------------------------------------------------------------
@@ -185,6 +188,62 @@ def test_env_enablement_includes_prefixed_watch_regex(monkeypatch) -> None:
 
     assert seed is not None
     assert seed["watch_regex"] == ["\\bdeploy\\b", "iphone|ios|crash"]
+
+
+def test_parse_infoflow_op_channel_normalizes_dm_and_group() -> None:
+    assert parse_infoflow_op_channel(" alice ") == "alice"
+    assert parse_infoflow_op_channel("4507088") == "group:4507088"
+    assert parse_infoflow_op_channel(" group:4507088 ") == "group:4507088"
+    assert parse_infoflow_op_channel("infoflow:group:4507088") == "group:4507088"
+
+
+def test_parse_infoflow_op_channel_rejects_invalid_group(caplog) -> None:
+    assert parse_infoflow_op_channel("group:not-a-number") == ""
+    assert "invalid INFOFLOW_OP_CHANNEL" in caplog.text
+
+
+def test_parse_infoflow_op_channel_rejects_comma_list(caplog) -> None:
+    assert parse_infoflow_op_channel("alice,group:4507088") == ""
+    assert "supports one target only" in caplog.text
+
+
+def test_parse_infoflow_admin_users_supports_single_and_comma_list() -> None:
+    assert parse_infoflow_admin_users(" Alice, bob ,ALICE,, 12345 ") == (
+        "alice",
+        "bob",
+        "12345",
+    )
+
+
+def test_parse_infoflow_admin_users_rejects_group_like_items(caplog) -> None:
+    assert parse_infoflow_admin_users("alice,group:4507088,infoflow:bob") == ("alice",)
+    assert "invalid INFOFLOW_ADMIN_USER" in caplog.text
+
+
+def test_env_enablement_uses_op_channel_as_home(monkeypatch) -> None:
+    monkeypatch.setenv("INFOFLOW_APP_KEY", "k")
+    monkeypatch.setenv("INFOFLOW_APP_SECRET", "s")
+    monkeypatch.setenv("INFOFLOW_CHECK_TOKEN", "tok")
+    monkeypatch.setenv("INFOFLOW_ENCODING_AES_KEY", "aes")
+    monkeypatch.setenv("INFOFLOW_OP_CHANNEL", "4507088")
+    monkeypatch.setenv("INFOFLOW_HOME_CHANNEL", "legacy")
+
+    seed = _env_enablement()
+
+    assert seed is not None
+    assert seed["home_channel"] == {"chat_id": "group:4507088", "name": "group:4507088"}
+
+
+def test_infoflow_home_channel_falls_back_to_legacy_home(monkeypatch, caplog) -> None:
+    monkeypatch.delenv("INFOFLOW_OP_CHANNEL", raising=False)
+    monkeypatch.setenv("INFOFLOW_HOME_CHANNEL", "4507088")
+    monkeypatch.setenv("INFOFLOW_HOME_CHANNEL_NAME", "Legacy Home")
+
+    assert infoflow_home_channel_from_env() == {
+        "chat_id": "group:4507088",
+        "name": "Legacy Home",
+    }
+    assert "deprecated" in caplog.text
 
 
 def test_requirements_do_not_require_api_host(monkeypatch) -> None:
@@ -374,8 +433,8 @@ def test_group_status_redirect_kind_does_not_match_normal_text() -> None:
     assert _group_status_redirect_kind("用户正常问：Memory updated 是什么意思？") == ""
 
 
-def test_format_group_status_admin_notice_identifies_group() -> None:
-    notice = _format_group_status_admin_notice(
+def test_format_group_status_ops_notice_identifies_group() -> None:
+    notice = _format_group_status_ops_notice(
         group_id="4507088",
         content="💾 Self-improvement review: Memory updated",
         status_kind="💾 Self-improvement review:",

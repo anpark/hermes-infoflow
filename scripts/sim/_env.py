@@ -118,9 +118,12 @@ def required_env(*names: str) -> None:
 
 
 def test_group_id() -> str:
-    """Return ``INFOFLOW_TEST_GROUP_ID``, aborting with a clear hint if unset."""
-    required_env("INFOFLOW_TEST_GROUP_ID")
-    return os.environ["INFOFLOW_TEST_GROUP_ID"].strip()
+    """Return the single ``INFOFLOW_OP_GROUP`` used by sim scripts."""
+    required_env("INFOFLOW_OP_GROUP")
+    group_id = os.environ["INFOFLOW_OP_GROUP"].strip()
+    if not group_id.isdigit():
+        raise SystemExit("[sim] INFOFLOW_OP_GROUP must be a single numeric group id.")
+    return group_id
 
 
 __all__ = [
