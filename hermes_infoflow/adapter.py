@@ -186,10 +186,12 @@ from .bot import Bot  # noqa: E402
 from .dashboard import get_tracker, normalize_chat_id
 from .identity import raw_id_from_key, sender_key
 from .iftools import (
+    CREATE_GROUP_TOOL_SCHEMA,
     GROUP_MEMBERS_TOOL_SCHEMA,
     HISTORY_TOOL_SCHEMA,
     RECALL_TOOL_SCHEMA,
     REPLY_TOOL_SCHEMA,
+    make_create_group_handler,
     make_group_members_handler,
     make_history_handler,
     make_recall_handler,
@@ -2207,6 +2209,10 @@ def register(ctx: Any) -> None:
             "【群成员】使用 `infoflow_get_group_members` 查询群成员列表（人类与机器人），"
             "便于在 @ 提及前确认 user_id、agent_id 或机器人显示名。\n"
             "\n"
+            "【建群/拉群】使用 `infoflow_create_group` 创建新如流群，并在建群时"
+            "一次性拉入多个人类成员和机器人。人类可传 uuapName 或邮箱；"
+            "机器人必须传 agentId，不能只传机器人名称。该工具不用于向已有群追加成员。\n"
+            "\n"
             "【历史消息】使用 `infoflow_get_message_history` 查询聊天历史。"
             "成功返回 JSON 数组字符串，每项含 `time` 和 `content`；"
             "`time` 格式为 `YYYY.MM.DD HH.mm.ss`；"
@@ -2258,6 +2264,22 @@ def register(ctx: Any) -> None:
         except Exception as exc:
             gw_log().warning(
                 "[infoflow] failed to register group members tool: %s", exc,
+            )
+        try:
+            register_tool(
+                name="infoflow_create_group",
+                toolset="infoflow",
+                schema=CREATE_GROUP_TOOL_SCHEMA,
+                handler=make_create_group_handler(),
+                is_async=True,
+                description=(
+                    "Create a new Infoflow group and invite initial human/robot members."
+                ),
+                emoji="➕",
+            )
+        except Exception as exc:
+            gw_log().warning(
+                "[infoflow] failed to register create group tool: %s", exc,
             )
         try:
             register_tool(

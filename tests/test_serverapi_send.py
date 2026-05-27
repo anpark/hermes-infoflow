@@ -160,6 +160,41 @@ def test_send_to_group_failure_preserves_partial_success_ids(monkeypatch) -> Non
     assert result.continuation_msgseqids == ("",)
 
 
+def test_create_group_delegates_to_api(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_create_group(account, **kwargs):
+        captured.update(kwargs)
+        return {"ok": True, "groupid": "123"}
+
+    monkeypatch.setattr(
+        serverapi_mod._api,
+        "create_group",
+        fake_create_group,
+    )
+    api = ServerAPI(settings=_settings())
+
+    result = asyncio.run(api.create_group(
+        group_name="测试群",
+        group_owner="chengbo05@baidu.com",
+        member_list=["alice@baidu.com"],
+        robot_list=[15072],
+        friendly_level=2,
+        search_ability=1,
+        managers=["alice@baidu.com"],
+        robot_managers=[15072],
+        session=object(),
+    ))
+
+    assert result == {"ok": True, "groupid": "123"}
+    assert captured["group_name"] == "测试群"
+    assert captured["group_owner"] == "chengbo05@baidu.com"
+    assert captured["member_list"] == ["alice@baidu.com"]
+    assert captured["robot_list"] == [15072]
+    assert captured["managers"] == ["alice@baidu.com"]
+    assert captured["robot_managers"] == [15072]
+
+
 def test_private_bot_echo_converts_to_bot_sender() -> None:
     api = ServerAPI(settings=_settings())
     incoming = api.to_incoming(

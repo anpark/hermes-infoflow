@@ -1093,6 +1093,43 @@ class ServerAPI:
         return result.members
 
     # ------------------------------------------------------------------
+    # Group create
+    # ------------------------------------------------------------------
+
+    async def create_group(
+        self,
+        *,
+        group_name: str,
+        group_owner: str,
+        member_list: list[str] | None = None,
+        robot_list: list[int] | None = None,
+        friendly_level: int = 2,
+        search_ability: int = 1,
+        managers: list[str] | None = None,
+        robot_managers: list[int] | None = None,
+        group_sidebar: dict[str, Any] | None = None,
+        session: aiohttp.ClientSession | None = None,
+    ) -> dict[str, Any]:
+        """Create an Infoflow group and invite initial human/robot members."""
+        async with self._ensure_session(session) as sess:
+            try:
+                return await _api.create_group(
+                    self._api_account,
+                    group_name=group_name,
+                    group_owner=group_owner,
+                    member_list=member_list,
+                    robot_list=robot_list,
+                    friendly_level=friendly_level,
+                    search_ability=search_ability,
+                    managers=managers,
+                    robot_managers=robot_managers,
+                    group_sidebar=group_sidebar,
+                    session=sess,
+                )
+            except Exception as exc:
+                return {"ok": False, "error": str(exc)}
+
+    # ------------------------------------------------------------------
     # Image download
     # ------------------------------------------------------------------
 

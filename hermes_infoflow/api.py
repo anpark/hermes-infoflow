@@ -122,6 +122,7 @@ TOKEN_DEFAULT_LIFETIME_SECONDS = 7200
 INFOFLOW_AUTH_PATH = "/api/v1/auth/app_access_token"
 INFOFLOW_PRIVATE_SEND_PATH = "/api/v1/app/message/send"
 INFOFLOW_GROUP_SEND_PATH = "/api/v1/robot/msg/groupmsgsend"
+INFOFLOW_GROUP_CREATE_PATH = "/api/v1/robot/group/create"
 INFOFLOW_GROUP_RECALL_PATH = "/api/v1/robot/group/msgRecall"
 INFOFLOW_PRIVATE_RECALL_PATH = "/api/v1/app/message/revoke"
 INFOFLOW_EMOJI_ADD_PATH = "/api/v1/im/message/emoji/add"
@@ -776,6 +777,120 @@ async def send_group_message(
 
 
 # ---------------------------------------------------------------------------
+# Group create
+# ---------------------------------------------------------------------------
+
+
+def _parse_create_group_response(response_text: str) -> dict[str, Any]:
+    try:
+        data = json.loads(response_text)
+    except json.JSONDecodeError:
+        return {"ok": False, "error": f"non-JSON response: {response_text[:200]}"}
+
+    code = data.get("code")
+    if code not in (None, "ok", 0):
+        err = data.get("message") or data.get("errmsg") or f"code={code}"
+        logger.error("[infoflow:createGroup] failed: %s", err)
+        return {"ok": False, "error": str(err), "raw_response": data}
+
+    inner = data.get("data") if isinstance(data.get("data"), dict) else data
+    if isinstance(inner, dict) and isinstance(inner.get("data"), dict):
+        inner = inner["data"]
+    if not isinstance(inner, dict):
+        return {
+            "ok": False,
+            "error": f"unexpected response shape: {response_text[:200]}",
+            "raw_response": data,
+        }
+
+    errcode = inner.get("errcode")
+    if errcode not in (None, 0):
+        err = inner.get("errmsg") or f"errcode={errcode}"
+        logger.error("[infoflow:createGroup] failed: %s", err)
+        return {
+            "ok": False,
+            "error": str(err),
+            "errcode": errcode,
+            "errmsg": inner.get("errmsg"),
+            "raw_response": data,
+        }
+
+    groupid = inner.get("groupid", inner.get("groupId", inner.get("group_id")))
+    result: dict[str, Any] = {
+        "ok": True,
+        "groupid": str(groupid or ""),
+        "errmsg": inner.get("errmsg", ""),
+        "raw_response": data,
+    }
+    for key in ("failMembers", "failRobotIds", "failManager", "failRobotManager"):
+        value = inner.get(key)
+        result[key] = value if isinstance(value, list) else []
+    return result
+
+
+async def create_group(
+    account: InfoflowAccountAPI,
+    *,
+    group_name: str,
+    group_owner: str,
+    member_list: list[str] | None = None,
+    robot_list: list[int] | None = None,
+    friendly_level: int = 2,
+    search_ability: int = 1,
+    managers: list[str] | None = None,
+    robot_managers: list[int] | None = None,
+    group_sidebar: dict[str, Any] | None = None,
+    session: aiohttp.ClientSession | None = None,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Create an Infoflow group chat and invite humans/robots at creation time."""
+    if not account.app_key or not account.app_secret:
+        return {"ok": False, "error": "Infoflow appKey/appSecret not configured"}
+
+    try:
+        token = await get_app_access_token(account, session=session, timeout=timeout)
+    except InfoflowAPIError as exc:
+        logger.error("[infoflow:createGroup] token error: %s", exc)
+        return {"ok": False, "error": str(exc)}
+
+    payload: dict[str, Any] = {
+        "groupName": str(group_name),
+        "groupOwner": str(group_owner),
+        "friendlyLevel": int(friendly_level),
+        "searchAbility": int(search_ability),
+    }
+    if member_list:
+        payload["memberList"] = [str(item) for item in member_list]
+    if robot_list:
+        payload["robotList"] = [int(item) for item in robot_list]
+    if managers:
+        payload["managers"] = [str(item) for item in managers]
+    if robot_managers:
+        payload["robotManagers"] = [int(item) for item in robot_managers]
+    if group_sidebar:
+        payload["groupSidebar"] = dict(group_sidebar)
+
+    url = _join(account.api_host, INFOFLOW_GROUP_CREATE_PATH)
+    body_str = json.dumps(payload, ensure_ascii=False)
+    gw_log().info("[infoflow:create_group_payload] %s", body_str)
+    headers = _auth_headers(token)
+
+    async with _ensure_session(session) as sess, sess.post(
+        url,
+        data=body_str.encode("utf-8"),
+        headers=headers,
+        timeout=aiohttp.ClientTimeout(total=timeout),
+    ) as resp:
+        text = await resp.text()
+        if resp.status >= 400:
+            return {
+                "ok": False,
+                "error": f"create group HTTP {resp.status}: {text[:200]}",
+            }
+    return _parse_create_group_response(text)
+
+
+# ---------------------------------------------------------------------------
 # Group members
 # ---------------------------------------------------------------------------
 
@@ -1178,6 +1293,7 @@ __all__ = [
     "ReplyContext",
     "add_message_reaction",
     "clear_token_cache",
+    "create_group",
     "delete_message_reaction",
     "ensure_https",
     "get_app_access_token",

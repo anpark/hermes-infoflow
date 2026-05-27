@@ -163,6 +163,87 @@ def test_send_group_message_keeps_msgseqids_aligned(monkeypatch) -> None:
     assert result["msgseqids"] == ["", "222"]
 
 
+def test_create_group_posts_expected_payload(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    class _Resp:
+        status = 200
+
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): return None
+        async def text(self):
+            return json.dumps({
+                "errcode": 0,
+                "errmsg": "",
+                "groupid": 123456,
+                "failMembers": [],
+                "failRobotIds": [999],
+            })
+
+    class _Sess:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): return None
+        def post(self, url, *, data, headers, timeout):
+            captured["url"] = url
+            captured["data"] = data.decode("utf-8")
+            captured["headers"] = headers
+            captured["timeout"] = timeout
+            return _Resp()
+        async def close(self): return None
+
+    async def fake_token(*a, **k):
+        return "TOK"
+
+    monkeypatch.setattr(api, "get_app_access_token", fake_token)
+
+    async def _go():
+        return await api.create_group(
+            api.InfoflowAccountAPI(
+                api_host="https://api.example.com",
+                app_key="k",
+                app_secret="s",
+            ),
+            group_name="测试群",
+            group_owner="chengbo05@baidu.com",
+            member_list=["alice@baidu.com", "bob@baidu.com"],
+            robot_list=[15072, 6471],
+            friendly_level=3,
+            search_ability=0,
+            managers=["alice@baidu.com"],
+            robot_managers=[15072],
+            session=_Sess(),
+        )
+
+    result = asyncio.run(_go())
+
+    assert captured["url"] == "https://api.example.com/api/v1/robot/group/create"
+    assert captured["headers"]["Authorization"] == "Bearer-TOK"
+    payload = json.loads(captured["data"])
+    assert payload == {
+        "groupName": "测试群",
+        "groupOwner": "chengbo05@baidu.com",
+        "memberList": ["alice@baidu.com", "bob@baidu.com"],
+        "robotList": [15072, 6471],
+        "friendlyLevel": 3,
+        "searchAbility": 0,
+        "managers": ["alice@baidu.com"],
+        "robotManagers": [15072],
+    }
+    assert result["ok"] is True
+    assert result["groupid"] == "123456"
+    assert result["failRobotIds"] == [999]
+
+
+def test_parse_create_group_response_reports_errcode() -> None:
+    result = api._parse_create_group_response(
+        '{"errcode":40001,"errmsg":"owner not found"}'
+    )
+
+    assert result["ok"] is False
+    assert result["errcode"] == 40001
+    assert "owner not found" in result["error"]
+
+
 def test_extract_id_from_raw_json_handles_large_int_and_quoted() -> None:
     raw = '{"messageid":1859713223686736431,"msgkey":"abc-123"}'
     assert api._extract_id(raw, "messageid") == "1859713223686736431"

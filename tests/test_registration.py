@@ -64,6 +64,23 @@ def test_register_registers_platform_and_tool() -> None:
     assert members_tool["is_async"] is True
     assert members_tool["schema"]["parameters"]["required"] == ["group_id"]
 
+    assert any(t["name"] == "infoflow_create_group" for t in ctx.tools)
+    create_tool = next(
+        t for t in ctx.tools if t["name"] == "infoflow_create_group"
+    )
+    assert create_tool["toolset"] == "infoflow"
+    assert create_tool["is_async"] is True
+    assert create_tool["schema"]["parameters"]["required"] == [
+        "group_name",
+        "group_owner",
+    ]
+    assert "robot_ids" in create_tool["schema"]["parameters"]["properties"]
+    assert (
+        create_tool["schema"]["parameters"]["properties"]["friendly_level"]["default"]
+        == 3
+    )
+    assert "infoflow_create_group" in platform["platform_hint"]
+
     assert any(t["name"] == "infoflow_get_message_history" for t in ctx.tools)
     history_tool = next(
         t for t in ctx.tools if t["name"] == "infoflow_get_message_history"

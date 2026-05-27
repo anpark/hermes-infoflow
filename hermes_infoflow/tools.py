@@ -315,6 +315,86 @@ GROUP_MEMBERS_TOOL_SCHEMA = {
 }
 
 
+# Schema for the agent-callable infoflow_create_group tool.
+CREATE_GROUP_TOOL_SCHEMA = {
+    "name": "infoflow_create_group",
+    "description": (
+        "创建如流群聊，并在建群时一次性拉入多个人类成员和机器人。"
+        "这是建群/拉群工具，不用于向已有群追加成员。\n\n"
+        "字段说明：\n"
+        "- `group_owner`、`member_users`、`managers` 可传 `chengbo05` "
+        "或 `chengbo05@baidu.com`；工具会把无域名的 uuapName 规范成 "
+        "`@baidu.com` 邮箱\n"
+        "- `robot_ids`、`robot_managers` 必须是如流机器人 agentId 整数，"
+        "不是机器人名称或 imId；可先用 `infoflow_get_group_members` "
+        "在已知群里确认机器人 agentId\n"
+        "- `friendly_level`: 1=不允许任何人进群，2=群主和管理员验证，"
+        "3=不需要验证；tool 默认 3，并会传给如流 API\n"
+        "- `search_ability`: 0=不可搜索，1=可搜索；默认 1\n\n"
+        "默认行为：tool 会自动把当前 Infoflow 插件自己的 "
+        "`INFOFLOW_APP_AGENT_ID` 加入 `robot_ids` 和 `robot_managers`，"
+        "让机器人自己成为新群机器人管理员，便于后续操作群。\n\n"
+        "限制：管理员总数（`managers` + `robot_managers`）最多 4 个；"
+        "`managers` 必须同时出现在 `member_users` 中，`robot_managers` "
+        "必须同时出现在 `robot_ids` 中。"
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "group_name": {
+                "type": "string",
+                "description": "群名称。",
+            },
+            "group_owner": {
+                "type": "string",
+                "description": "群主 uuapName 或邮箱，例如 `chengbo05` / `chengbo05@baidu.com`。",
+            },
+            "member_users": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "要拉入群的人类成员 uuapName 或邮箱列表。",
+                "default": [],
+            },
+            "robot_ids": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "description": "要拉入群的机器人 agentId 列表。",
+                "default": [],
+            },
+            "friendly_level": {
+                "type": "integer",
+                "enum": [1, 2, 3],
+                "description": "加群方式：1=禁止进群，2=群主/管理员验证，3=无需验证；省略时默认 3。",
+                "default": 3,
+            },
+            "search_ability": {
+                "type": "integer",
+                "enum": [0, 1],
+                "description": "是否可被搜索：0=不可搜索，1=可搜索。",
+                "default": 1,
+            },
+            "managers": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "普通管理员 uuapName 或邮箱列表；必须已在 member_users 中，且不能是群主。",
+                "default": [],
+            },
+            "robot_managers": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "description": "机器人管理员 agentId 列表；必须已在 robot_ids 中。省略时自动使用当前机器人的 agentId。",
+                "default": [],
+            },
+            "group_sidebar": {
+                "type": "object",
+                "description": "可选侧边栏配置，例如 {\"autoOpen\": 0, \"customSidebar\": 1, \"link\": \"https://...\"}。",
+            },
+        },
+        "required": ["group_name", "group_owner"],
+    },
+}
+
+
 # Schema for the agent-callable infoflow_get_message_history tool.
 HISTORY_TOOL_SCHEMA = {
     "name": "infoflow_get_message_history",
@@ -442,6 +522,228 @@ _HISTORY_DATETIME_RE = re.compile(
 
 def _json_error(message: str) -> str:
     return tool_result_json({"success": False, "error": message})
+
+
+def _dedupe_preserve_order(values: list[Any]) -> list[Any]:
+    seen: set[Any] = set()
+    result: list[Any] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+
+def _coerce_string_list(value: Any) -> list[str]:
+    if value is None or value == "":
+        return []
+    if isinstance(value, str):
+        raw_items = re.split(r"[,，\s]+", value)
+    elif isinstance(value, (list, tuple, set)):
+        raw_items = []
+        for item in value:
+            if isinstance(item, str) and ("," in item or "，" in item):
+                raw_items.extend(re.split(r"[,，\s]+", item))
+            else:
+                raw_items.append(str(item))
+    else:
+        raw_items = [str(value)]
+    return [item.strip() for item in raw_items if item and item.strip()]
+
+
+def _coerce_int_list(value: Any, field_name: str) -> tuple[list[int], str | None]:
+    raw_items = _coerce_string_list(value)
+    result: list[int] = []
+    for raw in raw_items:
+        try:
+            item = int(raw)
+        except (TypeError, ValueError):
+            return [], f"{field_name} must contain integer Infoflow agentIds"
+        if item <= 0:
+            return [], f"{field_name} must contain positive Infoflow agentIds"
+        result.append(item)
+    return _dedupe_preserve_order(result), None
+
+
+def _normalize_baidu_email(value: Any, field_name: str) -> tuple[str, str | None]:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return "", f"{field_name} is required"
+    raw = raw.removeprefix("mailto:").strip()
+    if any(ch.isspace() for ch in raw):
+        return "", f"{field_name} must be a uuapName or email, not whitespace-separated text"
+    if "@" not in raw:
+        raw = f"{raw}@baidu.com"
+    if raw.startswith("@") or raw.endswith("@"):
+        return "", f"{field_name} must be a valid uuapName or email"
+    return raw, None
+
+
+def _normalize_baidu_email_list(value: Any, field_name: str) -> tuple[list[str], str | None]:
+    normalized: list[str] = []
+    for item in _coerce_string_list(value):
+        email, error = _normalize_baidu_email(item, field_name)
+        if error:
+            return [], error
+        normalized.append(email)
+    return _dedupe_preserve_order(normalized), None
+
+
+def _normalize_create_group_args(args: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+    group_name = str(args.get("group_name") or args.get("name") or "").strip()
+    if not group_name:
+        return {}, "group_name is required"
+
+    group_owner, error = _normalize_baidu_email(
+        args.get("group_owner") or args.get("owner"),
+        "group_owner",
+    )
+    if error:
+        return {}, error
+
+    member_users, error = _normalize_baidu_email_list(
+        args.get("member_users", args.get("members")),
+        "member_users",
+    )
+    if error:
+        return {}, error
+
+    robot_ids, error = _coerce_int_list(
+        args.get("robot_ids", args.get("robots")),
+        "robot_ids",
+    )
+    if error:
+        return {}, error
+
+    managers, error = _normalize_baidu_email_list(args.get("managers"), "managers")
+    if error:
+        return {}, error
+
+    robot_managers, error = _coerce_int_list(
+        args.get("robot_managers"),
+        "robot_managers",
+    )
+    if error:
+        return {}, error
+
+    friendly_level = _clamp_int(args.get("friendly_level", 3), 3, 1, 3)
+    if args.get("friendly_level") not in (None, ""):
+        try:
+            friendly_level = int(args.get("friendly_level"))
+        except (TypeError, ValueError):
+            return {}, "friendly_level must be 1, 2, or 3"
+        if friendly_level not in (1, 2, 3):
+            return {}, "friendly_level must be 1, 2, or 3"
+
+    search_ability = _clamp_int(args.get("search_ability", 1), 1, 0, 1)
+    if args.get("search_ability") not in (None, ""):
+        try:
+            search_ability = int(args.get("search_ability"))
+        except (TypeError, ValueError):
+            return {}, "search_ability must be 0 or 1"
+        if search_ability not in (0, 1):
+            return {}, "search_ability must be 0 or 1"
+
+    if group_owner in managers:
+        return {}, "group_owner cannot also be listed in managers"
+    member_set = set(member_users)
+    missing_managers = [m for m in managers if m not in member_set]
+    if missing_managers:
+        return {}, "managers must also be included in member_users"
+
+    group_sidebar = args.get("group_sidebar")
+    if group_sidebar is not None and not isinstance(group_sidebar, dict):
+        return {}, "group_sidebar must be an object"
+
+    return {
+        "group_name": group_name,
+        "group_owner": group_owner,
+        "member_users": member_users,
+        "robot_ids": robot_ids,
+        "friendly_level": friendly_level,
+        "search_ability": search_ability,
+        "managers": managers,
+        "robot_managers": robot_managers,
+        "group_sidebar": group_sidebar,
+    }, None
+
+
+def _own_agent_id_for_adapter(adapter: Any) -> int | None:
+    settings = getattr(adapter, "_settings", None)
+    raw = settings.get("app_agent_id") if isinstance(settings, dict) else None
+    if raw in (None, ""):
+        serverapi = getattr(adapter, "_serverapi", None)
+        account = getattr(serverapi, "_api_account", None)
+        raw = getattr(account, "app_agent_id", None)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _finalize_create_group_defaults(
+    normalized: dict[str, Any],
+    *,
+    own_agent_id: int | None,
+) -> tuple[dict[str, Any], str | None]:
+    data = dict(normalized)
+    robot_ids = list(data.get("robot_ids") or [])
+    robot_managers = list(data.get("robot_managers") or [])
+
+    if own_agent_id is None:
+        return {}, (
+            "INFOFLOW_APP_AGENT_ID is required so the bot can be added as "
+            "a robot manager for the new group."
+        )
+
+    if own_agent_id not in robot_ids:
+        robot_ids.append(own_agent_id)
+    if own_agent_id not in robot_managers:
+        robot_managers.append(own_agent_id)
+
+    robot_ids = _dedupe_preserve_order(robot_ids)
+    robot_managers = _dedupe_preserve_order(robot_managers)
+    managers = list(data.get("managers") or [])
+
+    if len(managers) + len(robot_managers) > 4:
+        return {}, (
+            "managers and robot_managers can contain at most 4 total admins "
+            "after adding the bot itself as robot manager"
+        )
+    robot_set = set(robot_ids)
+    missing_robot_managers = [r for r in robot_managers if r not in robot_set]
+    if missing_robot_managers:
+        return {}, "robot_managers must also be included in robot_ids"
+
+    data["robot_ids"] = robot_ids
+    data["robot_managers"] = robot_managers
+    return data, None
+
+
+def _sensitive_tool_allowed(adapter: Any) -> tuple[bool, str | None]:
+    """Best-effort channel authorization for side-effectful Infoflow tools."""
+    try:
+        from .bot import get_recall_inbound_message_id_hint  # noqa: E402
+    except Exception:
+        return True, None
+
+    current_message_id = get_recall_inbound_message_id_hint() or ""
+    if not current_message_id:
+        return True, None
+
+    store = getattr(adapter, "_message_store", None)
+    finder = getattr(store, "find_any", None)
+    if not callable(finder):
+        return False, "Current Infoflow message context is required to authorize this tool."
+    record = finder(current_message_id)
+    if record is None:
+        return False, "Current Infoflow message context is required to authorize this tool."
+    admin_uid = str(getattr(adapter, "_admin_uid", "") or "")
+    if _record_is_admin(record, admin_uid):
+        return True, None
+    return False, "Only Infoflow admin users can create groups."
 
 
 _MEDIA_DIRECTIVE_RE = re.compile(
@@ -920,6 +1222,88 @@ def make_group_members_handler():
             stale=fetch_result.status == GroupMembersFetchStatus.OK_STALE,
             trusted_user_name_lookup=_trusted_user_name_lookup(adapter),
         )
+        return tool_result_json(payload)
+
+    return _handler
+
+
+def make_create_group_handler():
+    """Build the ``infoflow_create_group`` tool handler."""
+
+    async def _handler(args: dict, **_kwargs) -> str:
+        normalized, error = _normalize_create_group_args(args)
+        if error:
+            return _json_error(error)
+
+        adapter = _get_live_adapter()
+        if adapter is None:
+            return _json_error("Infoflow adapter not running — cannot create group.")
+
+        allowed, auth_error = _sensitive_tool_allowed(adapter)
+        if not allowed:
+            return _json_error(auth_error or "Not authorized to create Infoflow groups.")
+
+        own_agent_id = _own_agent_id_for_adapter(adapter)
+        normalized, error = _finalize_create_group_defaults(
+            normalized,
+            own_agent_id=own_agent_id,
+        )
+        if error:
+            return _json_error(error)
+
+        result = await adapter._serverapi.create_group(
+            group_name=normalized["group_name"],
+            group_owner=normalized["group_owner"],
+            member_list=normalized["member_users"] or None,
+            robot_list=normalized["robot_ids"] or None,
+            friendly_level=normalized["friendly_level"],
+            search_ability=normalized["search_ability"],
+            managers=normalized["managers"] or None,
+            robot_managers=normalized["robot_managers"] or None,
+            group_sidebar=normalized["group_sidebar"],
+        )
+        if not result.get("ok"):
+            return tool_result_json({
+                "success": False,
+                "error": result.get("error") or result.get("errmsg") or "create group failed",
+                "errcode": result.get("errcode"),
+                "errmsg": result.get("errmsg"),
+            })
+
+        failed = {
+            "members": result.get("failMembers") or [],
+            "robots": result.get("failRobotIds") or [],
+            "managers": result.get("failManager") or [],
+            "robot_managers": result.get("failRobotManager") or [],
+        }
+        if own_agent_id in failed["robots"] or own_agent_id in failed["robot_managers"]:
+            return tool_result_json({
+                "success": False,
+                "error": (
+                    "group created but the bot itself was not added as robot "
+                    "manager; bot group-management capability is not guaranteed"
+                ),
+                "group_id": str(result.get("groupid") or ""),
+                "group_name": normalized["group_name"],
+                "failed": failed,
+            })
+        payload = {
+            "success": True,
+            "group_id": str(result.get("groupid") or ""),
+            "group_name": normalized["group_name"],
+            "group_owner": normalized["group_owner"],
+            "requested": {
+                "member_users": normalized["member_users"],
+                "robot_ids": normalized["robot_ids"],
+                "friendly_level": normalized["friendly_level"],
+                "search_ability": normalized["search_ability"],
+                "managers": normalized["managers"],
+                "robot_managers": normalized["robot_managers"],
+            },
+            "failed": failed,
+        }
+        if any(failed.values()):
+            payload["partial_failure"] = True
         return tool_result_json(payload)
 
     return _handler
