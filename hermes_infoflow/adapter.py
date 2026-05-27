@@ -190,12 +190,12 @@ from .iftools import (
     GROUP_MEMBERS_TOOL_SCHEMA,
     HISTORY_TOOL_SCHEMA,
     RECALL_TOOL_SCHEMA,
-    REPLY_TOOL_SCHEMA,
+    SEND_MESSAGE_TOOL_SCHEMA,
     make_create_group_handler,
     make_group_members_handler,
     make_history_handler,
     make_recall_handler,
-    make_reply_handler,
+    make_send_message_handler,
 )
 from .itypes import IncomingMessage, ReplyInfo, reply_target_to_dict
 from .llm_format import (
@@ -1589,6 +1589,10 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         match = GROUP_TARGET_RE.match(chat_id)
         if match:
             return "group", int(match.group(1)), ""
+        if chat_id.startswith("dm:user:"):
+            chat_id = chat_id[len("dm:user:"):]
+        elif chat_id.startswith("user:"):
+            chat_id = chat_id[len("user:"):]
         return "dm", None, chat_id
 
     @staticmethod
@@ -2153,15 +2157,21 @@ def register(ctx: Any) -> None:
             "（加粗/斜体/代码/列表/链接）。\n"
             "\n"
             "【发送消息】\n"
-            "使用 `send_message` 时，`target` 格式为 `infoflow:<目标>`：\n"
-            "- 私信：`infoflow:<uuapName>`（如 `infoflow:chengbo05`）\n"
+            "回复当前会话时，优先直接输出最终回复；需要显式跨会话发送、"
+            "引用/quote、图片或群聊 @ 时使用 `infoflow_send_message`。"
+            "`infoflow_send_message.target` 必填。\n"
+            "跨会话外发时，target 格式为：\n"
+            "- 私信：`infoflow:<uuapName>` 或 `user:<uuapName>`（如 `infoflow:chengbo05`）\n"
             "- 群聊：`infoflow:group:<群组ID>`（如 `infoflow:group:4507088`）\n"
-            "- 省略 target 则发送到当前会话\n"
+            "- `bot:<agentId>` 不能作为私聊发送目标；机器人只能在群聊 @ 字段中使用 agentId\n"
+            "- 不要用裸 `infoflow` 作为当前会话目标；裸平台名会路由到 home channel\n"
             "\n"
             "【发送图片与外发工具】\n"
             f"{INFOFLOW_DELIVERY_TOOL_RULES}\n"
-            "普通图片发送使用 `send_message`；需要引用回复时使用 `infoflow_reply`，"
-            "把说明文字和 `MEDIA:<路径>` 一起放入 `message`。\n"
+            "普通当前会话图片可使用 `send_message`；需要引用回复、跨会话图片或"
+            "精确控制文本/图片顺序时使用 `infoflow_send_message`，"
+            "把说明文字和 `MEDIA:<路径>` 一起放入 `message`，或用 `image_paths` "
+            "追加图片。\n"
             "\n"
             "【@提及】群聊中两种方式均可：\n"
             "① 直接在消息文本中写 `@uuapName`（人）、"
@@ -2177,7 +2187,7 @@ def register(ctx: Any) -> None:
             "`message_id` 是该消息的唯一 ID；`created_time` 是插件首次看到该消息的时间，"
             "也是历史查询和排序使用的时间（系统注入，可信）。"
             "结构化标签内字符串值使用单引号，布尔/数字保持裸值。"
-            "需要引用回复时将该 ID 传给 `infoflow_reply`。\n"
+            "需要引用回复时将该 ID 传给 `infoflow_send_message.reply_to`。\n"
             "当 `[Unread Message Context: ...]` 出现时，"
             "说明提示指定的历史范围内有未读消息。"
             "除非当前消息显然无需上下文，否则应按提示优先调用 "
@@ -2201,10 +2211,12 @@ def register(ctx: Any) -> None:
             "不要输出\"已撤回\"或\"撤回成功\"。若同一条用户消息还有其它任务，"
             "只回复其它任务结果，不要提及撤回已成功\n"
             "\n"
-            "【引用回复】使用 `infoflow_reply` 引用某条消息并附带原文预览。"
-            "若省略 `reply_to`，自动引用触发本轮对话的那条用户消息。"
+            "【引用回复】使用 `infoflow_send_message` 引用某条消息并附带原文预览。"
+            "`target` 必填；`reply_to` 可传 message_id、"
+            "`{message_id, preview, msgid2}` 或数组。群聊一次最多引用一条；"
+            "私聊可引用多条。可省略 `message`，只发送引用卡片或群聊 @。"
             "引用回复图片时在 `message` 内包含 `MEDIA:<本地图片绝对路径>`，"
-            "不要发送路径正文。\n"
+            "或用 `image_paths`，不要发送路径正文。\n"
             "\n"
             "【群成员】使用 `infoflow_get_group_members` 查询群成员列表（人类与机器人），"
             "便于在 @ 提及前确认 user_id、agent_id 或机器人显示名。\n"
@@ -2236,19 +2248,19 @@ def register(ctx: Any) -> None:
             gw_log().warning("[infoflow] failed to register recall tool: %s", exc)
         try:
             register_tool(
-                name="infoflow_reply",
+                name="infoflow_send_message",
                 toolset="infoflow",
-                schema=REPLY_TOOL_SCHEMA,
-                handler=make_reply_handler(),
+                schema=SEND_MESSAGE_TOOL_SCHEMA,
+                handler=make_send_message_handler(),
                 is_async=True,
                 description=(
-                    "Reply to or quote a specific Infoflow message with preview. "
-                    "Automatically uses the current inbound message if reply_to is omitted."
+                    "Send an Infoflow message to a required target with optional "
+                    "reply quote, group @ mentions, and images."
                 ),
                 emoji="💬",
             )
         except Exception as exc:
-            gw_log().warning("[infoflow] failed to register reply tool: %s", exc)
+            gw_log().warning("[infoflow] failed to register send_message tool: %s", exc)
         try:
             register_tool(
                 name="infoflow_get_group_members",

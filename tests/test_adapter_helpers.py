@@ -424,6 +424,16 @@ def test_parse_infoflow_target_uuapname_dm() -> None:
     assert result == ("chengbo05", None)
 
 
+def test_parse_infoflow_target_user_prefix_dm() -> None:
+    result = _parse_infoflow_target("infoflow:user:chengbo05")
+    assert result == ("chengbo05", None)
+
+
+def test_parse_infoflow_target_rejects_bot_private_target() -> None:
+    assert _parse_infoflow_target("bot:17212") is None
+    assert _parse_infoflow_target("infoflow:bot:17212") is None
+
+
 def test_parse_infoflow_target_empty_string() -> None:
     assert _parse_infoflow_target("") is None
 

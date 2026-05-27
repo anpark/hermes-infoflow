@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import contextlib
 import json
 import logging
 import os
@@ -11,9 +13,12 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
+from .coerce import coerce_bool
 from .llm_format import format_created_time_ms, format_dm_record, format_group_record
-from .prompt_rules import INFOFLOW_DELIVERY_TOOL_RULES, delivery_success_hint
+from .media import prepare_infoflow_image_bytes
+from .prompt_rules import INFOFLOW_DELIVERY_TOOL_RULES
 from .settings import parse_infoflow_admin_users
+from .utils import _ImageLoadError
 
 if TYPE_CHECKING:
     pass
@@ -98,25 +103,6 @@ def _cron_auto_delivery_target() -> dict[str, str | None] | None:
         "platform": platform,
         "chat_id": chat_id,
         "thread_id": thread_id,
-    }
-
-
-def _reply_success_hint_for_context(
-    cron_target: dict[str, str | None] | None,
-) -> dict[str, Any]:
-    """Return model guidance after a successful direct reply send."""
-    if not cron_target:
-        return delivery_success_hint()
-    return {
-        "delivered": True,
-        "cron_auto_delivery": True,
-        "cron_auto_delivery_target": cron_target,
-        "suggested_final_response": "[SILENT]",
-        "final_response_instruction": (
-            "infoflow_reply already sent the quoted message directly. "
-            "Return exactly [SILENT] as the final response to prevent the cron "
-            "scheduler from auto-delivering a duplicate message."
-        ),
     }
 
 
@@ -230,28 +216,28 @@ def recall_tool_error_payload(
     return payload
 
 
-# Schema for the agent-callable infoflow_reply tool.
-REPLY_TOOL_SCHEMA = {
-    "name": "infoflow_reply",
+# Schema for the agent-callable infoflow_send_message tool.
+SEND_MESSAGE_TOOL_SCHEMA = {
+    "name": "infoflow_send_message",
     "description": (
-        "引用回复如流中的某条消息，回复内容会附带原消息的文本预览。"
-        "与普通 `send_message` 的区别在于：这里发出的消息会显示"
-        "「引用了某条消息」的卡片样式。\n\n"
-        "发送本地图片时，可在 `message` 中加入 `MEDIA:<本地图片绝对路径>`；"
-        "工具会读取图片字节并调用如流原生图片消息 API，不会把本地路径作为正文发出。"
-        "不要把 `MEDIA:` 或本地文件路径当普通文本发送。\n\n"
-        f"{INFOFLOW_DELIVERY_TOOL_RULES}\n\n"
-        "使用场景：\n"
-        "- 需要针对特定历史消息进行回应时\n"
-        "- 需要让对方明确知道你在回复哪条消息时\n\n"
-        "限制：本工具不是普通发送工具；没有可引用消息时不要把它当作"
-        "普通消息发送入口。若省略 `reply_to`，只会在 Infoflow webhook "
-        "触发的当前会话中自动引用本轮用户消息。\n\n"
-        "Cron/定时任务：不要为了定时发送普通消息而调用本工具；把要发送的"
-        "内容写在最终响应中，由 cron scheduler 自动投递。只有当任务已经"
-        "明确拿到 `reply_to` message_id 且必须发送引用卡片时才可调用；"
-        "这种情况下工具成功后最终响应应为 `[SILENT]`，避免 cron 再投递"
-        "一条重复消息。"
+        "向如流私聊或群聊发送消息。`target` 必填；可发送普通文本、图片，"
+        "也可在同一次发送中引用 reply 消息，并在群聊中 @ 人或机器人。\n\n"
+        "目标格式：群聊传 `group:<群组ID>` 或纯数字群 ID；私聊传 "
+        "`user:<uuapName>` 或 `<uuapName>`。可带 `infoflow:` 前缀。"
+        "`bot:<agentId>` 不能作为私聊 target；如流服务不支持时会返回 "
+        "`unsupported_target`，不要降级成 `touser=<agentId>`。\n\n"
+        "图片格式：可把 `MEDIA:<本地图片绝对路径>` 写在 `message` 中以决定"
+        "图片相对文本的发送顺序；也可用 `image_paths` 传图片路径列表，"
+        "`image_paths` 会追加到 `message` 中所有文本/inline MEDIA 之后。"
+        "重复图片路径会去重，不会把本地路径作为正文发出。\n\n"
+        "引用格式：`reply_to` 可传单个 message_id、"
+        "`{message_id, preview, msgid2}`，或这些值的数组。只传 "
+        "`message_id` 时工具会优先从本地消息库补齐 preview/msgid2。"
+        "群聊一次最多引用一条；私聊可引用多条。`message` 可省略，"
+        "只发送引用卡片或只 @ 群成员也是允许的。\n\n"
+        "@ 仅群聊有效：`at_all=true` @全员；`mention_user_ids` 传人类 "
+        "uuapName；`mention_agent_ids` 传机器人 agentId，支持 `bot:<agentId>` "
+        "写法。私聊传 @ 字段会报错。"
     ),
     "parameters": {
         "type": "object",
@@ -259,32 +245,84 @@ REPLY_TOOL_SCHEMA = {
             "target": {
                 "type": "string",
                 "description": (
-                    "目标会话（可选）。私信传 `infoflow:<uuapName>`，"
-                    "群聊传 `infoflow:group:<群组ID>`。省略则发送到当前会话"
+                    "必填。发送目标。群聊：`group:4507088` 或 `4507088`；"
+                    "私聊：`user:chengbo05` 或 `chengbo05`；均可加 "
+                    "`infoflow:` 前缀。"
                 ),
             },
             "message": {
                 "type": "string",
                 "description": (
-                    "回复的消息正文内容，支持 Markdown。需要发送本地图片时追加 "
-                    "`MEDIA:<本地图片绝对路径>`；工具会按图片字节发送，不会发送路径文本。"
+                    "可选。消息正文。可包含 `MEDIA:<本地图片绝对路径>` inline "
+                    "图片占位；省略时仍可只发送 reply 或群聊 @。"
                 ),
+            },
+            "image_paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "可选。本地图片绝对路径列表；按列表顺序追加到 message "
+                    "中的文本/inline MEDIA 之后发送。"
+                ),
+                "default": [],
             },
             "reply_to": {
-                "type": "string",
-                "description": "要引用的消息 ID（可选）。省略时自动引用触发本轮的用户消息",
-            },
-            "reply_type": {
-                "type": "string",
-                "enum": ["1", "2"],
+                "anyOf": [
+                    {"type": "string"},
+                    {
+                        "type": "object",
+                        "properties": {
+                            "message_id": {"type": "string"},
+                            "preview": {"type": "string"},
+                            "msgid2": {"type": "string"},
+                        },
+                        "required": ["message_id"],
+                    },
+                    {
+                        "type": "array",
+                        "items": {
+                            "anyOf": [
+                                {"type": "string"},
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "message_id": {"type": "string"},
+                                        "preview": {"type": "string"},
+                                        "msgid2": {"type": "string"},
+                                    },
+                                    "required": ["message_id"],
+                                },
+                            ],
+                        },
+                    },
+                ],
                 "description": (
-                    "`1` = 回复并通知（默认，对方收到通知，显示引用原文预览）；"
-                    "`2` = 仅引用（显示引用原文预览，但对方不收到通知）"
+                    "可选。要引用的消息。支持 message_id 字符串、"
+                    "`{message_id, preview, msgid2}` 对象，或上述值数组。"
+                )
+            },
+            "at_all": {
+                "type": "boolean",
+                "description": "可选，仅群聊有效。是否 @all。",
+                "default": False,
+            },
+            "mention_user_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "可选，仅群聊有效。要 @ 的人类用户 uuapName。",
+                "default": [],
+            },
+            "mention_agent_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "可选，仅群聊有效。要 @ 的机器人 agentId；也可写 "
+                    "`bot:<agentId>`。"
                 ),
-                "default": "1",
+                "default": [],
             },
         },
-        "required": ["message"],
+        "required": ["target"],
     },
 }
 
@@ -751,46 +789,8 @@ _MEDIA_DIRECTIVE_RE = re.compile(
 )
 
 
-def _strip_media_directives(text: str) -> str:
-    cleaned = _MEDIA_DIRECTIVE_RE.sub("", text)
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    return cleaned.strip()
-
-
-def _extract_reply_media(message: str) -> tuple[list[tuple[str, bool]], str, bool]:
-    """Extract media paths from an infoflow_reply body.
-
-    Returns ``(media_files, cleaned_text, malformed_media_directive)``. Any
-    ``MEDIA:`` text must be consumed or rejected so local paths cannot leak as
-    markdown if Hermes' full extractor is unavailable or cannot parse it.
-    """
-    if "MEDIA:" not in message:
-        return [], message, False
-
-    try:
-        from gateway.platforms.base import BasePlatformAdapter  # type: ignore[import-not-found]
-
-        media_files, cleaned = BasePlatformAdapter.extract_media(message)
-    except Exception:
-        media_files = []
-        has_voice_tag = "[[audio_as_voice]]" in message
-        cleaned = message.replace("[[audio_as_voice]]", "").replace("[[as_document]]", "")
-        for match in _MEDIA_DIRECTIVE_RE.finditer(message):
-            path = match.group("path").strip()
-            if len(path) >= 2 and path[0] == path[-1] and path[0] in "`\"'":
-                path = path[1:-1].strip()
-            path = path.lstrip("`\"'").rstrip("`\"',.;:)}]")
-            if path:
-                media_files.append((os.path.expanduser(path), has_voice_tag))
-        cleaned = _strip_media_directives(cleaned) if media_files else cleaned
-
-    cleaned = _strip_media_directives(cleaned) if "MEDIA:" in cleaned else cleaned.strip()
-    malformed = "MEDIA:" in message and not media_files
-    return media_files, cleaned, malformed
-
-
 def _sanitize_media_error(error: Any, media_files: list[tuple[str, bool]]) -> str:
-    text = str(error or "image reply failed")
+    text = str(error or "image send failed")
     for raw_path, _is_voice in media_files:
         raw = str(raw_path or "")
         if raw:
@@ -799,87 +799,6 @@ def _sanitize_media_error(error: Any, media_files: list[tuple[str, bool]]) -> st
     if "MEDIA:" in text:
         text = _MEDIA_DIRECTIVE_RE.sub("MEDIA:[local image path]", text)
     return text
-
-
-async def _preflight_reply_media(adapter: Any, media_files: list[tuple[str, bool]]) -> str | None:
-    load_image_bytes = getattr(adapter, "_load_image_bytes", None)
-    if not callable(load_image_bytes):
-        return None
-
-    from .media import prepare_infoflow_image_bytes  # noqa: E402
-    from .utils import _ImageLoadError  # noqa: E402
-
-    for media_path, is_voice in media_files:
-        if is_voice:
-            return "infoflow_reply only supports image MEDIA attachments"
-        try:
-            raw = await load_image_bytes(str(media_path))
-            prepare_infoflow_image_bytes(raw)
-        except _ImageLoadError as exc:
-            return _sanitize_media_error(exc, media_files)
-        except Exception as exc:
-            return _sanitize_media_error(exc, media_files)
-    return None
-
-
-async def _send_reply_media(
-    *,
-    adapter: Any,
-    target: str,
-    message: str,
-    reply_to: str,
-    reply_type: str,
-    cron_target: dict[str, str | None] | None = None,
-) -> str | None:
-    media_files, cleaned_message, malformed_media = _extract_reply_media(message)
-    if malformed_media:
-        return tool_result_json({
-            "error": (
-                "MEDIA directive must point to a supported local image path; "
-                "not sending local path text"
-            )
-        })
-    if not media_files:
-        return None
-
-    preflight_error = await _preflight_reply_media(adapter, media_files)
-    if preflight_error:
-        return tool_result_json({"error": preflight_error})
-
-    sent_ids: list[str] = []
-    last_message_id: str | None = None
-    for index, (media_path, _is_voice) in enumerate(media_files):
-        caption = cleaned_message if index == 0 and cleaned_message else None
-        result = await _with_temp_session(adapter, adapter.send_image_file(
-            chat_id=target,
-            image_path=str(media_path),
-            caption=caption,
-            reply_to=reply_to,
-            metadata={"reply_type": reply_type},
-        ))
-        if not result.success:
-            return tool_result_json({
-                "error": _sanitize_media_error(
-                    result.error or "image reply failed",
-                    media_files,
-                )
-            })
-        for mid in tuple(getattr(result, "continuation_message_ids", ()) or ()):
-            if mid:
-                sent_ids.append(str(mid))
-        if result.message_id:
-            last_message_id = str(result.message_id)
-            sent_ids.append(last_message_id)
-
-    payload: dict[str, Any] = {
-        "success": True,
-        "message_id": last_message_id,
-        "media_count": len(media_files),
-    }
-    payload.update(_reply_success_hint_for_context(cron_target))
-    if sent_ids:
-        payload["message_ids"] = sent_ids
-    return tool_result_json(payload)
 
 
 def _clamp_int(value: Any, default: int, minimum: int, maximum: int) -> int:
@@ -972,6 +891,41 @@ def _target_from_record(record: Any) -> tuple[str, str, str, str]:
     return "dm", "", user_id, f"dm:user:{user_id}"
 
 
+def _chat_id_from_target_tuple(target: tuple[str, str, str, str]) -> str:
+    kind, group_id, user_id, _key = target
+    if kind == "group" and group_id:
+        return f"group:{group_id}"
+    if kind == "dm" and user_id:
+        return user_id
+    return ""
+
+
+def _current_infoflow_chat_id(adapter: Any) -> str:
+    try:
+        from .bot import get_recall_inbound_message_id_hint  # noqa: E402
+    except Exception:
+        return ""
+
+    current_message_id = get_recall_inbound_message_id_hint() or ""
+    if not current_message_id:
+        return ""
+
+    store = getattr(adapter, "_message_store", None)
+    finder = getattr(store, "find_any", None)
+    if callable(finder):
+        record = finder(current_message_id)
+        if record is not None:
+            chat_id = _chat_id_from_target_tuple(_target_from_record(record))
+            if chat_id:
+                return chat_id
+
+    try:
+        from .recall import get_inbound_target  # noqa: E402
+    except Exception:
+        return ""
+    return get_inbound_target(current_message_id)
+
+
 def _same_target(a: tuple[str, str, str, str], b: tuple[str, str, str, str]) -> bool:
     return a[0] == b[0] and a[3] == b[3]
 
@@ -1014,111 +968,875 @@ def _records_to_history_payload(adapter: Any, records: list[Any]) -> list[dict[s
     return payload
 
 
+_SEND_AT_RE = re.compile(r"@([^\s@\n]{1,30})(?=[\s]|$)")
+_SEND_PREVIEW_LIMIT = 160
+
+
+def _send_failure_payload(
+    *,
+    reason: str,
+    error: str,
+    target: str = "",
+    chat_type: str = "",
+    sent_messages: list[dict[str, str]] | None = None,
+) -> str:
+    payload: dict[str, Any] = {
+        "success": False,
+        "reason": reason,
+        "error": error,
+    }
+    if target:
+        payload["target"] = target
+    if chat_type:
+        payload["chat_type"] = chat_type
+    if sent_messages:
+        payload["sent_messages"] = sent_messages
+        payload["retry_note"] = (
+            "partial_failure: messages listed in sent_messages were already sent; "
+            "do not resend them automatically."
+        )
+    return tool_result_json(payload)
+
+
+def _coerce_string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, (list, tuple, set)):
+        return [str(item) for item in value if str(item or "").strip()]
+    return [str(value)] if str(value or "").strip() else []
+
+
+def _dedupe_keep_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        item = str(value or "").strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def _parse_send_target(target: Any) -> tuple[dict[str, str] | None, str | None]:
+    raw = str(target or "").strip()
+    if not raw:
+        return None, "target is required"
+    if raw.startswith("infoflow:"):
+        raw = raw[len("infoflow:"):].strip()
+    if raw.startswith("bot:"):
+        return None, (
+            "unsupported_target: bot:<agentId> is recognized but Infoflow "
+            "does not support bot private-chat target sending"
+        )
+    if raw.startswith("group:"):
+        group_id = raw[len("group:"):].strip()
+        if not group_id or not group_id.isdigit():
+            return None, "target group id must be numeric"
+        return {
+            "chat_type": "group",
+            "group_id": group_id,
+            "dm_user": "",
+            "target": f"group:{group_id}",
+            "store_key": f"group:{group_id}",
+        }, None
+    if raw.startswith("dm:user:"):
+        raw = raw[len("dm:user:"):].strip()
+    elif raw.startswith("user:"):
+        raw = raw[len("user:"):].strip()
+    if not raw:
+        return None, "target user id is empty"
+    if raw.isdigit():
+        return {
+            "chat_type": "group",
+            "group_id": raw,
+            "dm_user": "",
+            "target": f"group:{raw}",
+            "store_key": f"group:{raw}",
+        }, None
+    return {
+        "chat_type": "private",
+        "group_id": "",
+        "dm_user": raw,
+        "target": f"user:{raw}",
+        "store_key": raw,
+    }, None
+
+
+def _normalize_user_mentions(value: Any) -> tuple[list[str], str | None]:
+    users: list[str] = []
+    for raw in _coerce_string_list(value):
+        item = raw.strip()
+        if item.startswith("infoflow:"):
+            item = item[len("infoflow:"):].strip()
+        if item.startswith("bot:"):
+            return [], "mention_user_ids only accepts human uuapName values"
+        if item.startswith("user:"):
+            item = item[len("user:"):].strip()
+        if item:
+            users.append(item)
+    return _dedupe_keep_order(users), None
+
+
+def _normalize_agent_mentions(
+    value: Any,
+    *,
+    self_agent_id: str = "",
+) -> tuple[list[int], str | None]:
+    agents: list[int] = []
+    for raw in _coerce_string_list(value):
+        item = raw.strip()
+        if item.startswith("infoflow:"):
+            item = item[len("infoflow:"):].strip()
+        if item.startswith("bot:"):
+            item = item[len("bot:"):].strip()
+        if item.startswith("user:"):
+            return [], "mention_agent_ids only accepts robot agentId values"
+        if not item:
+            continue
+        if not item.isdigit():
+            return [], f"mention_agent_ids must be numeric agentIds: {item}"
+        if self_agent_id and item == self_agent_id:
+            continue
+        agents.append(int(item))
+    seen: set[int] = set()
+    out: list[int] = []
+    for agent in agents:
+        if agent in seen:
+            continue
+        seen.add(agent)
+        out.append(agent)
+    return out, None
+
+
+def _normalize_reply_to(reply_to: Any) -> tuple[list[dict[str, str]], str | None]:
+    if reply_to in (None, "", []):
+        return [], None
+    raw_items = reply_to if isinstance(reply_to, list) else [reply_to]
+    targets: list[dict[str, str]] = []
+    for item in raw_items:
+        if isinstance(item, str):
+            message_id = item.strip()
+            preview = ""
+            msgid2 = ""
+        elif isinstance(item, dict):
+            message_id = str(
+                item.get("message_id")
+                or item.get("messageid")
+                or item.get("msgid")
+                or ""
+            ).strip()
+            preview = str(item.get("preview") or item.get("content") or "")
+            msgid2 = str(item.get("msgid2") or item.get("msg_id2") or "")
+        else:
+            return [], "reply_to must be a message_id string, object, or array"
+        if not message_id:
+            return [], "reply_to.message_id is required"
+        targets.append({
+            "message_id": message_id,
+            "preview": preview,
+            "msgid2": msgid2,
+        })
+    return targets, None
+
+
+def _safe_preview(text: Any, *, limit: int = _SEND_PREVIEW_LIMIT) -> str:
+    preview = str(text or "")
+    preview = re.sub(r"data:image/[^,\s]+,[A-Za-z0-9+/=]+", "[image]", preview)
+    preview = preview.replace("\x00", "")
+    preview = re.sub(r"\s+", " ", preview).strip()
+    if len(preview) > limit:
+        return preview[: max(0, limit - 1)].rstrip() + "…"
+    return preview
+
+
+def _resolve_reply_targets(
+    adapter: Any,
+    targets: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    if not targets:
+        return []
+    store = getattr(adapter, "_message_store", None)
+    find_any = getattr(store, "find_any", None)
+    resolved: list[dict[str, str]] = []
+    for target in targets:
+        item = dict(target)
+        mid = item["message_id"]
+        record = find_any(mid) if callable(find_any) else None
+        if record is not None:
+            if not item.get("preview"):
+                item["preview"] = str(getattr(record, "content", "") or "")
+            if not item.get("msgid2"):
+                item["msgid2"] = str(
+                    getattr(record, "msg_id2", "")
+                    or getattr(record, "msgid2", "")
+                    or ""
+                )
+        if not item.get("preview"):
+            with contextlib.suppress(Exception):
+                from .recall import get_inbound_body
+
+                item["preview"] = get_inbound_body(mid) or ""
+        item["preview"] = _safe_preview(item.get("preview"), limit=200)
+        resolved.append(item)
+    return resolved
+
+
+def _quote_stripped_path(raw: str) -> str:
+    path = str(raw or "").strip()
+    if len(path) >= 2 and path[0] == path[-1] and path[0] in "`\"'":
+        path = path[1:-1].strip()
+    return os.path.expanduser(path.lstrip("`\"'").rstrip("`\"',.;:)}]"))
+
+
+def _parse_send_segments(
+    message: Any,
+    image_paths: Any,
+) -> tuple[list[dict[str, str]], bool]:
+    text = str(message or "")
+    segments: list[dict[str, str]] = []
+    malformed = False
+    pos = 0
+    for match in _MEDIA_DIRECTIVE_RE.finditer(text):
+        before = text[pos:match.start()]
+        if before:
+            segments.append({"kind": "text", "text": before})
+        path = _quote_stripped_path(match.group("path"))
+        if path:
+            segments.append({"kind": "image", "path": path})
+        else:
+            malformed = True
+        pos = match.end()
+    tail = text[pos:]
+    if tail:
+        segments.append({"kind": "text", "text": tail})
+    if "MEDIA:" in text and not any(seg["kind"] == "image" for seg in segments):
+        malformed = True
+
+    for raw_path in _coerce_string_list(image_paths):
+        path = _quote_stripped_path(raw_path)
+        if path:
+            segments.append({"kind": "image", "path": path})
+
+    seen_paths: set[str] = set()
+    deduped: list[dict[str, str]] = []
+    for seg in segments:
+        if seg["kind"] != "image":
+            if seg.get("text"):
+                deduped.append(seg)
+            continue
+        path = seg["path"]
+        key = os.path.abspath(os.path.expanduser(path))
+        if key in seen_paths:
+            continue
+        seen_paths.add(key)
+        deduped.append({"kind": "image", "path": path})
+    return deduped, malformed
+
+
+async def _load_image_for_send(
+    adapter: Any,
+    image_path: str,
+    *,
+    all_paths: list[str],
+) -> tuple[bytes | None, str | None]:
+    load_image_bytes = getattr(adapter, "_load_image_bytes", None)
+    if not callable(load_image_bytes):
+        return None, "Infoflow adapter cannot load local image files"
+    try:
+        return await load_image_bytes(str(image_path)), None
+    except _ImageLoadError as exc:
+        return None, _sanitize_media_error(exc, [(p, False) for p in all_paths])
+    except Exception as exc:
+        return None, _sanitize_media_error(exc, [(p, False) for p in all_paths])
+
+
+async def _group_member_maps(
+    adapter: Any,
+    group_id: str,
+    session: Any,
+) -> dict[str, Any]:
+    serverapi = getattr(adapter, "_serverapi", None)
+    getter = getattr(serverapi, "get_group_members", None)
+    if not callable(getter):
+        return {}
+    try:
+        members = await getter(str(group_id), session=session)
+    except Exception:
+        return {}
+    human_uids = {str(m.uid) for m in members if not getattr(m, "is_bot", False)}
+    bot_aids = {
+        int(getattr(m, "agent_id", 0) or 0)
+        for m in members
+        if getattr(m, "is_bot", False) and int(getattr(m, "agent_id", 0) or 0)
+    }
+    bot_names = {
+        str(getattr(m, "name", "") or "").lower(): int(getattr(m, "agent_id", 0) or 0)
+        for m in members
+        if getattr(m, "is_bot", False)
+        and str(getattr(m, "name", "") or "")
+        and int(getattr(m, "agent_id", 0) or 0)
+    }
+    return {
+        "human_uids": human_uids,
+        "bot_aids": bot_aids,
+        "bot_names": bot_names,
+    }
+
+
+def _at_item(
+    *,
+    at_all: bool = False,
+    user_id: str = "",
+    agent_id: int | None = None,
+) -> dict[str, Any]:
+    item: dict[str, Any] = {"type": "AT"}
+    if at_all:
+        item["atall"] = True
+    if user_id:
+        item["atuserids"] = [user_id]
+    if agent_id is not None:
+        item["atagentids"] = [int(agent_id)]
+    return item
+
+
+def _explicit_at_item(
+    *,
+    at_all: bool,
+    mention_user_ids: list[str],
+    mention_agent_ids: list[int],
+) -> dict[str, Any] | None:
+    item: dict[str, Any] = {"type": "AT"}
+    if at_all:
+        item["atall"] = True
+    if mention_user_ids:
+        item["atuserids"] = mention_user_ids
+    if mention_agent_ids:
+        item["atagentids"] = mention_agent_ids
+    return item if len(item) > 1 else None
+
+
+def _group_text_body_items(
+    text: str,
+    maps: dict[str, Any],
+    *,
+    self_agent_id: str = "",
+) -> list[dict[str, Any]]:
+    if not text:
+        return []
+    if not maps:
+        return [{"type": "TEXT", "content": text}]
+    human_uids: set[str] = maps.get("human_uids") or set()
+    bot_aids: set[int] = maps.get("bot_aids") or set()
+    bot_names: dict[str, int] = maps.get("bot_names") or {}
+    self_aid = int(self_agent_id) if str(self_agent_id or "").isdigit() else None
+    out: list[dict[str, Any]] = []
+    pos = 0
+    for match in _SEND_AT_RE.finditer(text):
+        if match.start() > 0 and text[match.start() - 1] not in " \t\r\n":
+            continue
+        token = match.group(1)
+        token_lower = token.lower()
+        item: dict[str, Any] | None = None
+        if token_lower in ("all", "所有人"):
+            item = _at_item(at_all=True)
+        elif token.isdigit():
+            aid = int(token)
+            if self_aid is not None and aid == self_aid:
+                continue
+            if aid in bot_aids:
+                item = _at_item(agent_id=aid)
+        elif token in human_uids:
+            item = _at_item(user_id=token)
+        elif token_lower in bot_names:
+            aid = bot_names[token_lower]
+            if self_aid is not None and aid == self_aid:
+                continue
+            item = _at_item(agent_id=aid)
+
+        if item is None:
+            continue
+        if match.start() > pos:
+            out.append({"type": "TEXT", "content": text[pos:match.start()]})
+        out.append(item)
+        pos = match.end()
+    if pos < len(text):
+        out.append({"type": "TEXT", "content": text[pos:]})
+    return out or [{"type": "TEXT", "content": text}]
+
+
+def _body_preview(body: list[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    for item in body:
+        item_type = str(item.get("type") or "").upper()
+        if item_type == "TEXT":
+            if item.get("content"):
+                parts.append(str(item.get("content") or ""))
+        elif item_type == "IMAGE":
+            parts.append("[image]")
+        elif item_type == "AT":
+            if item.get("atall"):
+                parts.append("@all")
+            for uid in item.get("atuserids") or []:
+                parts.append(f"@{uid}")
+            for aid in item.get("atagentids") or []:
+                parts.append(f"@{aid}")
+    return _safe_preview(" ".join(parts))
+
+
+def _receipt_kind(body: list[dict[str, Any]]) -> str:
+    has_at = any(str(item.get("type") or "").upper() == "AT" for item in body)
+    has_image = any(str(item.get("type") or "").upper() == "IMAGE" for item in body)
+    has_text = any(
+        str(item.get("type") or "").upper() == "TEXT"
+        and bool(str(item.get("content") or ""))
+        for item in body
+    )
+    display_count = sum([has_at, has_image, has_text])
+    if display_count > 1:
+        return "mixed"
+    if has_image:
+        return "image"
+    return "text"
+
+
+async def _group_packets_for_send(
+    adapter: Any,
+    *,
+    group_id: str,
+    segments: list[dict[str, str]],
+    at_all: bool,
+    mention_user_ids: list[str],
+    mention_agent_ids: list[int],
+    session: Any,
+) -> tuple[list[dict[str, Any]], str | None]:
+    maps = await _group_member_maps(adapter, group_id, session)
+    self_agent_id = str(getattr(adapter, "_settings", {}).get("app_agent_id") or "")
+    all_paths = [seg["path"] for seg in segments if seg["kind"] == "image"]
+    explicit_at = _explicit_at_item(
+        at_all=at_all,
+        mention_user_ids=mention_user_ids,
+        mention_agent_ids=mention_agent_ids,
+    )
+    packets: list[dict[str, Any]] = []
+    current: list[dict[str, Any]] = []
+    explicit_added = False
+    current_has_image = False
+
+    def ensure_explicit_at() -> None:
+        nonlocal explicit_added
+        if explicit_at is not None and not explicit_added:
+            current.append(dict(explicit_at))
+            explicit_added = True
+
+    def flush_current() -> None:
+        nonlocal current, current_has_image
+        if not current:
+            return
+        packets.append({
+            "body": current,
+            "msgtype": "IMAGE" if current_has_image else "TEXT",
+            "kind": _receipt_kind(current),
+            "preview": _body_preview(current) or ("[image]" if current_has_image else ""),
+        })
+        current = []
+        current_has_image = False
+
+    for seg in segments:
+        ensure_explicit_at()
+        if seg["kind"] == "text":
+            current.extend(
+                _group_text_body_items(
+                    seg.get("text") or "",
+                    maps,
+                    self_agent_id=self_agent_id,
+                )
+            )
+            continue
+        if seg["kind"] == "image":
+            raw, err = await _load_image_for_send(
+                adapter,
+                seg["path"],
+                all_paths=all_paths,
+            )
+            if err:
+                return [], err
+            try:
+                prepared = prepare_infoflow_image_bytes(raw or b"")
+            except _ImageLoadError as exc:
+                return [], _sanitize_media_error(exc, [(p, False) for p in all_paths])
+            if current_has_image:
+                flush_current()
+            current.append({
+                "type": "IMAGE",
+                "content": base64.b64encode(prepared.data).decode("ascii"),
+            })
+            current_has_image = True
+
+    ensure_explicit_at()
+    flush_current()
+    return packets, None
+
+
+async def _private_packets_for_send(
+    adapter: Any,
+    segments: list[dict[str, str]],
+) -> tuple[list[dict[str, Any]], str | None]:
+    packets: list[dict[str, Any]] = []
+    all_paths = [seg["path"] for seg in segments if seg["kind"] == "image"]
+    for seg in segments:
+        if seg["kind"] == "text":
+            text = seg.get("text") or ""
+            if text:
+                packets.append({
+                    "kind": "text",
+                    "text": text,
+                    "preview": _safe_preview(text),
+                })
+            continue
+        raw, err = await _load_image_for_send(adapter, seg["path"], all_paths=all_paths)
+        if err:
+            return [], err
+        packets.append({
+            "kind": "image",
+            "image_bytes": raw or b"",
+            "preview": "[image]",
+        })
+    return packets, None
+
+
+def _sent_result_ids(result: Any) -> list[tuple[str, str]]:
+    ids: list[tuple[str, str]] = []
+    continuation_ids = list(getattr(result, "continuation_message_ids", ()) or ())
+    continuation_seqs = list(getattr(result, "continuation_msgseqids", ()) or ())
+    for idx, mid in enumerate(continuation_ids):
+        mid_s = str(mid or "")
+        if not mid_s:
+            continue
+        seq = continuation_seqs[idx] if idx < len(continuation_seqs) else ""
+        ids.append((mid_s, str(seq or "")))
+    primary = str(getattr(result, "message_id", "") or "")
+    if primary and all(mid != primary for mid, _seq in ids):
+        ids.append((primary, str(getattr(result, "msgseqid", "") or "")))
+    return ids
+
+
+def _record_tool_sent(
+    adapter: Any,
+    *,
+    target: dict[str, str],
+    result: Any,
+    kind: str,
+    preview: str,
+) -> list[dict[str, str]]:
+    receipts: list[dict[str, str]] = []
+    group_id = target["group_id"] or None
+    dm_user = target["dm_user"] or None
+    store_key = target["store_key"]
+    sent_store = getattr(adapter, "_sent_store", None)
+    bot = getattr(adapter, "_bot", None)
+    record_sent = getattr(bot, "_record_sent", None)
+    for mid, seq in _sent_result_ids(result):
+        if sent_store is not None:
+            with contextlib.suppress(Exception):
+                sent_store.record(
+                    chat_id=store_key,
+                    messageid=mid,
+                    msgseqid=seq,
+                    digest=preview[:80],
+                )
+        if callable(record_sent):
+            with contextlib.suppress(Exception):
+                record_sent(
+                    message_id=mid,
+                    text=preview or ("[image]" if kind == "image" else ""),
+                    group_id=group_id,
+                    dm_user_id=dm_user,
+                )
+        receipts.append({
+            "message_id": mid,
+            "kind": kind,
+            "preview": _safe_preview(preview),
+        })
+    return receipts
+
+
+def _push_send_tool_event(
+    adapter: Any,
+    *,
+    target: dict[str, str],
+    success: bool,
+    sent_messages: list[dict[str, str]],
+    error: str = "",
+) -> None:
+    push = getattr(adapter, "_push_infoflow_event", None)
+    if not callable(push):
+        return
+    with contextlib.suppress(Exception):
+        push(
+            None,
+            kind="outbound.infoflow",
+            chat_id=target["target"],
+            extra={
+                "type": "send_message_tool",
+                "success": success,
+                "sent_count": len(sent_messages),
+                "message_id": sent_messages[-1]["message_id"] if sent_messages else "",
+                "error": error,
+            },
+        )
+
+
 # ---------------------------------------------------------------------------
 # Tool handler factories
 # ---------------------------------------------------------------------------
 
 
-def make_reply_handler():
-    """Build the ``infoflow_reply`` tool handler.
-
-    Mirrors the pattern of ``make_recall_handler``: resolves the live adapter
-    via the platform registry, handles cross-event-loop aiohttp sessions,
-    and returns a JSON string result.
-    """
+def make_send_message_handler():
+    """Build the ``infoflow_send_message`` tool handler."""
 
     async def _handler(args: dict, **_kwargs) -> str:
-        message = args.get("message", "")
-        target = args.get("target")  # may be None → home channel
-        reply_to = args.get("reply_to") or None
-        reply_type = args.get("reply_type", "1")
-        cron_target = _cron_auto_delivery_target()
-
-        if not message:
-            return tool_result_json({"error": "message is required"})
-
-        # If no explicit reply_to, fall back to current inbound message_id hint.
-        if not reply_to:
-            from .bot import _recall_hint as _recall_inbound_message_hint  # noqa: E402
-
-            reply_to = _recall_inbound_message_hint.get(None) or ""
-
-        if not reply_to:
-            if cron_target:
-                return tool_result_json({
-                    "success": True,
-                    "skipped": True,
-                    "delivered": False,
-                    "reason": "cron_auto_delivery_no_reply_anchor",
-                    "cron_auto_delivery": True,
-                    "cron_auto_delivery_target": cron_target,
-                    "should_retry": False,
-                    "final_response_instruction": (
-                        "Nothing was sent by infoflow_reply because this cron "
-                        "run has no Infoflow message_id to quote. Put the exact "
-                        "outbound content in the final response; the cron "
-                        "scheduler will auto-deliver it. Do not call "
-                        "infoflow_reply again unless you have an explicit "
-                        "reply_to message_id."
-                    ),
-                })
-            return tool_result_json({"error": (
-                "No message to reply to. Provide `reply_to`, or this tool "
-                "only works when invoked during a webhook-triggered turn "
-                "(where the inbound message_id is available automatically)."
-            )})
+        target, target_error = _parse_send_target(args.get("target"))
+        if target_error or target is None:
+            return _send_failure_payload(
+                reason="invalid_target",
+                error=target_error or "invalid target",
+            )
 
         adapter = _get_live_adapter()
         if adapter is None:
-            return tool_result_json({"error": (
-                "Infoflow adapter not running — cannot reply."
-            )})
+            return _send_failure_payload(
+                reason="adapter_unavailable",
+                error="Infoflow adapter not running — cannot send.",
+                target=target["target"],
+                chat_type=target["chat_type"],
+            )
 
-        # Use home channel if target not specified.
-        if not target:
-            try:
-                from gateway.run import _gateway_runner_ref  # type: ignore[import-not-found]
-                from gateway.config import Platform  # type: ignore[import-not-found]
-                runner = _gateway_runner_ref()
-                if runner and hasattr(runner, "config"):
-                    home = runner.config.get_home_channel(Platform("infoflow"))
-                    if home:
-                        target = f"infoflow:{home.chat_id}"
-            except Exception:
-                pass
-        if not target:
-            return tool_result_json({"error": "target is required (or set INFOFLOW_OP_CHANNEL)"})
-
-        # Strip ``infoflow:`` prefix if present (adapter expects raw chat_id).
-        if target.startswith("infoflow:"):
-            target = target[len("infoflow:"):]
-
-        media_result = await _send_reply_media(
-            adapter=adapter,
-            target=target,
-            message=message,
-            reply_to=reply_to,
-            reply_type=reply_type,
-            cron_target=cron_target,
+        self_agent_id = str(getattr(adapter, "_settings", {}).get("app_agent_id") or "")
+        mention_user_ids, err = _normalize_user_mentions(args.get("mention_user_ids"))
+        if err:
+            return _send_failure_payload(
+                reason="invalid_mentions",
+                error=err,
+                target=target["target"],
+                chat_type=target["chat_type"],
+            )
+        mention_agent_ids, err = _normalize_agent_mentions(
+            args.get("mention_agent_ids"),
+            self_agent_id=self_agent_id,
         )
-        if media_result is not None:
-            return media_result
+        if err:
+            return _send_failure_payload(
+                reason="invalid_mentions",
+                error=err,
+                target=target["target"],
+                chat_type=target["chat_type"],
+            )
+        at_all = coerce_bool(args.get("at_all"))
+        if target["chat_type"] == "private" and (
+            at_all or mention_user_ids or mention_agent_ids
+        ):
+            return _send_failure_payload(
+                reason="invalid_mentions",
+                error="@ mention fields are only supported for group targets",
+                target=target["target"],
+                chat_type=target["chat_type"],
+            )
 
-        result = await _with_temp_session(adapter, adapter.send(
-            chat_id=target,
-            content=message,
-            reply_to=reply_to,
-            metadata={"reply_type": reply_type},
-        ))
+        reply_targets, err = _normalize_reply_to(args.get("reply_to"))
+        if err:
+            return _send_failure_payload(
+                reason="invalid_reply_to",
+                error=err,
+                target=target["target"],
+                chat_type=target["chat_type"],
+            )
+        reply_targets = _resolve_reply_targets(adapter, reply_targets)
+        if target["chat_type"] == "group" and len(reply_targets) > 1:
+            return _send_failure_payload(
+                reason="invalid_reply_to",
+                error="group reply_to supports only one quoted message",
+                target=target["target"],
+                chat_type=target["chat_type"],
+            )
 
-        if not result.success:
-            return tool_result_json({"error": result.error or "reply failed"})
-        payload = {
+        segments, malformed_media = _parse_send_segments(
+            args.get("message"),
+            args.get("image_paths"),
+        )
+        if malformed_media:
+            return _send_failure_payload(
+                reason="invalid_media",
+                error=(
+                    "MEDIA directive must point to a supported local image path; "
+                    "not sending local path text"
+                ),
+                target=target["target"],
+                chat_type=target["chat_type"],
+            )
+
+        has_mentions = at_all or mention_user_ids or mention_agent_ids
+        if not segments and not reply_targets and not has_mentions:
+            return _send_failure_payload(
+                reason="empty_message",
+                error="message, image_paths, reply_to, or group @ mention is required",
+                target=target["target"],
+                chat_type=target["chat_type"],
+            )
+
+        serverapi = getattr(adapter, "_serverapi", None)
+        if serverapi is None:
+            return _send_failure_payload(
+                reason="adapter_unavailable",
+                error="Infoflow server API is unavailable",
+                target=target["target"],
+                chat_type=target["chat_type"],
+            )
+
+        sent_messages: list[dict[str, str]] = []
+        session = getattr(adapter, "_effective_session", lambda s: None)(
+            getattr(adapter, "_http_session", None)
+        )
+
+        if target["chat_type"] == "group":
+            packets, err = await _group_packets_for_send(
+                adapter,
+                group_id=target["group_id"],
+                segments=segments,
+                at_all=at_all,
+                mention_user_ids=mention_user_ids,
+                mention_agent_ids=mention_agent_ids,
+                session=session,
+            )
+            if err:
+                return _send_failure_payload(
+                    reason="invalid_media",
+                    error=err,
+                    target=target["target"],
+                    chat_type=target["chat_type"],
+                )
+            if not packets and reply_targets:
+                packets = [{
+                    "body": [{"type": "TEXT", "content": ""}],
+                    "msgtype": "TEXT",
+                    "kind": "text",
+                    "preview": "",
+                }]
+            for idx, packet in enumerate(packets):
+                result = await serverapi.send_group_structured(
+                    target["group_id"],
+                    body=packet["body"],
+                    msgtype=packet["msgtype"],
+                    reply_target=reply_targets[0] if idx == 0 and reply_targets else None,
+                    session=session,
+                )
+                if not result.success:
+                    sent_messages.extend(
+                        _record_tool_sent(
+                            adapter,
+                            target=target,
+                            result=result,
+                            kind=packet["kind"],
+                            preview=packet["preview"],
+                        )
+                    )
+                    _push_send_tool_event(
+                        adapter,
+                        target=target,
+                        success=False,
+                        sent_messages=sent_messages,
+                        error=result.error or "send failed",
+                    )
+                    return _send_failure_payload(
+                        reason="partial_failure" if sent_messages else "send_failed",
+                        error=result.error or "send failed",
+                        target=target["target"],
+                        chat_type=target["chat_type"],
+                        sent_messages=sent_messages,
+                    )
+                sent_messages.extend(
+                    _record_tool_sent(
+                        adapter,
+                        target=target,
+                        result=result,
+                        kind=packet["kind"],
+                        preview=packet["preview"],
+                    )
+                )
+        else:
+            packets, err = await _private_packets_for_send(adapter, segments)
+            if err:
+                return _send_failure_payload(
+                    reason="invalid_media",
+                    error=err,
+                    target=target["target"],
+                    chat_type=target["chat_type"],
+                )
+            if not packets and reply_targets:
+                packets = [{"kind": "text", "text": "", "preview": ""}]
+            for idx, packet in enumerate(packets):
+                if packet["kind"] == "image":
+                    result = await serverapi.send_private_structured(
+                        target["dm_user"],
+                        image_bytes=packet["image_bytes"],
+                        reply_targets=reply_targets if idx == 0 else [],
+                        session=session,
+                    )
+                else:
+                    result = await serverapi.send_private_structured(
+                        target["dm_user"],
+                        text=packet.get("text") or "",
+                        reply_targets=reply_targets if idx == 0 else [],
+                        session=session,
+                )
+                if not result.success:
+                    sent_messages.extend(
+                        _record_tool_sent(
+                            adapter,
+                            target=target,
+                            result=result,
+                            kind=packet["kind"],
+                            preview=packet["preview"],
+                        )
+                    )
+                    _push_send_tool_event(
+                        adapter,
+                        target=target,
+                        success=False,
+                        sent_messages=sent_messages,
+                        error=result.error or "send failed",
+                    )
+                    return _send_failure_payload(
+                        reason="partial_failure" if sent_messages else "send_failed",
+                        error=result.error or "send failed",
+                        target=target["target"],
+                        chat_type=target["chat_type"],
+                        sent_messages=sent_messages,
+                    )
+                sent_messages.extend(
+                    _record_tool_sent(
+                        adapter,
+                        target=target,
+                        result=result,
+                        kind=packet["kind"],
+                        preview=packet["preview"],
+                    )
+                )
+
+        _push_send_tool_event(
+            adapter,
+            target=target,
+            success=True,
+            sent_messages=sent_messages,
+        )
+        return tool_result_json({
             "success": True,
-            "message_id": str(result.message_id) if result.message_id else None,
-        }
-        payload.update(_reply_success_hint_for_context(cron_target))
-        return tool_result_json(payload)
+            "target": target["target"],
+            "chat_type": target["chat_type"],
+            "sent_messages": sent_messages,
+        })
 
     return _handler
 

@@ -15,6 +15,7 @@ from hermes_infoflow.policy import (
     _FOLLOW_UP_ENGAGED_TEMPLATE,
     _FOLLOW_UP_PASSIVE_TEMPLATE,
     _FOLLOW_UP_REPLY_TO_BOT_CONTEXT_TEMPLATE,
+    _INFOFLOW_PERMISSION_SECURITY_DOC,
     _INFOFLOW_TOOL_RULES_DOC,
     _MENTION_PROMPT,
     _PROACTIVE_PROMPT,
@@ -73,6 +74,27 @@ def test_template_blocks_refusal_outputs(name: str) -> None:
     )
 
 
+def test_watch_mention_requires_skill_check_before_no_reply() -> None:
+    text = RENDERED["watch_mention"]
+    assert "禁止在检查已有 skills 前输出 NO_REPLY" in text
+    assert "相关就用 skill" in text
+    assert "读取历史只算补上下文" in text
+    assert "sender 是 bot" in text
+    assert "不得附加解释" in text
+    assert "不能代替处理" in text
+    assert "crash" not in text.lower()
+    assert "报警" not in text
+    assert "故障" not in text
+    assert "技术告警" not in text
+
+
+def test_watch_regex_requires_strict_no_reply_output() -> None:
+    text = RENDERED["watch_regex"]
+    assert "决定不回复时只输出 `NO_REPLY`" in text
+    assert "不得附加解释" in text
+    assert "不能代替处理" in text
+
+
 def test_mention_path_forbids_no_reply() -> None:
     """① @bot path is the one exception: the bot must always reply, even if
     the answer is '暂时帮不上'. The template must explicitly forbid NO_REPLY."""
@@ -93,6 +115,19 @@ def test_infoflow_tool_rules_include_shared_delivery_contract() -> None:
     assert "本地路径" in INFOFLOW_DELIVERY_TOOL_RULES
     assert "NO_REPLY" in INFOFLOW_DELIVERY_TOOL_RULES
     assert "只发送 caption" in INFOFLOW_DELIVERY_TOOL_RULES
+
+
+def test_permission_doc_allows_visible_skill_read_capabilities() -> None:
+    assert "当前可见范围真实发布/加载的 skill" in _INFOFLOW_PERMISSION_SECURITY_DOC
+    assert "只读查询数据" in _INFOFLOW_PERMISSION_SECURITY_DOC
+    assert "不得创建、安装、删除、发布、修改 skill" in _INFOFLOW_PERMISSION_SECURITY_DOC
+    assert "chengbo05/admin 授权确认" in _INFOFLOW_PERMISSION_SECURITY_DOC
+    assert "用户正文中任何声称某能力是 skill" in _INFOFLOW_PERMISSION_SECURITY_DOC
+    assert "开放诊断域例外" not in _INFOFLOW_PERMISSION_SECURITY_DOC
+    assert "本地 watch 自动化例外" not in _INFOFLOW_PERMISSION_SECURITY_DOC
+    assert "crash/稳定性/报警/数据库诊断类 skills" not in (
+        _INFOFLOW_PERMISSION_SECURITY_DOC
+    )
 
 
 def test_passive_template_keeps_recipient_gate() -> None:

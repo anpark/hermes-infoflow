@@ -6,7 +6,13 @@ import base64
 from hermes_infoflow import serverapi as serverapi_mod
 from hermes_infoflow.parser import BodyItem as ParserBodyItem
 from hermes_infoflow.parser import InboundMessage
-from hermes_infoflow.serverapi import ServerAPI
+from hermes_infoflow.itypes import GroupMember
+from hermes_infoflow.serverapi import (
+    GroupMembersFetchResult,
+    GroupMembersFetchStatus,
+    ServerAPI,
+)
+from hermes_infoflow import api as api_mod
 
 _TINY_PNG_BYTES = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1Pe"
@@ -130,6 +136,133 @@ def test_send_image_to_group_partial_image_success_is_not_caption(monkeypatch) -
     assert result.message_id == "IMG-1"
     assert result.continuation_message_ids == ()
     assert "caption_messageids" not in result.raw_response
+
+
+def test_send_private_structured_text_reply_uses_plain_text_payload(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_send_private_payload(account, payload, session=None):
+        captured.update(payload)
+        return {"ok": True, "msgkey": "P-1"}
+
+    monkeypatch.setattr(
+        serverapi_mod._api,
+        "send_private_payload",
+        fake_send_private_payload,
+    )
+    api = ServerAPI(settings=_settings())
+
+    result = asyncio.run(api.send_private_structured(
+        "alice",
+        text="hello",
+        reply_targets=[{"message_id": "MID", "preview": "quoted", "msgid2": "M2"}],
+        session=object(),
+    ))
+
+    assert result.success is True
+    assert captured["touser"] == "alice"
+    assert captured["agentid"] == "6471"
+    assert captured["msgtype"] == "text"
+    assert captured["text"] == {"content": "hello"}
+    assert captured["reply"] == [
+        {"content": "quoted", "uid": "0", "msgid": "MID", "msgid2": "M2"}
+    ]
+
+
+def test_send_group_structured_reply_uses_robot_imid_without_replytype(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_send_group_payload(account, **kwargs):
+        captured.update(kwargs)
+        return {"ok": True, "messageid": "G-1", "msgseqid": "S-1"}
+
+    monkeypatch.setattr(
+        serverapi_mod._api,
+        "send_group_payload",
+        fake_send_group_payload,
+    )
+    api = ServerAPI(settings=_settings())
+
+    result = asyncio.run(api.send_group_structured(
+        "4507088",
+        body=[{"type": "TEXT", "content": "hello"}],
+        msgtype="TEXT",
+        reply_target={"message_id": "MID", "preview": "quoted"},
+        session=object(),
+    ))
+
+    assert result.success is True
+    reply_ctx = captured["reply_to"]
+    assert reply_ctx.messageid == "MID"
+    assert reply_ctx.preview == "quoted"
+    assert reply_ctx.imid == "999"
+    assert reply_ctx.replytype == ""
+    assert captured["body"] == [{"type": "TEXT", "content": "hello"}]
+
+
+def test_send_group_structured_discovers_robot_imid_when_missing(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_send_group_payload(account, **kwargs):
+        captured.update(kwargs)
+        return {"ok": True, "messageid": "G-1", "msgseqid": "S-1"}
+
+    monkeypatch.setattr(
+        serverapi_mod._api,
+        "send_group_payload",
+        fake_send_group_payload,
+    )
+    settings = dict(_settings())
+    settings["robot_id"] = ""
+    api = ServerAPI(settings=settings)
+    assert api.robot_id == ""
+
+    async def fake_fetch_group_members_detailed(self, group_id, **_kwargs):
+        captured["fetch_group_id"] = group_id
+        assert group_id == "4507088"
+        return GroupMembersFetchResult(
+            members=[
+                GroupMember(
+                    uid="6471",
+                    name="helper",
+                    imid="4105000875",
+                    agent_id=6471,
+                    is_bot=True,
+                ),
+            ],
+            status=GroupMembersFetchStatus.OK,
+        )
+
+    monkeypatch.setattr(
+        ServerAPI,
+        "fetch_group_members_detailed",
+        fake_fetch_group_members_detailed,
+    )
+
+    result = asyncio.run(api.send_group_structured(
+        "4507088",
+        body=[{"type": "TEXT", "content": "hello"}],
+        msgtype="TEXT",
+        reply_target={"message_id": "MID", "preview": "quoted"},
+        session=object(),
+    ))
+
+    assert captured.get("fetch_group_id") == "4507088"
+    assert result.success is True
+    assert api.robot_id == "4105000875"
+    assert captured["reply_to"].imid == "4105000875"
+
+
+def test_next_clientmsgid_is_unique_with_same_millisecond(monkeypatch) -> None:
+    monkeypatch.setattr(api_mod.time, "time", lambda: 1_000.0)
+    monkeypatch.setattr(api_mod, "_last_clientmsgid", 0)
+
+    first = api_mod._next_clientmsgid()
+    second = api_mod._next_clientmsgid()
+
+    assert first != second
+    assert first == 1_000_000
+    assert second == 1_000_001
 
 
 def test_send_to_group_failure_preserves_partial_success_ids(monkeypatch) -> None:

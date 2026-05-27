@@ -165,8 +165,10 @@
 
 - 匹配规则：
   1. 全文 strip（去除空白 + `_NO_REPLY_PUNCT` 标点）== `"NO_REPLY"`
-  2. 首行 strip == `"NO_REPLY"`
+  2. 首个非空行 strip == `"NO_REPLY"`
+  3. 最后一个非空行 strip == `"NO_REPLY"`
 - 命中 → suppress，不发送给用户
+- 如果命中且除边缘 `NO_REPLY` 外仍有正文，转发诊断到 `INFOFLOW_OP_CHANNEL`
 - **日志**：在 `[iflow:send]` 前判断
 
 ### Step 11：消息发送

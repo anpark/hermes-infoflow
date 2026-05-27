@@ -575,6 +575,167 @@ class ServerAPI:
             return SentResult(success=False, error=res.get("error") or "send failed", raw_response=res)
 
     # ------------------------------------------------------------------
+    # Send — structured payloads for tool-level reply/AT/media support
+    # ------------------------------------------------------------------
+
+    async def send_private_structured(
+        self,
+        user_id: str,
+        *,
+        text: str | None = None,
+        image_bytes: bytes | None = None,
+        reply_targets: list[dict[str, str]] | None = None,
+        session: aiohttp.ClientSession | None = None,
+    ) -> SentResult:
+        """Send one private text or image message with optional reply metadata."""
+        agent_id = str(self._settings.get("app_agent_id") or "").strip()
+        if not agent_id:
+            return SentResult(
+                success=False,
+                error="Infoflow appAgentId is required for private message send",
+            )
+
+        payload: dict[str, Any] = {
+            "touser": str(user_id),
+            "toparty": "",
+            "totag": "",
+            "agentid": agent_id,
+        }
+        if image_bytes is not None:
+            try:
+                prepared_image = prepare_infoflow_image_bytes(image_bytes)
+            except _ImageLoadError as exc:
+                return SentResult(success=False, error=str(exc))
+            payload["msgtype"] = "image"
+            payload["image"] = {
+                "content": base64.b64encode(prepared_image.data).decode("ascii")
+            }
+        else:
+            payload["msgtype"] = "text"
+            payload["text"] = {"content": str(text or "")}
+
+        reply_payload: list[dict[str, str]] = []
+        for target in reply_targets or []:
+            mid = str(target.get("message_id") or "").strip()
+            if not mid:
+                continue
+            item = {
+                "content": str(target.get("preview") or "")[:_MAX_PREVIEW_LENGTH],
+                "uid": "0",
+                "msgid": mid,
+            }
+            msgid2 = str(target.get("msgid2") or "").strip()
+            if msgid2:
+                item["msgid2"] = msgid2
+            reply_payload.append(item)
+        if reply_payload:
+            payload["reply"] = reply_payload
+
+        async with self._ensure_session(session) as sess:
+            try:
+                res = await _api.send_private_payload(
+                    self._api_account,
+                    payload,
+                    session=sess,
+                )
+            except Exception as exc:
+                return SentResult(success=False, error=str(exc))
+
+            if res.get("ok"):
+                return SentResult(
+                    success=True,
+                    message_id=str(res.get("messageid") or res.get("msgkey") or ""),
+                    msgseqid=str(res.get("msgseqid") or ""),
+                    raw_response=res,
+                )
+            return SentResult(
+                success=False,
+                error=str(res.get("error") or "send failed"),
+                raw_response=res,
+            )
+
+    async def send_group_structured(
+        self,
+        group_id: str,
+        *,
+        body: list[dict[str, Any]],
+        msgtype: str,
+        reply_target: dict[str, str] | None = None,
+        session: aiohttp.ClientSession | None = None,
+    ) -> SentResult:
+        """Send one group payload with explicit body order and optional reply."""
+        async with self._ensure_session(session) as sess:
+            reply_ctx = None
+            if reply_target is not None:
+                mid = str(reply_target.get("message_id") or "").strip()
+                if not mid:
+                    return SentResult(success=False, error="reply_to.message_id is required")
+                if not self._robot_id:
+                    await self._discover_own_robot_id_from_group(group_id, session=sess)
+                if not self._robot_id:
+                    return SentResult(
+                        success=False,
+                        error="Infoflow robot imid is required for group reply",
+                    )
+                reply_ctx = _api.ReplyContext(
+                    messageid=mid,
+                    preview=str(reply_target.get("preview") or "")[:_MAX_PREVIEW_LENGTH],
+                    replytype="",
+                    imid=self._robot_id,
+                )
+            try:
+                res = await _api.send_group_payload(
+                    self._api_account,
+                    group_id=int(group_id),
+                    body=body,
+                    msgtype=msgtype,
+                    reply_to=reply_ctx,
+                    session=sess,
+                )
+            except Exception as exc:
+                return SentResult(success=False, error=str(exc))
+
+            if res.get("ok"):
+                return _sent_result_from_api_response(
+                    res,
+                    success=True,
+                    default_error="send failed",
+                )
+            return _sent_result_from_api_response(
+                res,
+                success=False,
+                default_error="send failed",
+            )
+
+    async def _discover_own_robot_id_from_group(
+        self,
+        group_id: str,
+        *,
+        session: aiohttp.ClientSession | None = None,
+    ) -> None:
+        """Populate ``robot_id`` from group members when config lacks imid."""
+        agent_id = str(self._settings.get("app_agent_id") or "").strip()
+        if not agent_id:
+            return
+        try:
+            result = await self.fetch_group_members_detailed(
+                group_id,
+                session=session,
+                force_refresh=False,
+            )
+        except Exception:
+            return
+        for member in result.members:
+            if not getattr(member, "is_bot", False):
+                continue
+            if str(getattr(member, "agent_id", "") or "") != agent_id:
+                continue
+            imid = str(getattr(member, "imid", "") or "").strip()
+            if imid:
+                self.robot_id = imid
+                return
+
+    # ------------------------------------------------------------------
     # Send image — group
     # ------------------------------------------------------------------
 

@@ -53,7 +53,7 @@ from .recall import (
     reply_to_bot_from_current_inbound,
 )
 from .sent_store import SentMessageStore
-from .settings import parse_infoflow_admin_users
+from .settings import infoflow_op_channel_from_env, parse_infoflow_admin_users
 from .utils import gw_log
 
 if TYPE_CHECKING:  # pragma: no cover — avoid circular import at runtime
@@ -175,12 +175,13 @@ def no_reply_sentinel_hits(text: str | None) -> bool:
     """True iff ``text`` should be suppressed by the NO_REPLY sentinel.
 
     Acceptance rules (kept in sync with the merged-prompt contract):
-      1) full text (strip whitespace + ``_NO_REPLY_PUNCT``) == "NO_REPLY", or
-      2) first line (same strip) == "NO_REPLY".
+      1) full text (strip whitespace + ``_NO_REPLY_PUNCT``) == "NO_REPLY";
+      2) first non-empty line (same strip) == "NO_REPLY"; or
+      3) last non-empty line (same strip) == "NO_REPLY".
 
-    Deliberately does NOT match "NO_REPLY" appearing only on a middle/last
-    line — we'd rather ship a real answer followed by an accidental
-    sentinel than swallow the entire message.
+    Deliberately does NOT match "NO_REPLY" appearing only in the middle of a
+    longer message, or as an inline substring. GLM often appends a trailing
+    sentinel after an explanation when it meant to stay silent; suppress that.
     """
     if not text:
         return False
@@ -188,8 +189,29 @@ def no_reply_sentinel_hits(text: str | None) -> bool:
     full_clean = stripped.strip(_NO_REPLY_PUNCT)
     if full_clean == "NO_REPLY":
         return True
-    first_line = stripped.split("\n", 1)[0].strip().strip(_NO_REPLY_PUNCT)
-    return first_line == "NO_REPLY"
+    lines = [line for line in stripped.splitlines() if line.strip()]
+    if not lines:
+        return False
+    return (
+        lines[0].strip().strip(_NO_REPLY_PUNCT) == "NO_REPLY"
+        or lines[-1].strip().strip(_NO_REPLY_PUNCT) == "NO_REPLY"
+    )
+
+
+def _no_reply_sentinel_residual(text: str | None) -> str:
+    """Return non-sentinel content left after dropping edge NO_REPLY lines."""
+    if not no_reply_sentinel_hits(text):
+        return str(text or "")
+    lines = str(text or "").strip().splitlines()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if lines and lines[0].strip().strip(_NO_REPLY_PUNCT) == "NO_REPLY":
+        lines.pop(0)
+    if lines and lines[-1].strip().strip(_NO_REPLY_PUNCT) == "NO_REPLY":
+        lines.pop()
+    return "\n".join(lines).strip()
 
 
 class Bot:
@@ -261,6 +283,71 @@ class Bot:
     @property
     def serverapi(self) -> ServerAPI:
         return self._serverapi
+
+    async def _broadcast_mixed_no_reply_to_ops(
+        self,
+        *,
+        text: str,
+        group_id: str | None,
+        dm_user_id: str | None,
+        path: str,
+        inbound_mid: str,
+        session: Any = None,
+    ) -> None:
+        residual = _no_reply_sentinel_residual(text)
+        if not residual:
+            return
+        target = infoflow_op_channel_from_env()
+        if not target:
+            return
+
+        source = f"group:{group_id}" if group_id is not None else (dm_user_id or "")
+        if target == source:
+            gw_log().warning(
+                "[iflow:send] mid=%s path=%s skip mixed NO_REPLY ops forward: "
+                "target equals source=%s",
+                inbound_mid,
+                path,
+                target,
+            )
+            return
+
+        notice = (
+            "[Infoflow NO_REPLY suppressed]\n"
+            f"mid: {inbound_mid or '-'}\n"
+            f"path: {path or '-'}\n"
+            f"target: {source or '-'}\n\n"
+            f"{text}"
+        )
+        try:
+            if target.startswith("group:"):
+                await self._serverapi.send_to_group(
+                    target.split(":", 1)[1],
+                    notice,
+                    session=session,
+                )
+            else:
+                await self._serverapi.send_to_dm(
+                    target,
+                    notice,
+                    session=session,
+                )
+            gw_log().info(
+                "[iflow:send] mid=%s path=%s mixed NO_REPLY forwarded_to_ops=%s",
+                inbound_mid,
+                path,
+                target,
+            )
+        except Exception as exc:
+            gw_log().warning(
+                "[iflow:send] mid=%s path=%s failed to forward mixed NO_REPLY "
+                "to ops target=%s error=%s",
+                inbound_mid,
+                path,
+                target,
+                exc,
+                exc_info=True,
+            )
 
     # ======================================================================
     # INBOUND pipeline
@@ -1228,6 +1315,14 @@ class Bot:
 
         # NO_REPLY sentinel — see ``no_reply_sentinel_hits`` for acceptance rules.
         if no_reply_sentinel_hits(text):
+            await self._broadcast_mixed_no_reply_to_ops(
+                text=text or "",
+                group_id=group_id,
+                dm_user_id=dm_user_id,
+                path=_path,
+                inbound_mid=_mid_var.get(""),
+                session=session,
+            )
             gw_log().info(
                 "[iflow:send] mid=%s path=%s NO_REPLY sentinel suppressed",
                 _mid_var.get(""), _path,

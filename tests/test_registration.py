@@ -80,6 +80,19 @@ def test_register_registers_platform_and_tool() -> None:
         == 3
     )
     assert "infoflow_create_group" in platform["platform_hint"]
+    assert "infoflow_send_message" in platform["platform_hint"]
+    assert "infoflow_reply" not in platform["platform_hint"]
+
+    assert any(t["name"] == "infoflow_send_message" for t in ctx.tools)
+    send_tool = next(t for t in ctx.tools if t["name"] == "infoflow_send_message")
+    assert send_tool["toolset"] == "infoflow"
+    assert send_tool["is_async"] is True
+    assert send_tool["schema"]["parameters"]["required"] == ["target"]
+    send_props = send_tool["schema"]["parameters"]["properties"]
+    assert "image_paths" in send_props
+    assert "reply_to" in send_props
+    assert "mention_user_ids" in send_props
+    assert not any(t["name"] == "infoflow_reply" for t in ctx.tools)
 
     assert any(t["name"] == "infoflow_get_message_history" for t in ctx.tools)
     history_tool = next(

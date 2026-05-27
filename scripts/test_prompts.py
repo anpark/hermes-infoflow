@@ -67,7 +67,7 @@ CASES: list[Case] = [
         _WATCH_MENTION_PROMPT.format(who="张三"),
         "@张三 你那个会议室预定了吗",
         "no_reply",
-        "bot 无法代查,应静默尝试后 NO_REPLY,不应输出'我帮你看看'",
+        "本脚本不提供 skills/tools;仿真无可查结果时最终 NO_REPLY,不应输出'我帮你看看'",
     ),
     Case(
         "watch-mention-can-answer",
@@ -258,9 +258,12 @@ _PUNCT = "。,.！!？?~～ \t\n;；:：，"
 
 
 def classify_output(text: str) -> str:
-    full = (text or "").strip().strip(_PUNCT)
-    first = ((text or "").split("\n", 1)[0]).strip().strip(_PUNCT)
-    if full == "NO_REPLY" or first == "NO_REPLY":
+    stripped = (text or "").strip()
+    full = stripped.strip(_PUNCT)
+    lines = [line for line in stripped.splitlines() if line.strip()]
+    first = lines[0].strip().strip(_PUNCT) if lines else ""
+    last = lines[-1].strip().strip(_PUNCT) if lines else ""
+    if full == "NO_REPLY" or first == "NO_REPLY" or last == "NO_REPLY":
         return "no_reply"
     return "reply"
 

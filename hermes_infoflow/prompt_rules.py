@@ -9,7 +9,7 @@ SUGGESTED_FINAL_RESPONSE_NO_REPLY = "NO_REPLY"
 INFOFLOW_DELIVERY_TOOL_RULES = """\
 ## 外发工具规则
 
-`send_message`、`infoflow_reply` 等会实际向如流发送内容的工具属于外发工具。工具调用结果以工具返回为准。
+`send_message`、`infoflow_send_message` 等会实际向如流发送内容的工具属于外发工具。工具调用结果以工具返回为准。
 
 - `MEDIA:<本地图片绝对路径>` 是传输指令，不是消息正文；绝不能把 `MEDIA:`、`file://` 或本地路径发成普通文本。
 - 生成图片/媒体时先保存到 `~/.hermes/cache/images/` 或 `~/.hermes/image_cache/`，再把 `MEDIA:<...>` 交给工具上传字节。

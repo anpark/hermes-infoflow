@@ -209,6 +209,14 @@ def get_inbound_body(message_id: str) -> str | None:
     return ctx.inbound_body or None
 
 
+def get_inbound_target(message_id: str) -> str:
+    """Return the Infoflow chat target for an inbound message, or empty string."""
+    ctx = _lookup_inbound_context(message_id)
+    if ctx is None:
+        return ""
+    return ctx.target or ""
+
+
 def get_inbound_sender_imid(message_id: str) -> str:
     """Return the sender's imid for ``message_id``, or empty string."""
     ctx = _lookup_inbound_context(message_id)

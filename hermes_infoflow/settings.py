@@ -417,6 +417,7 @@ def _parse_infoflow_target(
 
         group:<id>        → ("group:<id>", None)
         <id> (numeric)    → ("group:<id>", None)
+        user:<uuapName>   → ("<uuapName>", None)
         <uuapName>        → ("<uuapName>", None)
 
     Returns ``None`` for empty/whitespace-only strings to decline parsing.
@@ -425,9 +426,19 @@ def _parse_infoflow_target(
     target_ref = target_ref.strip()
     if not target_ref:
         return None
+    if target_ref.startswith("infoflow:"):
+        target_ref = target_ref[len("infoflow:"):].strip()
+    if target_ref.startswith("bot:"):
+        return None
     # Already in canonical form: group:4507088
     if target_ref.startswith("group:"):
         return (target_ref, None)
+    if target_ref.startswith("dm:user:"):
+        target_ref = target_ref[len("dm:user:"):].strip()
+    elif target_ref.startswith("user:"):
+        target_ref = target_ref[len("user:"):].strip()
+    if not target_ref:
+        return None
     # Pure numeric → treat as group ID (matches _normalize_chat_id logic)
     if target_ref.isdigit():
         return (f"group:{target_ref}", None)

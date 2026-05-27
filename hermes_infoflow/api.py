@@ -133,6 +133,17 @@ INFOFLOW_GETUSERINFO_PATH = "/api/v1/app/user/getuserinfo"
 # instances within the same process — matches OpenClaw's module-level
 # Map<string, {token, expiresAt}>.
 _token_cache: dict[str, tuple[str, float]] = {}
+_last_clientmsgid = 0
+
+
+def _next_clientmsgid() -> int:
+    """Return a millisecond-shaped client message id for rapid local sends."""
+    global _last_clientmsgid
+    candidate = int(time.time() * 1000)
+    if candidate <= _last_clientmsgid:
+        candidate = _last_clientmsgid + 1
+    _last_clientmsgid = candidate
+    return candidate
 
 
 # ---------------------------------------------------------------------------
@@ -515,6 +526,45 @@ async def send_private_message(
     return _parse_send_response(text, kind="private")
 
 
+async def send_private_payload(
+    account: InfoflowAccountAPI,
+    payload: dict[str, Any],
+    *,
+    session: aiohttp.ClientSession | None = None,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Send an already-formed private-message payload.
+
+    This is used by the reply-aware send tool. The generic private text path
+    emits ``msgtype=md``, but Infoflow private replies only render reliably
+    when the payload uses plain ``msgtype=text`` with a top-level ``reply``.
+    """
+    if not account.app_key or not account.app_secret:
+        return {"ok": False, "error": "Infoflow appKey/appSecret not configured"}
+    if not payload:
+        return {"ok": False, "error": "private payload is empty"}
+
+    try:
+        token = await get_app_access_token(account, session=session, timeout=timeout)
+    except InfoflowAPIError as exc:
+        logger.error("[infoflow:sendPrivate] token error: %s", exc)
+        return {"ok": False, "error": str(exc)}
+
+    url = _join(account.api_host, INFOFLOW_PRIVATE_SEND_PATH)
+    body_str = json.dumps(payload, ensure_ascii=False)
+    gw_log().info("[infoflow:send_payload] %s", _truncate_image_payload(body_str))
+    headers = _auth_headers(token)
+
+    async with _ensure_session(session) as sess, sess.post(
+        url,
+        data=body_str.encode("utf-8"),
+        headers=headers,
+        timeout=aiohttp.ClientTimeout(total=timeout),
+    ) as resp:
+        text = await resp.text()
+    return _parse_send_response(text, kind="private")
+
+
 def _parse_send_response(response_text: str, *, kind: str) -> dict[str, Any]:
     try:
         data = json.loads(response_text)
@@ -658,31 +708,29 @@ async def send_group_message(
 
     url = _join(account.api_host, INFOFLOW_GROUP_SEND_PATH)
     headers = _auth_headers(token, content_type="application/json")
-    msg_seq = 0
 
     async def _post(body: list[dict[str, Any]], msgtype: str, reply: ReplyContext | None):
-        nonlocal msg_seq
         payload: dict[str, Any] = {
             "message": {
                 "header": {
                     "toid": group_id,
                     "totype": "GROUP",
                     "msgtype": msgtype,
-                    "clientmsgid": int(time.time() * 1000) + msg_seq,
+                    "clientmsgid": _next_clientmsgid(),
                     "role": "robot",
                 },
                 "body": body,
             }
         }
-        msg_seq += 1
         if reply is not None:
             # Per Infoflow docs: reply sits at the same level as header
             # and body inside the message object.
             reply_block: dict[str, Any] = {
                 "messageid": reply.messageid,
                 "preview": reply.preview,
-                "replytype": reply.replytype,
             }
+            if reply.replytype:
+                reply_block["replytype"] = reply.replytype
             if reply.imid:
                 reply_block["imid"] = reply.imid
             payload["message"]["reply"] = reply_block
@@ -774,6 +822,66 @@ async def send_group_message(
         "messageids": messageids,
         "msgseqids": msgseqids,
     }
+
+
+async def send_group_payload(
+    account: InfoflowAccountAPI,
+    group_id: int,
+    *,
+    body: list[dict[str, Any]],
+    msgtype: str,
+    reply_to: ReplyContext | None = None,
+    session: aiohttp.ClientSession | None = None,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Send one structured group message without MD rewriting or splitting."""
+    if not account.app_key or not account.app_secret:
+        return {"ok": False, "error": "Infoflow appKey/appSecret not configured"}
+    if not body:
+        return {"ok": False, "error": "group body is empty"}
+
+    try:
+        token = await get_app_access_token(account, session=session, timeout=timeout)
+    except InfoflowAPIError as exc:
+        logger.error("[infoflow:sendGroup] token error: %s", exc)
+        return {"ok": False, "error": str(exc)}
+
+    payload: dict[str, Any] = {
+        "message": {
+            "header": {
+                "toid": int(group_id),
+                "totype": "GROUP",
+                "msgtype": str(msgtype or "TEXT").upper(),
+                "clientmsgid": _next_clientmsgid(),
+                "role": "robot",
+            },
+            "body": body,
+        }
+    }
+    if reply_to is not None:
+        reply_block: dict[str, Any] = {
+            "messageid": reply_to.messageid,
+            "preview": reply_to.preview,
+        }
+        if reply_to.imid:
+            reply_block["imid"] = reply_to.imid
+        if reply_to.replytype:
+            reply_block["replytype"] = reply_to.replytype
+        payload["message"]["reply"] = reply_block
+
+    url = _join(account.api_host, INFOFLOW_GROUP_SEND_PATH)
+    body_str = json.dumps(payload, ensure_ascii=False)
+    gw_log().info("[infoflow:send_payload] %s", _truncate_image_payload(body_str))
+    headers = _auth_headers(token, content_type="application/json")
+
+    async with _ensure_session(session) as sess, sess.post(
+        url,
+        data=body_str.encode("utf-8"),
+        headers=headers,
+        timeout=aiohttp.ClientTimeout(total=timeout),
+    ) as resp:
+        text = await resp.text()
+    return _parse_send_response(text, kind="group")
 
 
 # ---------------------------------------------------------------------------
