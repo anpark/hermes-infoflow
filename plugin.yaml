@@ -131,6 +131,10 @@ optional_env:
     description: "Follow-up window in seconds after last bot reply (default 300)"
     prompt: "Follow-up window seconds"
     password: false
+  - name: INFOFLOW_IDLE_SESSION_RESET_SECONDS
+    description: "Infoflow ordinary-message idle session reset threshold in seconds (default 2700, 0 disables)"
+    prompt: "Idle session reset seconds"
+    password: false
   - name: INFOFLOW_GROUPS
     description: "Per-group config overrides as JSON, keyed by group ID. Each entry can override reply_mode / watch_mentions / watch_regex / follow_up / follow_up_window / system_prompt."
     prompt: "Per-group config (JSON)"

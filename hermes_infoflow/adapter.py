@@ -35,6 +35,7 @@ import os
 import re
 import socket as _socket
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin as _urljoin
@@ -229,6 +230,7 @@ from .serverapi import ServerAPI
 from .settings import (
     DEFAULT_BODY_LIMIT_BYTES,
     DEFAULT_HOST,
+    DEFAULT_IDLE_SESSION_RESET_SECONDS,
     DEFAULT_PORT,
     DEFAULT_WEBHOOK_PATH,
     GROUP_TARGET_RE,
@@ -284,6 +286,9 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             )
         platform = Platform("infoflow")  # type: ignore[call-arg]
         super().__init__(config=config, platform=platform)
+        # Hermes injects this back-reference only when the adapter declares
+        # the attribute. It is needed for Infoflow-specific session rotation.
+        self.gateway_runner = None
 
         self._settings = _read_account_settings(config)
         self._admin_users = infoflow_admin_users_from_env()
@@ -1205,7 +1210,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             self._reset_processing_context(tokens)
 
     async def on_processing_start(self, event: Any) -> None:
-        """Inject per-event unread-message-context metadata at actual LLM start time."""
+        """Inject per-event session-boundary and unread-context metadata."""
         raw_message = getattr(event, "raw_message", None)
         if not isinstance(raw_message, dict):
             return
@@ -1214,6 +1219,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         if raw_message.get("infoflow_unread_message_context_applied"):
             return
 
+        session_boundary_line = await self._maybe_apply_idle_session_reset(event)
         unread_context = self._unread_message_context_for_event(event)
         count = unread_context.history_before_count
         raw_message["infoflow_unread_message_context_count"] = count
@@ -1223,13 +1229,20 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         )
         raw_message["infoflow_unread_message_context_applied"] = True
         text = str(getattr(event, "text", "") or "")
+        prefix_lines = []
+        if session_boundary_line:
+            prefix_lines.append(session_boundary_line)
         if count > 0:
-            text = f"{unread_message_context_line(count)}\n{text}"
+            prefix_lines.append(unread_message_context_line(count))
+        if prefix_lines:
+            text = "\n".join([*prefix_lines, text])
             event.text = text
         gw_log().info(
-            "[iflow:user_message] mid=%s unread_context_before_count=%d "
-            "effective_unread_count=%d len=%d text=\n%s",
+            "[iflow:user_message] mid=%s idle_reset=%s "
+            "unread_context_before_count=%d effective_unread_count=%d "
+            "len=%d text=\n%s",
             self._event_message_id(event) or "-",
+            bool(session_boundary_line),
             count,
             unread_context.effective_unread_count,
             len(text),
@@ -1260,6 +1273,271 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 and raw_message.get("infoflow_standard_message")
             ):
                 self._mark_event_llm_visible(event)
+
+    # ------------------------------------------------------------------
+    # Infoflow idle session reset
+    # ------------------------------------------------------------------
+
+    def _idle_session_reset_seconds(self) -> int:
+        raw = self._settings.get(
+            "idle_session_reset_seconds",
+            DEFAULT_IDLE_SESSION_RESET_SECONDS,
+        )
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return DEFAULT_IDLE_SESSION_RESET_SECONDS
+
+    def _resolve_gateway_session_key(self, event: Any) -> str:
+        source = getattr(event, "source", None)
+        if source is None:
+            return ""
+        gateway = getattr(self, "gateway_runner", None)
+        if gateway is not None:
+            resolver = getattr(gateway, "_session_key_for_source", None)
+            if callable(resolver):
+                try:
+                    session_key = resolver(source)
+                    if isinstance(session_key, str) and session_key:
+                        return session_key
+                except Exception:
+                    pass
+            session_store = getattr(gateway, "session_store", None)
+            generator = getattr(session_store, "_generate_session_key", None)
+            if callable(generator):
+                try:
+                    session_key = generator(source)
+                    if isinstance(session_key, str) and session_key:
+                        return session_key
+                except Exception:
+                    pass
+        return self._llm_context_key_for_event(event)
+
+    @staticmethod
+    def _seconds_since_session_update(entry: Any) -> float | None:
+        updated_at = getattr(entry, "updated_at", None)
+        if isinstance(updated_at, str):
+            with contextlib.suppress(ValueError):
+                updated_at = datetime.fromisoformat(updated_at)
+        if not isinstance(updated_at, datetime):
+            return None
+        now = datetime.now(updated_at.tzinfo) if updated_at.tzinfo else datetime.now()
+        return max(0.0, (now - updated_at).total_seconds())
+
+    @staticmethod
+    def _get_session_entry(session_store: Any, session_key: str) -> Any | None:
+        ensure_loaded = getattr(session_store, "_ensure_loaded", None)
+        if callable(ensure_loaded):
+            with contextlib.suppress(Exception):
+                ensure_loaded()
+        entries = getattr(session_store, "_entries", None)
+        if isinstance(entries, dict):
+            return entries.get(session_key)
+        return None
+
+    @staticmethod
+    def _has_running_work(gateway: Any, session_store: Any, session_key: str) -> bool:
+        running_agents = getattr(gateway, "_running_agents", None)
+        if isinstance(running_agents, dict) and session_key in running_agents:
+            return True
+        has_active_processes = getattr(session_store, "_has_active_processes_fn", None)
+        if callable(has_active_processes):
+            try:
+                return bool(has_active_processes(session_key))
+            except Exception:
+                gw_log().warning(
+                    "[infoflow] active process check failed for %s; skip idle reset",
+                    session_key,
+                    exc_info=True,
+                )
+                return True
+        return False
+
+    @staticmethod
+    def _cleanup_cached_agent(gateway: Any, session_key: str) -> None:
+        cached_agent = None
+        cache_lock = getattr(gateway, "_agent_cache_lock", None)
+        cache = getattr(gateway, "_agent_cache", None)
+        if cache_lock is not None and cache is not None:
+            try:
+                with cache_lock:
+                    cached = cache.get(session_key)
+                    cached_agent = (
+                        cached[0]
+                        if isinstance(cached, tuple)
+                        else cached if cached else None
+                    )
+            except Exception:
+                cached_agent = None
+        cleanup = getattr(gateway, "_cleanup_agent_resources", None)
+        if cached_agent is not None and callable(cleanup):
+            with contextlib.suppress(Exception):
+                cleanup(cached_agent)
+        evict = getattr(gateway, "_evict_cached_agent", None)
+        if callable(evict):
+            with contextlib.suppress(Exception):
+                evict(session_key)
+
+    @staticmethod
+    def _clear_gateway_session_state(gateway: Any, session_key: str) -> None:
+        model_overrides = getattr(gateway, "_session_model_overrides", None)
+        if isinstance(model_overrides, dict):
+            model_overrides.pop(session_key, None)
+        reasoning_clear = getattr(gateway, "_set_session_reasoning_override", None)
+        if callable(reasoning_clear):
+            with contextlib.suppress(Exception):
+                reasoning_clear(session_key, None)
+        pending_notes = getattr(gateway, "_pending_model_notes", None)
+        if isinstance(pending_notes, dict):
+            pending_notes.pop(session_key, None)
+        security_clear = getattr(gateway, "_clear_session_boundary_security_state", None)
+        if callable(security_clear):
+            with contextlib.suppress(Exception):
+                security_clear(session_key)
+        invalidate = getattr(gateway, "_invalidate_session_run_generation", None)
+        if callable(invalidate):
+            with contextlib.suppress(Exception):
+                invalidate(session_key, reason="infoflow_idle_reset")
+        queued_events = getattr(gateway, "_queued_events", None)
+        if isinstance(queued_events, dict):
+            queued_events.pop(session_key, None)
+
+    async def _emit_idle_session_reset_hooks(
+        self,
+        gateway: Any,
+        source: Any,
+        session_key: str,
+        old_session_id: str,
+        new_session_id: str,
+    ) -> None:
+        platform_value = "infoflow"
+        platform = getattr(source, "platform", None)
+        if platform is not None:
+            platform_value = str(getattr(platform, "value", platform) or "infoflow")
+        user_id = getattr(source, "user_id", None)
+
+        try:
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
+
+            if old_session_id:
+                _invoke_hook(
+                    "on_session_finalize",
+                    session_id=old_session_id,
+                    platform=platform_value,
+                )
+        except Exception:
+            pass
+
+        hooks = getattr(gateway, "hooks", None)
+        emit = getattr(hooks, "emit", None)
+        if callable(emit):
+            for name in ("session:end", "session:reset"):
+                try:
+                    result = emit(
+                        name,
+                        {
+                            "platform": platform_value,
+                            "user_id": user_id,
+                            "session_key": session_key,
+                        },
+                    )
+                    if asyncio.iscoroutine(result):
+                        await result
+                except Exception:
+                    pass
+
+        try:
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
+
+            if new_session_id:
+                _invoke_hook(
+                    "on_session_reset",
+                    session_id=new_session_id,
+                    platform=platform_value,
+                )
+        except Exception:
+            pass
+
+    @staticmethod
+    def _session_boundary_line(idle_seconds: int) -> str:
+        return (
+            "[Session Boundary: 该 Infoflow 会话因超过 "
+            f"{idle_seconds} 秒无新的 LLM 会话处理，已切换为新的 LLM session。"
+            "之前聊天历史没有放入当前上下文；如果当前问题依赖之前内容，"
+            "请调用 infoflow_get_message_history，使用当前 Message 标签中的 "
+            "message_id 作为锚点查询历史。若当前消息可独立回答，请直接处理。]"
+        )
+
+    async def _maybe_apply_idle_session_reset(self, event: Any) -> str:
+        raw_message = getattr(event, "raw_message", None)
+        if not isinstance(raw_message, dict):
+            return ""
+        if raw_message.get("infoflow_idle_session_reset_applied"):
+            return ""
+
+        idle_seconds = self._idle_session_reset_seconds()
+        if idle_seconds <= 0:
+            return ""
+
+        gateway = getattr(self, "gateway_runner", None)
+        session_store = getattr(gateway, "session_store", None) if gateway else None
+        if gateway is None or session_store is None:
+            return ""
+
+        session_key = self._resolve_gateway_session_key(event)
+        if not session_key:
+            return ""
+        entry = self._get_session_entry(session_store, session_key)
+        if entry is None:
+            return ""
+
+        elapsed = self._seconds_since_session_update(entry)
+        if elapsed is None or elapsed <= idle_seconds:
+            return ""
+        if self._has_running_work(gateway, session_store, session_key):
+            return ""
+
+        old_session_id = str(getattr(entry, "session_id", "") or "")
+        try:
+            self._cleanup_cached_agent(gateway, session_key)
+            reset = getattr(session_store, "reset_session", None)
+            if not callable(reset):
+                return ""
+            new_entry = reset(session_key)
+            if new_entry is None:
+                return ""
+            new_session_id = str(getattr(new_entry, "session_id", "") or "")
+            self._clear_gateway_session_state(gateway, session_key)
+            await self._emit_idle_session_reset_hooks(
+                gateway,
+                getattr(event, "source", None),
+                session_key,
+                old_session_id,
+                new_session_id,
+            )
+        except Exception as exc:
+            gw_log().warning(
+                "[infoflow] idle session reset failed for %s: %s",
+                session_key,
+                exc,
+                exc_info=True,
+            )
+            return ""
+
+        raw_message["infoflow_idle_session_reset_applied"] = True
+        raw_message["infoflow_idle_session_reset_seconds"] = idle_seconds
+        raw_message["infoflow_idle_session_reset_old_session_id"] = old_session_id
+        raw_message["infoflow_idle_session_reset_new_session_id"] = new_session_id
+        gw_log().info(
+            "[infoflow] idle session reset applied session_key=%s old=%s new=%s "
+            "idle_seconds=%d elapsed_seconds=%.1f",
+            session_key,
+            old_session_id or "-",
+            new_session_id or "-",
+            idle_seconds,
+            elapsed,
+        )
+        return self._session_boundary_line(idle_seconds)
 
     # ------------------------------------------------------------------
     # Session helpers

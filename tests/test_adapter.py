@@ -12,6 +12,8 @@ import base64
 import inspect
 import json
 import os
+from datetime import datetime, timedelta
+from threading import Lock
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import urlencode
@@ -87,6 +89,74 @@ def _make_config():
     return SimpleNamespace(extra={}, token=None, api_key=None, enabled=True, home_channel=None)
 
 
+class _FakeHooks:
+    def __init__(self):
+        self.events: list[tuple[str, dict]] = []
+
+    async def emit(self, name: str, payload: dict) -> None:
+        self.events.append((name, payload))
+
+
+class _FakeSessionStore:
+    def __init__(self, session_key: str, entry: SimpleNamespace):
+        self._entries = {session_key: entry}
+        self._has_active_processes_fn = lambda key: False
+        self.reset_calls: list[str] = []
+
+    def _ensure_loaded(self) -> None:
+        return None
+
+    def _generate_session_key(self, source) -> str:
+        return next(iter(self._entries))
+
+    def reset_session(self, session_key: str):
+        self.reset_calls.append(session_key)
+        old = self._entries[session_key]
+        new_entry = SimpleNamespace(
+            session_key=session_key,
+            session_id="new-session",
+            updated_at=datetime.now(),
+            origin=getattr(old, "origin", None),
+            is_fresh_reset=True,
+        )
+        self._entries[session_key] = new_entry
+        return new_entry
+
+
+class _FakeGateway:
+    def __init__(self, session_key: str, entry: SimpleNamespace):
+        self.session_store = _FakeSessionStore(session_key, entry)
+        self._running_agents = {}
+        self._agent_cache = {}
+        self._agent_cache_lock = Lock()
+        self._session_model_overrides = {session_key: {"model": "old"}}
+        self._pending_model_notes = {session_key: "old note"}
+        self._queued_events = {session_key: [object()]}
+        self.reasoning_cleared: list[tuple[str, object]] = []
+        self.security_cleared: list[str] = []
+        self.invalidated: list[tuple[str, str]] = []
+        self.cleaned_agents: list[object] = []
+        self.hooks = _FakeHooks()
+
+    def _session_key_for_source(self, source) -> str:
+        return next(iter(self.session_store._entries))
+
+    def _cleanup_agent_resources(self, agent) -> None:
+        self.cleaned_agents.append(agent)
+
+    def _evict_cached_agent(self, session_key: str) -> None:
+        self._agent_cache.pop(session_key, None)
+
+    def _set_session_reasoning_override(self, session_key: str, value) -> None:
+        self.reasoning_cleared.append((session_key, value))
+
+    def _clear_session_boundary_security_state(self, session_key: str) -> None:
+        self.security_cleared.append(session_key)
+
+    def _invalidate_session_run_generation(self, session_key: str, *, reason: str = "") -> None:
+        self.invalidated.append((session_key, reason))
+
+
 def _make_request(*, content_type: str, body: bytes, headers: dict[str, str] | None = None):
     """Tiny aiohttp-shaped request stand-in for ``_handle_webhook``."""
     hdrs = {"Content-Type": content_type}
@@ -115,6 +185,157 @@ def test_adapter_construction_reads_env(configured_env, monkeypatch) -> None:
     assert adapter._serverapi._api_account.app_key == "k"
     assert adapter._policy.reply_mode == "mention-and-watch"
     assert adapter._policy.require_mention is True
+    assert adapter.gateway_runner is None
+
+
+def test_idle_session_reset_rotates_before_unread_context(configured_env, tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(ms, "_STATE_BASE_DIR", tmp_path)
+    cfg = _make_config()
+    cfg.extra = {"idle_session_reset_seconds": 1}
+    adapter = InfoflowAdapter(cfg)
+    base_time = int(__import__("time").time() * 1000)
+    adapter._message_store.persist_group(
+        message_id="M1",
+        group_id="4507088",
+        sender="user:alice",
+        content="older unread",
+        created_time=base_time + 1_000,
+    )
+    adapter._message_store.persist_group(
+        message_id="M2",
+        group_id="4507088",
+        sender="user:carol",
+        content="current",
+        created_time=base_time + 2_000,
+    )
+    source = adapter.build_source(
+        chat_id="group:4507088",
+        chat_name="group:4507088",
+        chat_type="group",
+        user_id="carol",
+        user_name="carol",
+        message_id="M2",
+    )
+    event = MessageEvent(
+        text="[Message: message_id:'M2']\ncurrent",
+        message_type=MessageType.TEXT,
+        source=source,
+        raw_message={"infoflow_standard_message": True},
+        message_id="M2",
+    )
+    session_key = adapter._llm_context_key_for_event(event)
+    old_entry = SimpleNamespace(
+        session_key=session_key,
+        session_id="old-session",
+        updated_at=datetime.now() - timedelta(seconds=2),
+        origin=source,
+    )
+    gateway = _FakeGateway(session_key, old_entry)
+    old_agent = object()
+    gateway._agent_cache[session_key] = (old_agent, "sig")
+    adapter.gateway_runner = gateway
+
+    asyncio.run(adapter.on_processing_start(event))
+
+    assert gateway.session_store.reset_calls == [session_key]
+    assert gateway.cleaned_agents == [old_agent]
+    assert session_key not in gateway._agent_cache
+    assert session_key not in gateway._session_model_overrides
+    assert session_key not in gateway._pending_model_notes
+    assert session_key not in gateway._queued_events
+    assert gateway.reasoning_cleared == [(session_key, None)]
+    assert gateway.security_cleared == [session_key]
+    assert gateway.invalidated == [(session_key, "infoflow_idle_reset")]
+    assert gateway.hooks.events == [
+        (
+            "session:end",
+            {"platform": "infoflow", "user_id": "carol", "session_key": session_key},
+        ),
+        (
+            "session:reset",
+            {"platform": "infoflow", "user_id": "carol", "session_key": session_key},
+        ),
+    ]
+    assert event.text.startswith("[Session Boundary:")
+    assert "\n[Unread Message Context:" in event.text
+    assert event.text.index("[Session Boundary:") < event.text.index("[Unread Message Context:")
+    assert event.raw_message["infoflow_idle_session_reset_applied"] is True
+    assert event.raw_message["infoflow_idle_session_reset_seconds"] == 1
+    assert event.raw_message["infoflow_idle_session_reset_old_session_id"] == "old-session"
+    assert event.raw_message["infoflow_idle_session_reset_new_session_id"] == "new-session"
+    assert event.raw_message["infoflow_unread_message_context_count"] == 1
+
+
+def test_idle_session_reset_skips_running_agent(configured_env) -> None:
+    cfg = _make_config()
+    cfg.extra = {"idle_session_reset_seconds": 1}
+    adapter = InfoflowAdapter(cfg)
+    source = adapter.build_source(
+        chat_id="alice",
+        chat_name="alice",
+        chat_type="dm",
+        user_id="alice",
+        user_name="alice",
+        message_id="M1",
+    )
+    event = MessageEvent(
+        text="[Message: message_id:'M1']\ncurrent",
+        message_type=MessageType.TEXT,
+        source=source,
+        raw_message={"infoflow_standard_message": True},
+        message_id="M1",
+    )
+    session_key = adapter._llm_context_key_for_event(event)
+    old_entry = SimpleNamespace(
+        session_key=session_key,
+        session_id="old-session",
+        updated_at=datetime.now() - timedelta(seconds=2),
+        origin=source,
+    )
+    gateway = _FakeGateway(session_key, old_entry)
+    gateway._running_agents[session_key] = object()
+    adapter.gateway_runner = gateway
+
+    asyncio.run(adapter.on_processing_start(event))
+
+    assert gateway.session_store.reset_calls == []
+    assert "Session Boundary" not in event.text
+    assert "infoflow_idle_session_reset_applied" not in event.raw_message
+
+
+def test_idle_session_reset_ignores_command_fast_path(configured_env) -> None:
+    cfg = _make_config()
+    cfg.extra = {"idle_session_reset_seconds": 1}
+    adapter = InfoflowAdapter(cfg)
+    source = adapter.build_source(
+        chat_id="alice",
+        chat_name="alice",
+        chat_type="dm",
+        user_id="alice",
+        user_name="alice",
+        message_id="M1",
+    )
+    event = MessageEvent(
+        text="/new",
+        message_type=MessageType.TEXT,
+        source=source,
+        raw_message={},
+        message_id="M1",
+    )
+    session_key = adapter._llm_context_key_for_event(event)
+    old_entry = SimpleNamespace(
+        session_key=session_key,
+        session_id="old-session",
+        updated_at=datetime.now() - timedelta(seconds=2),
+        origin=source,
+    )
+    gateway = _FakeGateway(session_key, old_entry)
+    adapter.gateway_runner = gateway
+
+    asyncio.run(adapter.on_processing_start(event))
+
+    assert gateway.session_store.reset_calls == []
+    assert event.text == "/new"
 
 
 def test_build_message_event_uses_settings_agent_id_for_bot_identity(

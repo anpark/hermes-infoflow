@@ -28,6 +28,7 @@ DEFAULT_API_HOST = "https://api.im.baidu.com"
 DEFAULT_WEBHOOK_PATH = "/webhook/infoflow"
 MAX_MESSAGE_LENGTH = 2048  # matches OpenClaw textChunkLimit
 DEFAULT_BODY_LIMIT_BYTES = 20 * 1024 * 1024
+DEFAULT_IDLE_SESSION_RESET_SECONDS = 2700
 GROUP_TARGET_RE = re.compile(r"^(?:group:)?(\d+)$", re.IGNORECASE)
 MAX_PREVIEW_LENGTH = 100  # matches openclaw reply-dispatcher truncatePreview()
 WATCH_REGEX_ENV = "INFOFLOW_WATCH_REGEX"
@@ -204,6 +205,11 @@ def _read_account_settings(config: Any) -> dict[str, Any]:
         ),
         "follow_up_raw": pick("INFOFLOW_FOLLOW_UP", "follow_up", "true"),
         "follow_up_window_raw": pick("INFOFLOW_FOLLOW_UP_WINDOW", "follow_up_window", "300"),
+        "idle_session_reset_seconds_raw": pick(
+            "INFOFLOW_IDLE_SESSION_RESET_SECONDS",
+            "idle_session_reset_seconds",
+            DEFAULT_IDLE_SESSION_RESET_SECONDS,
+        ),
         "groups_raw": pick("INFOFLOW_GROUPS", "groups", None),
         "state_dir_raw": pick("HERMES_STATE_DIR", "state_dir", None),
     }
@@ -233,6 +239,16 @@ def _read_account_settings(config: Any) -> dict[str, Any]:
         settings["follow_up_window"] = int(fuw) if fuw not in (None, "") else 300
     except (TypeError, ValueError):
         settings["follow_up_window"] = 300
+
+    try:
+        idle_reset = settings.pop("idle_session_reset_seconds_raw")
+        settings["idle_session_reset_seconds"] = (
+            int(idle_reset)
+            if idle_reset not in (None, "")
+            else DEFAULT_IDLE_SESSION_RESET_SECONDS
+        )
+    except (TypeError, ValueError):
+        settings["idle_session_reset_seconds"] = DEFAULT_IDLE_SESSION_RESET_SECONDS
 
     # CSV-ish (mentions).
     watch_raw = settings.pop("watch_mentions_raw") or ""
@@ -321,6 +337,7 @@ def _env_enablement() -> dict | None:
         ("INFOFLOW_WATCH_MENTIONS", "watch_mentions"),
         ("INFOFLOW_FOLLOW_UP", "follow_up"),
         ("INFOFLOW_FOLLOW_UP_WINDOW", "follow_up_window"),
+        ("INFOFLOW_IDLE_SESSION_RESET_SECONDS", "idle_session_reset_seconds"),
         ("INFOFLOW_GROUPS", "groups"),
         ("INFOFLOW_CONNECTION_MODE", "connection_mode"),
         ("HERMES_STATE_DIR", "state_dir"),
@@ -423,6 +440,7 @@ __all__ = [
     "ADMIN_USER_ENV",
     "DEFAULT_API_HOST",
     "DEFAULT_HOST",
+    "DEFAULT_IDLE_SESSION_RESET_SECONDS",
     "DEFAULT_PORT",
     "DEFAULT_WEBHOOK_PATH",
     "GROUP_TARGET_RE",

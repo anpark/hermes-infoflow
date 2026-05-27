@@ -32,6 +32,7 @@ from hermes_infoflow.recall import (
 )
 from hermes_infoflow.settings import (
     DEFAULT_API_HOST,
+    DEFAULT_IDLE_SESSION_RESET_SECONDS,
     DEFAULT_PORT,
     _check_requirements,
     _env_enablement,
@@ -162,6 +163,31 @@ def test_read_settings_defaults_api_host_without_env(monkeypatch) -> None:
     assert s["api_host"] == DEFAULT_API_HOST
 
 
+def test_read_settings_defaults_idle_session_reset_seconds(monkeypatch) -> None:
+    monkeypatch.delenv("INFOFLOW_IDLE_SESSION_RESET_SECONDS", raising=False)
+    s = _read_account_settings(_cfg())
+    assert s["idle_session_reset_seconds"] == DEFAULT_IDLE_SESSION_RESET_SECONDS
+    assert DEFAULT_IDLE_SESSION_RESET_SECONDS == 2700
+
+
+def test_read_settings_idle_session_reset_seconds_from_env(monkeypatch) -> None:
+    monkeypatch.setenv("INFOFLOW_IDLE_SESSION_RESET_SECONDS", "120")
+    s = _read_account_settings(_cfg({"idle_session_reset_seconds": 300}))
+    assert s["idle_session_reset_seconds"] == 120
+
+
+def test_read_settings_idle_session_reset_seconds_from_config(monkeypatch) -> None:
+    monkeypatch.delenv("INFOFLOW_IDLE_SESSION_RESET_SECONDS", raising=False)
+    s = _read_account_settings(_cfg({"idle_session_reset_seconds": "600"}))
+    assert s["idle_session_reset_seconds"] == 600
+
+
+def test_read_settings_idle_session_reset_seconds_invalid_uses_default(monkeypatch) -> None:
+    monkeypatch.setenv("INFOFLOW_IDLE_SESSION_RESET_SECONDS", "not-a-number")
+    s = _read_account_settings(_cfg())
+    assert s["idle_session_reset_seconds"] == DEFAULT_IDLE_SESSION_RESET_SECONDS
+
+
 def test_env_enablement_uses_default_api_host(monkeypatch) -> None:
     monkeypatch.delenv("INFOFLOW_API_HOST", raising=False)
     monkeypatch.setenv("INFOFLOW_APP_KEY", "k")
@@ -173,6 +199,19 @@ def test_env_enablement_uses_default_api_host(monkeypatch) -> None:
 
     assert seed is not None
     assert seed["api_host"] == DEFAULT_API_HOST
+
+
+def test_env_enablement_includes_idle_session_reset_seconds(monkeypatch) -> None:
+    monkeypatch.setenv("INFOFLOW_APP_KEY", "k")
+    monkeypatch.setenv("INFOFLOW_APP_SECRET", "s")
+    monkeypatch.setenv("INFOFLOW_CHECK_TOKEN", "tok")
+    monkeypatch.setenv("INFOFLOW_ENCODING_AES_KEY", "aes")
+    monkeypatch.setenv("INFOFLOW_IDLE_SESSION_RESET_SECONDS", "1800")
+
+    seed = _env_enablement()
+
+    assert seed is not None
+    assert seed["idle_session_reset_seconds"] == "1800"
 
 
 def test_env_enablement_includes_prefixed_watch_regex(monkeypatch) -> None:
