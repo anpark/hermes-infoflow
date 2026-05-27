@@ -16,7 +16,7 @@ shape — that would be silently ignored. This script:
 * Ensures ``plugins.enabled`` is a list.
 * Appends the requested plugin id IFF it isn't already present.
 * Ensures ``platform_toolsets.<plugin-id>`` has the same baseline tool
-  permissions as the CLI platform, including ``hermes-infoflow``.
+  permissions as the CLI platform, including the ``infoflow`` plugin toolset.
 * Preserves every other key by round-tripping through PyYAML.
 
 Usage::

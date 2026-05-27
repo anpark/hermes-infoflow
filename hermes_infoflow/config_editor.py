@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
+INFOFLOW_TOOLSET = "infoflow"
+LEGACY_INFOFLOW_TOOLSETS = ("hermes-infoflow",)
+
 DEFAULT_INFOFLOW_PLATFORM_TOOLSETS = (
     "browser",
     "clarify",
@@ -12,7 +15,7 @@ DEFAULT_INFOFLOW_PLATFORM_TOOLSETS = (
     "cronjob",
     "delegation",
     "file",
-    "hermes-infoflow",
+    INFOFLOW_TOOLSET,
     "image_gen",
     "memory",
     "messaging",
@@ -49,10 +52,53 @@ def dedupe(items: list[str]) -> list[str]:
     return result
 
 
+def migrate_legacy_infoflow_toolsets(items: list[str]) -> list[str]:
+    return dedupe([
+        INFOFLOW_TOOLSET if item in LEGACY_INFOFLOW_TOOLSETS else item
+        for item in items
+    ])
+
+
+def migrate_platform_toolsets(data: dict[str, Any]) -> bool:
+    platform_toolsets = data.get("platform_toolsets")
+    if not isinstance(platform_toolsets, dict):
+        return False
+
+    changed = False
+    for platform, value in list(platform_toolsets.items()):
+        if not isinstance(value, list):
+            continue
+        current = normalize_toolsets(value, f"platform_toolsets.{platform}")
+        migrated = migrate_legacy_infoflow_toolsets(current)
+        if current != migrated:
+            platform_toolsets[platform] = migrated
+            changed = True
+    return changed
+
+
+def migrate_known_plugin_toolsets(data: dict[str, Any]) -> bool:
+    known_plugin_toolsets = data.get("known_plugin_toolsets")
+    if not isinstance(known_plugin_toolsets, dict):
+        return False
+
+    changed = False
+    for platform, value in list(known_plugin_toolsets.items()):
+        if not isinstance(value, list):
+            continue
+        current = normalize_toolsets(value, f"known_plugin_toolsets.{platform}")
+        migrated = migrate_legacy_infoflow_toolsets(current)
+        if current != migrated:
+            known_plugin_toolsets[platform] = migrated
+            changed = True
+    return changed
+
+
 def reference_toolsets(platform_toolsets: dict[str, Any]) -> list[str]:
-    cli_toolsets = normalize_toolsets(
-        platform_toolsets.get("cli"),
-        "platform_toolsets.cli",
+    cli_toolsets = migrate_legacy_infoflow_toolsets(
+        normalize_toolsets(
+            platform_toolsets.get("cli"),
+            "platform_toolsets.cli",
+        )
     )
     return dedupe([*cli_toolsets, *DEFAULT_INFOFLOW_PLATFORM_TOOLSETS])
 
@@ -64,12 +110,13 @@ def ensure_platform_toolsets(data: dict[str, Any], plugin_id: str) -> bool:
         raise SystemExit("platform_toolsets: must be a mapping; refusing to edit")
 
     required = reference_toolsets(platform_toolsets)
-    current = normalize_toolsets(
+    original = normalize_toolsets(
         platform_toolsets.get(plugin_id),
         f"platform_toolsets.{plugin_id}",
     )
+    current = migrate_legacy_infoflow_toolsets(original)
     merged = dedupe([*current, *required])
-    if current == merged:
+    if original == merged:
         return False
     platform_toolsets[plugin_id] = merged
     data["platform_toolsets"] = platform_toolsets
@@ -105,6 +152,8 @@ def apply(data: dict[str, Any], plugin_id: str, *, remove: bool = False) -> bool
             data["plugins"] = plugins
             changed = True
     else:
+        changed = migrate_platform_toolsets(data) or changed
+        changed = migrate_known_plugin_toolsets(data) or changed
         if plugin_id not in current:
             plugins["enabled"] = [*current, plugin_id]
             data["plugins"] = plugins

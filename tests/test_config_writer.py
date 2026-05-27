@@ -43,7 +43,8 @@ def test_apply_appends_to_existing_list(edit_module) -> None:
     changed = edit_module.apply(data, "infoflow")
     assert changed
     assert data["plugins"]["enabled"] == ["other", "infoflow"]
-    assert "hermes-infoflow" in data["platform_toolsets"]["infoflow"]
+    assert "infoflow" in data["platform_toolsets"]["infoflow"]
+    assert "hermes-infoflow" not in data["platform_toolsets"]["infoflow"]
 
 
 def test_apply_is_idempotent(edit_module) -> None:
@@ -90,7 +91,35 @@ def test_apply_merges_existing_infoflow_toolsets(edit_module) -> None:
     assert data["platform_toolsets"]["infoflow"][0] == "custom-mcp"
     assert "terminal" in data["platform_toolsets"]["infoflow"]
     assert "web" in data["platform_toolsets"]["infoflow"]
-    assert "hermes-infoflow" in data["platform_toolsets"]["infoflow"]
+    assert "infoflow" in data["platform_toolsets"]["infoflow"]
+    assert "hermes-infoflow" not in data["platform_toolsets"]["infoflow"]
+
+
+def test_apply_migrates_legacy_infoflow_toolsets(edit_module) -> None:
+    data = {
+        "plugins": {"enabled": ["infoflow"]},
+        "platform_toolsets": {
+            "cli": ["terminal", "hermes-infoflow"],
+            "infoflow": ["custom-mcp", "hermes-infoflow"],
+            "other": ["hermes-infoflow", "web"],
+        },
+        "known_plugin_toolsets": {
+            "cli": ["hermes-infoflow", "spotify"],
+            "infoflow": ["hermes-infoflow"],
+        },
+    }
+    changed = edit_module.apply(data, "infoflow")
+    assert changed
+    assert data["platform_toolsets"]["cli"] == ["terminal", "infoflow"]
+    assert data["platform_toolsets"]["infoflow"][0] == "custom-mcp"
+    assert "infoflow" in data["platform_toolsets"]["infoflow"]
+    assert data["platform_toolsets"]["other"] == ["infoflow", "web"]
+    assert data["known_plugin_toolsets"]["cli"] == ["infoflow", "spotify"]
+    assert data["known_plugin_toolsets"]["infoflow"] == ["infoflow"]
+    for toolsets in data["platform_toolsets"].values():
+        assert "hermes-infoflow" not in toolsets
+    for toolsets in data["known_plugin_toolsets"].values():
+        assert "hermes-infoflow" not in toolsets
 
 
 def test_apply_remove_drops_id(edit_module) -> None:

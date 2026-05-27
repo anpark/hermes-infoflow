@@ -73,6 +73,53 @@ async def _with_temp_session(adapter: Any, coro):
             adapter._http_session = saved_session
 
 
+def _cron_auto_delivery_target() -> dict[str, str | None] | None:
+    """Return the active cron auto-delivery target, if this is a cron run."""
+    try:
+        from gateway.session_context import get_session_env  # type: ignore[import-not-found]
+    except Exception:
+        get_value = os.getenv
+    else:
+        get_value = get_session_env
+
+    platform = (
+        str(get_value("HERMES_CRON_AUTO_DELIVER_PLATFORM", "") or "")
+        .strip()
+        .lower()
+    )
+    chat_id = str(get_value("HERMES_CRON_AUTO_DELIVER_CHAT_ID", "") or "").strip()
+    thread_id = (
+        str(get_value("HERMES_CRON_AUTO_DELIVER_THREAD_ID", "") or "").strip()
+        or None
+    )
+    if not platform or not chat_id:
+        return None
+    return {
+        "platform": platform,
+        "chat_id": chat_id,
+        "thread_id": thread_id,
+    }
+
+
+def _reply_success_hint_for_context(
+    cron_target: dict[str, str | None] | None,
+) -> dict[str, Any]:
+    """Return model guidance after a successful direct reply send."""
+    if not cron_target:
+        return delivery_success_hint()
+    return {
+        "delivered": True,
+        "cron_auto_delivery": True,
+        "cron_auto_delivery_target": cron_target,
+        "suggested_final_response": "[SILENT]",
+        "final_response_instruction": (
+            "infoflow_reply already sent the quoted message directly. "
+            "Return exactly [SILENT] as the final response to prevent the cron "
+            "scheduler from auto-delivering a duplicate message."
+        ),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Tool schemas
 # ---------------------------------------------------------------------------
@@ -197,7 +244,14 @@ REPLY_TOOL_SCHEMA = {
         "使用场景：\n"
         "- 需要针对特定历史消息进行回应时\n"
         "- 需要让对方明确知道你在回复哪条消息时\n\n"
-        "若省略 `reply_to`，自动引用触发本轮对话的那条用户消息。"
+        "限制：本工具不是普通发送工具；没有可引用消息时不要把它当作"
+        "普通消息发送入口。若省略 `reply_to`，只会在 Infoflow webhook "
+        "触发的当前会话中自动引用本轮用户消息。\n\n"
+        "Cron/定时任务：不要为了定时发送普通消息而调用本工具；把要发送的"
+        "内容写在最终响应中，由 cron scheduler 自动投递。只有当任务已经"
+        "明确拿到 `reply_to` message_id 且必须发送引用卡片时才可调用；"
+        "这种情况下工具成功后最终响应应为 `[SILENT]`，避免 cron 再投递"
+        "一条重复消息。"
     ),
     "parameters": {
         "type": "object",
@@ -473,6 +527,7 @@ async def _send_reply_media(
     message: str,
     reply_to: str,
     reply_type: str,
+    cron_target: dict[str, str | None] | None = None,
 ) -> str | None:
     media_files, cleaned_message, malformed_media = _extract_reply_media(message)
     if malformed_media:
@@ -519,7 +574,7 @@ async def _send_reply_media(
         "message_id": last_message_id,
         "media_count": len(media_files),
     }
-    payload.update(delivery_success_hint())
+    payload.update(_reply_success_hint_for_context(cron_target))
     if sent_ids:
         payload["message_ids"] = sent_ids
     return tool_result_json(payload)
@@ -675,6 +730,7 @@ def make_reply_handler():
         target = args.get("target")  # may be None → home channel
         reply_to = args.get("reply_to") or None
         reply_type = args.get("reply_type", "1")
+        cron_target = _cron_auto_delivery_target()
 
         if not message:
             return tool_result_json({"error": "message is required"})
@@ -686,6 +742,24 @@ def make_reply_handler():
             reply_to = _recall_inbound_message_hint.get(None) or ""
 
         if not reply_to:
+            if cron_target:
+                return tool_result_json({
+                    "success": True,
+                    "skipped": True,
+                    "delivered": False,
+                    "reason": "cron_auto_delivery_no_reply_anchor",
+                    "cron_auto_delivery": True,
+                    "cron_auto_delivery_target": cron_target,
+                    "should_retry": False,
+                    "final_response_instruction": (
+                        "Nothing was sent by infoflow_reply because this cron "
+                        "run has no Infoflow message_id to quote. Put the exact "
+                        "outbound content in the final response; the cron "
+                        "scheduler will auto-deliver it. Do not call "
+                        "infoflow_reply again unless you have an explicit "
+                        "reply_to message_id."
+                    ),
+                })
             return tool_result_json({"error": (
                 "No message to reply to. Provide `reply_to`, or this tool "
                 "only works when invoked during a webhook-triggered turn "
@@ -723,6 +797,7 @@ def make_reply_handler():
             message=message,
             reply_to=reply_to,
             reply_type=reply_type,
+            cron_target=cron_target,
         )
         if media_result is not None:
             return media_result
@@ -740,7 +815,7 @@ def make_reply_handler():
             "success": True,
             "message_id": str(result.message_id) if result.message_id else None,
         }
-        payload.update(delivery_success_hint())
+        payload.update(_reply_success_hint_for_context(cron_target))
         return tool_result_json(payload)
 
     return _handler

@@ -8,6 +8,14 @@ versioning (with prerelease suffixes such as `0.1.0b1` for betas).
 
 ## [Unreleased]
 
+### Changed
+
+- Register Infoflow-specific agent tools under the `infoflow` plugin toolset
+  and migrate legacy `hermes-infoflow` config entries to `infoflow`.
+- Clarify `infoflow_reply` cron usage and make cron runs without an explicit
+  `reply_to` skip the tool call instead of failing or sending a duplicate
+  ordinary message.
+
 ## [2026.5.26] - 2026-05-25
 
 ### Fixed
@@ -47,7 +55,7 @@ versioning (with prerelease suffixes such as `0.1.0b1` for betas).
   formatting so the model can inspect unread/nearby messages before deciding
   whether and how to reply.
 - `infoflow_get_group_members` agent tool with request coalescing and deploy
-  config setup for the `hermes-infoflow` toolset.
+  config setup for the `infoflow` plugin toolset.
 - Native Infoflow image/media sending for outbound messages and
   `infoflow_reply`, including local image validation and size handling.
 - `scripts/deploy.sh` and `scripts/lib/deploy-common.sh` accept `--port` to
@@ -59,7 +67,7 @@ versioning (with prerelease suffixes such as `0.1.0b1` for betas).
 - `scripts/lib/edit_hermes_env.py` for safe `.env` upserts during deploy.
 - Deploy / installer config editing now ensures
   `platform_toolsets.infoflow` includes the same baseline tool permissions
-  as CLI sessions, including the `hermes-infoflow` toolset.
+  as CLI sessions, including the `infoflow` plugin toolset.
 
 ### Changed
 

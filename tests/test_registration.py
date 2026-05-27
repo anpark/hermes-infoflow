@@ -51,7 +51,7 @@ def test_register_registers_platform_and_tool() -> None:
     # The recall tool must be registered too.
     assert any(t["name"] == "infoflow_recall_message" for t in ctx.tools)
     tool = next(t for t in ctx.tools if t["name"] == "infoflow_recall_message")
-    assert tool["toolset"] == "hermes-infoflow"
+    assert tool["toolset"] == "infoflow"
     assert tool["is_async"] is True
     assert tool["schema"]["parameters"]["required"] == ["target"]
     assert "NO_REPLY" in tool["schema"]["description"]
@@ -60,7 +60,7 @@ def test_register_registers_platform_and_tool() -> None:
     members_tool = next(
         t for t in ctx.tools if t["name"] == "infoflow_get_group_members"
     )
-    assert members_tool["toolset"] == "hermes-infoflow"
+    assert members_tool["toolset"] == "infoflow"
     assert members_tool["is_async"] is True
     assert members_tool["schema"]["parameters"]["required"] == ["group_id"]
 
@@ -68,7 +68,7 @@ def test_register_registers_platform_and_tool() -> None:
     history_tool = next(
         t for t in ctx.tools if t["name"] == "infoflow_get_message_history"
     )
-    assert history_tool["toolset"] == "hermes-infoflow"
+    assert history_tool["toolset"] == "infoflow"
     assert history_tool["is_async"] is True
     history_props = history_tool["schema"]["parameters"]["properties"]
     assert "message_id" in history_props

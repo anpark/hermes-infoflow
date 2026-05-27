@@ -1230,7 +1230,7 @@ def test_config_yaml_infoflow_platform_toolsets(readonly_deployed: Path) -> None
         "cronjob",
         "delegation",
         "file",
-        "hermes-infoflow",
+        "infoflow",
         "image_gen",
         "memory",
         "messaging",
@@ -1255,8 +1255,10 @@ def test_deploy_preserves_custom_infoflow_toolsets(tmp_path: Path) -> None:
             "  cli:\n"
             "  - terminal\n"
             "  - web\n"
+            "  - hermes-infoflow\n"
             "  infoflow:\n"
             "  - custom-mcp\n"
+            "  - hermes-infoflow\n"
         ),
     )
     assert result.returncode == 0, result.stderr
@@ -1265,7 +1267,9 @@ def test_deploy_preserves_custom_infoflow_toolsets(tmp_path: Path) -> None:
     assert infoflow_toolsets[0] == "custom-mcp"
     assert "terminal" in infoflow_toolsets
     assert "web" in infoflow_toolsets
-    assert "hermes-infoflow" in infoflow_toolsets
+    assert "infoflow" in infoflow_toolsets
+    assert "hermes-infoflow" not in infoflow_toolsets
+    assert "hermes-infoflow" not in data["platform_toolsets"]["cli"]
 
 
 def test_flat_layout_loads_like_hermes_agent_does(readonly_deployed: Path) -> None:

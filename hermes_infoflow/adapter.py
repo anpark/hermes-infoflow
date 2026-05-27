@@ -1941,7 +1941,7 @@ def register(ctx: Any) -> None:
         try:
             register_tool(
                 name="infoflow_recall_message",
-                toolset="hermes-infoflow",
+                toolset="infoflow",
                 schema=RECALL_TOOL_SCHEMA,
                 handler=make_recall_handler(),
                 is_async=True,
@@ -1953,7 +1953,7 @@ def register(ctx: Any) -> None:
         try:
             register_tool(
                 name="infoflow_reply",
-                toolset="hermes-infoflow",
+                toolset="infoflow",
                 schema=REPLY_TOOL_SCHEMA,
                 handler=make_reply_handler(),
                 is_async=True,
@@ -1968,7 +1968,7 @@ def register(ctx: Any) -> None:
         try:
             register_tool(
                 name="infoflow_get_group_members",
-                toolset="hermes-infoflow",
+                toolset="infoflow",
                 schema=GROUP_MEMBERS_TOOL_SCHEMA,
                 handler=make_group_members_handler(),
                 is_async=True,
@@ -1984,7 +1984,7 @@ def register(ctx: Any) -> None:
         try:
             register_tool(
                 name="infoflow_get_message_history",
-                toolset="hermes-infoflow",
+                toolset="infoflow",
                 schema=HISTORY_TOOL_SCHEMA,
                 handler=make_history_handler(),
                 is_async=True,
