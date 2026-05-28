@@ -55,7 +55,7 @@ def test_template_requests_silent_tools(name: str) -> None:
     silence (no '我帮你看看 / 稍等' intermediate messages)."""
     text = RENDERED[name]
     assert "tools" in text, f"{name} lost the tools-allowed directive"
-    assert "静默" in text or "不发" in text, (
+    assert "静默" in text or "不发" in text or "发中间话" in text, (
         f"{name} lost the silent-exploration directive"
     )
 
@@ -66,10 +66,15 @@ def test_template_requests_silent_tools(name: str) -> None:
 )
 def test_template_blocks_refusal_outputs(name: str) -> None:
     """Templates that funnel through value-filtering must explicitly list
-    refusal patterns ('我没法 / 我无法 / 作为AI') so the main agent rewrites
-    them to NO_REPLY rather than shipping low-value text."""
+    refusal/deflection patterns so the main agent rewrites them to NO_REPLY
+    rather than shipping low-value text."""
     text = RENDERED[name]
-    assert "作为AI" in text or "我无法" in text or "我没法" in text, (
+    assert (
+        "作为AI" in text
+        or "我无法" in text
+        or "我没法" in text
+        or ("拒绝" in text and "转述" in text)
+    ), (
         f"{name} lost refusal-pattern guidance"
     )
 
@@ -90,9 +95,15 @@ def test_watch_mention_requires_skill_check_before_no_reply() -> None:
 
 def test_watch_regex_requires_strict_no_reply_output() -> None:
     text = RENDERED["watch_regex"]
-    assert "决定不回复时只输出 `NO_REPLY`" in text
-    assert "不得附加解释" in text
-    assert "不能代替处理" in text
+    assert "先查已有 skills" in text
+    assert "相关就用 skill" in text
+    assert "sender 是 bot" in text
+    assert "不得解释或发中间话" in text
+    assert "单独一行 NO_REPLY" in text
+    assert "crash" not in text.lower()
+    assert "报警" not in text
+    assert "故障" not in text
+    assert "技术告警" not in text
 
 
 def test_mention_path_forbids_no_reply() -> None:
