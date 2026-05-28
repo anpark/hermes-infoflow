@@ -37,7 +37,7 @@ import socket as _socket
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 from urllib.parse import urljoin as _urljoin
 from urllib.parse import urlparse as _urlparse
 
@@ -165,6 +165,7 @@ try:
         MessageEvent,
         MessageType,
         Platform,
+        ProcessingOutcome,
         SendResult,
         cache_image_from_bytes,
     )
@@ -175,6 +176,10 @@ except ImportError:
     MessageEvent = dict  # type: ignore[assignment,misc]
     MessageType = Any  # type: ignore[assignment,misc]
     Platform = Any  # type: ignore[assignment,misc]
+    class _ProcessingOutcomeFallback:
+        SUCCESS = "success"
+
+    ProcessingOutcome = _ProcessingOutcomeFallback  # type: ignore[assignment,misc]
     SendResult = dict  # type: ignore[assignment,misc]
 
     def cache_image_from_bytes(*a, **kw):  # type: ignore[misc]
@@ -412,6 +417,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         )
 
         self._http_session: aiohttp.ClientSession | None = None
+        self._infoflow_original_busy_session_handler = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -420,6 +426,214 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
     @property
     def name(self) -> str:
         return "Infoflow"
+
+    def set_busy_session_handler(
+        self,
+        handler: Callable[[Any, str], Awaitable[bool]] | None,
+    ) -> None:
+        """Wrap Hermes' busy handler so Infoflow text follow-ups can steer.
+
+        The wrapper is deliberately narrow: only ordinary Infoflow text messages
+        in isolated sessions steer. Everything else falls back to Hermes' normal
+        busy path.
+        """
+        self._infoflow_original_busy_session_handler = handler
+        if handler is None:
+            return super().set_busy_session_handler(None)
+        if getattr(handler, "_infoflow_busy_steer_wrapper", False) is True:
+            return super().set_busy_session_handler(handler)
+
+        async def _wrapped_busy_session_handler(event: Any, session_key: str) -> bool:
+            return await self._handle_infoflow_busy_message(
+                event,
+                session_key,
+                handler,
+            )
+
+        setattr(_wrapped_busy_session_handler, "_infoflow_busy_steer_wrapper", True)
+        return super().set_busy_session_handler(_wrapped_busy_session_handler)
+
+    async def _call_original_busy_session_handler(
+        self,
+        handler: Callable[[Any, str], Awaitable[bool]] | None,
+        event: Any,
+        session_key: str,
+    ) -> bool:
+        if handler is None:
+            return False
+        return bool(await handler(event, session_key))
+
+    @staticmethod
+    def _config_bool(raw: Any, *, default: bool) -> bool:
+        if isinstance(raw, bool):
+            return raw
+        if raw is None or raw == "":
+            return default
+        return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+    def _busy_steer_candidate(
+        self,
+        event: Any,
+        session_key: str,
+    ) -> tuple[bool, str, Any | None]:
+        if not self._config_bool(
+            self._settings.get("busy_text_steer_enabled"),
+            default=True,
+        ):
+            return False, "disabled", None
+
+        raw_message = getattr(event, "raw_message", None)
+        if not isinstance(raw_message, dict) or not raw_message.get(
+            "infoflow_standard_message"
+        ):
+            return False, "non_infoflow_standard_message", None
+
+        if getattr(event, "message_type", None) != MessageType.TEXT:
+            return False, "non_text_message", None
+        if getattr(event, "media_urls", None):
+            return False, "media_message", None
+
+        text = str(getattr(event, "text", "") or "").strip()
+        if not text:
+            return False, "empty_text", None
+
+        get_command = getattr(event, "get_command", None)
+        if callable(get_command):
+            with contextlib.suppress(Exception):
+                if get_command():
+                    return False, "command", None
+
+        source = getattr(event, "source", None)
+        if source is None:
+            return False, "missing_source", None
+
+        chat_type = str(getattr(source, "chat_type", "") or "")
+        if chat_type != "dm":
+            if not str(getattr(source, "user_id", "") or "").strip():
+                return False, "missing_group_user_id", None
+            thread_id = str(getattr(source, "thread_id", "") or "").strip()
+            if thread_id:
+                isolated = self._config_bool(
+                    self.config.extra.get("thread_sessions_per_user", False),
+                    default=False,
+                )
+                if not isolated:
+                    return False, "shared_thread_session", None
+            else:
+                isolated = self._config_bool(
+                    self.config.extra.get("group_sessions_per_user", True),
+                    default=True,
+                )
+                if not isolated:
+                    return False, "shared_group_session", None
+
+        gateway = getattr(self, "gateway_runner", None)
+        if gateway is None:
+            return False, "missing_gateway_runner", None
+        if bool(getattr(gateway, "_draining", False)):
+            return False, "gateway_draining", None
+
+        authorizer = getattr(gateway, "_is_user_authorized", None)
+        if not callable(authorizer):
+            return False, "missing_authorizer", None
+        try:
+            if not bool(authorizer(source)):
+                return False, "unauthorized", None
+        except Exception as exc:
+            gw_log().warning(
+                "[infoflow:busy-steer] auth check failed session_key=%s mid=%s: %s",
+                session_key,
+                self._event_message_id(event) or "-",
+                exc,
+                exc_info=True,
+            )
+            return False, "auth_error", None
+
+        running_agents = getattr(gateway, "_running_agents", None)
+        if not isinstance(running_agents, dict):
+            return False, "missing_running_agents", None
+        running_agent = running_agents.get(session_key)
+        steer = getattr(running_agent, "steer", None)
+        if not callable(steer):
+            return False, "missing_running_agent_steer", None
+
+        return True, "", running_agent
+
+    async def _handle_infoflow_busy_message(
+        self,
+        event: Any,
+        session_key: str,
+        original_handler: Callable[[Any, str], Awaitable[bool]] | None,
+    ) -> bool:
+        can_steer, reason, running_agent = self._busy_steer_candidate(
+            event,
+            session_key,
+        )
+        if not can_steer:
+            gw_log().debug(
+                "[infoflow:busy-steer] fallback session_key=%s mid=%s reason=%s",
+                session_key,
+                self._event_message_id(event) or "-",
+                reason,
+            )
+            if reason in {"unauthorized", "auth_error"} and original_handler is None:
+                return True
+            return await self._call_original_busy_session_handler(
+                original_handler,
+                event,
+                session_key,
+            )
+
+        original_text = str(getattr(event, "text", "") or "")
+        raw_message = getattr(event, "raw_message", None)
+        raw_snapshot = dict(raw_message) if isinstance(raw_message, dict) else None
+        accepted = False
+        tokens = self._bind_processing_context(event)
+        try:
+            await self._run_processing_hook("on_processing_start", event)
+            steer_text = str(getattr(event, "text", "") or "").strip()
+            try:
+                accepted = bool(running_agent.steer(steer_text))
+            except Exception as exc:
+                gw_log().warning(
+                    "[infoflow:busy-steer] steer failed session_key=%s mid=%s: %s",
+                    session_key,
+                    self._event_message_id(event) or "-",
+                    exc,
+                    exc_info=True,
+                )
+                accepted = False
+
+            if accepted:
+                gw_log().info(
+                    "[infoflow:busy-steer] session_key=%s mid=%s chat_type=%s accepted=true",
+                    session_key,
+                    self._event_message_id(event) or "-",
+                    str(getattr(getattr(event, "source", None), "chat_type", "") or ""),
+                )
+                await self._run_processing_hook(
+                    "on_processing_complete",
+                    event,
+                    ProcessingOutcome.SUCCESS,
+                )
+                return True
+        finally:
+            self._reset_processing_context(tokens)
+
+        event.text = original_text
+        if raw_snapshot is not None and isinstance(getattr(event, "raw_message", None), dict):
+            event.raw_message.clear()
+            event.raw_message.update(raw_snapshot)
+        gw_log().info(
+            "[infoflow:busy-steer] session_key=%s mid=%s accepted=false fallback=true",
+            session_key,
+            self._event_message_id(event) or "-",
+        )
+        return await self._call_original_busy_session_handler(
+            original_handler,
+            event,
+            session_key,
+        )
 
     def _missing_required(self) -> list[str]:
         missing = []

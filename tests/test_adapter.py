@@ -127,6 +127,7 @@ class _FakeGateway:
     def __init__(self, session_key: str, entry: SimpleNamespace):
         self.session_store = _FakeSessionStore(session_key, entry)
         self._running_agents = {}
+        self._draining = False
         self._agent_cache = {}
         self._agent_cache_lock = Lock()
         self._session_model_overrides = {session_key: {"model": "old"}}
@@ -140,6 +141,9 @@ class _FakeGateway:
 
     def _session_key_for_source(self, source) -> str:
         return next(iter(self.session_store._entries))
+
+    def _is_user_authorized(self, source) -> bool:
+        return True
 
     def _cleanup_agent_resources(self, agent) -> None:
         self.cleaned_agents.append(agent)
@@ -500,6 +504,301 @@ def test_processing_context_binding_replaces_inherited_values(configured_env) ->
                 token.var.reset(token)
 
     asyncio.run(_go())
+
+
+def _attach_busy_gateway(adapter, event, agent, *, authorized=True, draining=False):
+    session_key = adapter._llm_context_key_for_event(event)
+    entry = SimpleNamespace(
+        session_key=session_key,
+        session_id="busy-session",
+        updated_at=datetime.now(),
+        origin=event.source,
+    )
+    gateway = _FakeGateway(session_key, entry)
+    gateway._running_agents[session_key] = agent
+    gateway._draining = draining
+    gateway._is_user_authorized = lambda source: authorized
+    adapter.gateway_runner = gateway
+    return gateway, session_key
+
+
+def test_busy_steer_dm_text_runs_hooks_and_updates_context(
+    configured_env, monkeypatch, tmp_path,
+) -> None:
+    monkeypatch.setattr(ms, "_STATE_BASE_DIR", tmp_path)
+    adapter = InfoflowAdapter(_make_config())
+    adapter._bot.finish_processing_reaction = AsyncMock()
+    base_time = int(__import__("time").time() * 1000)
+    adapter._message_store.persist_dm(
+        message_id="D1",
+        dm_user_id="alice",
+        sender_id="alice",
+        content="previous unread",
+        created_time=base_time + 1_000,
+    )
+    adapter._message_store.persist_dm(
+        message_id="D2",
+        dm_user_id="alice",
+        sender_id="alice",
+        content="current",
+        created_time=base_time + 2_000,
+    )
+    source = adapter.build_source(
+        chat_id="alice",
+        chat_name="alice",
+        chat_type="dm",
+        user_id="alice",
+        user_name="alice",
+        message_id="D2",
+    )
+    event = MessageEvent(
+        text="[Message: message_id:'D2']\ncurrent",
+        message_type=MessageType.TEXT,
+        source=source,
+        raw_message={"infoflow_standard_message": True},
+        message_id="D2",
+    )
+    agent = MagicMock()
+    agent.steer = MagicMock(return_value=True)
+    _gateway, session_key = _attach_busy_gateway(adapter, event, agent)
+    original_handler = AsyncMock(return_value=True)
+    adapter.set_busy_session_handler(original_handler)
+
+    handled = asyncio.run(adapter._busy_session_handler(event, session_key))
+
+    assert handled is True
+    original_handler.assert_not_awaited()
+    agent.steer.assert_called_once()
+    steered_text = agent.steer.call_args.args[0]
+    assert steered_text.startswith(
+        "[Unread Message Context: 请优先调用 infoflow_get_message_history"
+    )
+    assert "before_count=1、after_count=0" in steered_text
+    assert event.raw_message["infoflow_unread_message_context_count"] == 1
+    adapter._bot.finish_processing_reaction.assert_awaited_once()
+    state = adapter._message_store.get_llm_context_state(session_key)
+    assert state is not None
+    assert state.last_llm_visible_message_id == "D2"
+    assert state.last_llm_visible_created_time == base_time + 2_000
+
+
+def test_busy_steer_group_same_user_text(configured_env) -> None:
+    adapter = InfoflowAdapter(_make_config())
+    adapter._bot.finish_processing_reaction = AsyncMock()
+    source = adapter.build_source(
+        chat_id="group:4507088",
+        chat_name="group:4507088",
+        chat_type="group",
+        user_id="bob",
+        user_name="bob",
+        message_id="G1",
+    )
+    event = MessageEvent(
+        text="[Message: message_id:'G1']\nfollow up",
+        message_type=MessageType.TEXT,
+        source=source,
+        raw_message={"infoflow_standard_message": True},
+        message_id="G1",
+    )
+    agent = MagicMock()
+    agent.steer = MagicMock(return_value=True)
+    _gateway, session_key = _attach_busy_gateway(adapter, event, agent)
+    original_handler = AsyncMock(return_value=True)
+    adapter.set_busy_session_handler(original_handler)
+
+    handled = asyncio.run(adapter._busy_session_handler(event, session_key))
+
+    assert handled is True
+    original_handler.assert_not_awaited()
+    agent.steer.assert_called_once_with("[Message: message_id:'G1']\nfollow up")
+    adapter._bot.finish_processing_reaction.assert_awaited_once()
+
+
+def test_busy_steer_group_missing_user_id_falls_back(configured_env) -> None:
+    adapter = InfoflowAdapter(_make_config())
+    source = adapter.build_source(
+        chat_id="group:4507088",
+        chat_name="group:4507088",
+        chat_type="group",
+        user_id="",
+        user_name="unknown",
+        message_id="G1",
+    )
+    event = MessageEvent(
+        text="[Message: message_id:'G1']\nfollow up",
+        message_type=MessageType.TEXT,
+        source=source,
+        raw_message={"infoflow_standard_message": True},
+        message_id="G1",
+    )
+    agent = MagicMock()
+    agent.steer = MagicMock(return_value=True)
+    _gateway, session_key = _attach_busy_gateway(adapter, event, agent)
+    original_handler = AsyncMock(return_value=True)
+    adapter.set_busy_session_handler(original_handler)
+
+    handled = asyncio.run(adapter._busy_session_handler(event, session_key))
+
+    assert handled is True
+    original_handler.assert_awaited_once_with(event, session_key)
+    agent.steer.assert_not_called()
+
+
+def test_busy_steer_shared_group_session_falls_back(configured_env) -> None:
+    cfg = _make_config()
+    cfg.extra = {"group_sessions_per_user": False}
+    adapter = InfoflowAdapter(cfg)
+    source = adapter.build_source(
+        chat_id="group:4507088",
+        chat_name="group:4507088",
+        chat_type="group",
+        user_id="bob",
+        user_name="bob",
+        message_id="G1",
+    )
+    event = MessageEvent(
+        text="[Message: message_id:'G1']\nfollow up",
+        message_type=MessageType.TEXT,
+        source=source,
+        raw_message={"infoflow_standard_message": True},
+        message_id="G1",
+    )
+    agent = MagicMock()
+    agent.steer = MagicMock(return_value=True)
+    _gateway, session_key = _attach_busy_gateway(adapter, event, agent)
+    original_handler = AsyncMock(return_value=True)
+    adapter.set_busy_session_handler(original_handler)
+
+    handled = asyncio.run(adapter._busy_session_handler(event, session_key))
+
+    assert handled is True
+    original_handler.assert_awaited_once_with(event, session_key)
+    agent.steer.assert_not_called()
+
+
+def test_busy_steer_command_media_auth_and_drain_fall_back(configured_env) -> None:
+    adapter = InfoflowAdapter(_make_config())
+    source = adapter.build_source(
+        chat_id="alice",
+        chat_name="alice",
+        chat_type="dm",
+        user_id="alice",
+        user_name="alice",
+        message_id="D1",
+    )
+    cases = [
+        {
+            "event": MessageEvent(
+                text="/new",
+                message_type=MessageType.TEXT,
+                source=source,
+                raw_message={"infoflow_standard_message": True},
+                message_id="D1",
+            ),
+            "authorized": True,
+            "draining": False,
+        },
+        {
+            "event": MessageEvent(
+                text="photo caption",
+                message_type=MessageType.PHOTO,
+                source=source,
+                raw_message={"infoflow_standard_message": True},
+                message_id="D2",
+                media_urls=["/tmp/photo.png"],
+            ),
+            "authorized": True,
+            "draining": False,
+        },
+        {
+            "event": MessageEvent(
+                text="not authorized",
+                message_type=MessageType.TEXT,
+                source=source,
+                raw_message={"infoflow_standard_message": True},
+                message_id="D3",
+            ),
+            "authorized": False,
+            "draining": False,
+        },
+        {
+            "event": MessageEvent(
+                text="during drain",
+                message_type=MessageType.TEXT,
+                source=source,
+                raw_message={"infoflow_standard_message": True},
+                message_id="D4",
+            ),
+            "authorized": True,
+            "draining": True,
+        },
+    ]
+    for case in cases:
+        event = case["event"]
+        agent = MagicMock()
+        agent.steer = MagicMock(return_value=True)
+        _gateway, session_key = _attach_busy_gateway(
+            adapter,
+            event,
+            agent,
+            authorized=case["authorized"],
+            draining=case["draining"],
+        )
+        original_handler = AsyncMock(return_value=True)
+        adapter.set_busy_session_handler(original_handler)
+
+        handled = asyncio.run(adapter._busy_session_handler(event, session_key))
+
+        assert handled is True
+        original_handler.assert_awaited_once_with(event, session_key)
+        agent.steer.assert_not_called()
+
+
+def test_busy_steer_failure_restores_event_and_falls_back(
+    configured_env, monkeypatch, tmp_path,
+) -> None:
+    monkeypatch.setattr(ms, "_STATE_BASE_DIR", tmp_path)
+    adapter = InfoflowAdapter(_make_config())
+    base_time = int(__import__("time").time() * 1000)
+    adapter._message_store.persist_dm(
+        message_id="D1",
+        dm_user_id="alice",
+        sender_id="alice",
+        content="current",
+        created_time=base_time + 1_000,
+    )
+    source = adapter.build_source(
+        chat_id="alice",
+        chat_name="alice",
+        chat_type="dm",
+        user_id="alice",
+        user_name="alice",
+        message_id="D1",
+    )
+    raw_message = {"infoflow_standard_message": True}
+    event = MessageEvent(
+        text="[Message: message_id:'D1']\ncurrent",
+        message_type=MessageType.TEXT,
+        source=source,
+        raw_message=raw_message,
+        message_id="D1",
+    )
+    original_text = event.text
+    original_raw = dict(event.raw_message)
+    agent = MagicMock()
+    agent.steer = MagicMock(return_value=False)
+    _gateway, session_key = _attach_busy_gateway(adapter, event, agent)
+    original_handler = AsyncMock(return_value=True)
+    adapter.set_busy_session_handler(original_handler)
+
+    handled = asyncio.run(adapter._busy_session_handler(event, session_key))
+
+    assert handled is True
+    agent.steer.assert_called_once()
+    original_handler.assert_awaited_once_with(event, session_key)
+    assert event.text == original_text
+    assert event.raw_message == original_raw
+    assert adapter._message_store.get_llm_context_state(session_key) is None
 
 
 def test_unread_message_context_line_injected_and_context_state_updated(

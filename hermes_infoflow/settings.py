@@ -204,6 +204,11 @@ def _read_account_settings(config: Any) -> dict[str, Any]:
             watch_regex_env if watch_regex_env else pick(WATCH_REGEX_ENV, "watch_regex", "")
         ),
         "follow_up_raw": pick("INFOFLOW_FOLLOW_UP", "follow_up", "true"),
+        "busy_text_steer_enabled_raw": pick(
+            "INFOFLOW_BUSY_TEXT_STEER_ENABLED",
+            "busy_text_steer_enabled",
+            "true",
+        ),
         "follow_up_window_raw": pick("INFOFLOW_FOLLOW_UP_WINDOW", "follow_up_window", "300"),
         "idle_session_reset_seconds_raw": pick(
             "INFOFLOW_IDLE_SESSION_RESET_SECONDS",
@@ -233,6 +238,10 @@ def _read_account_settings(config: Any) -> dict[str, Any]:
 
     settings["require_mention"] = _to_bool(settings.pop("require_mention_raw"), default=True)
     settings["follow_up"] = _to_bool(settings.pop("follow_up_raw"), default=True)
+    settings["busy_text_steer_enabled"] = _to_bool(
+        settings.pop("busy_text_steer_enabled_raw"),
+        default=True,
+    )
 
     try:
         fuw = settings.pop("follow_up_window_raw")
@@ -336,6 +345,7 @@ def _env_enablement() -> dict | None:
         ("INFOFLOW_REQUIRE_MENTION", "require_mention"),
         ("INFOFLOW_WATCH_MENTIONS", "watch_mentions"),
         ("INFOFLOW_FOLLOW_UP", "follow_up"),
+        ("INFOFLOW_BUSY_TEXT_STEER_ENABLED", "busy_text_steer_enabled"),
         ("INFOFLOW_FOLLOW_UP_WINDOW", "follow_up_window"),
         ("INFOFLOW_IDLE_SESSION_RESET_SECONDS", "idle_session_reset_seconds"),
         ("INFOFLOW_GROUPS", "groups"),

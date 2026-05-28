@@ -170,6 +170,24 @@ def test_read_settings_defaults_idle_session_reset_seconds(monkeypatch) -> None:
     assert DEFAULT_IDLE_SESSION_RESET_SECONDS == 2700
 
 
+def test_read_settings_defaults_busy_text_steer_enabled(monkeypatch) -> None:
+    monkeypatch.delenv("INFOFLOW_BUSY_TEXT_STEER_ENABLED", raising=False)
+    s = _read_account_settings(_cfg())
+    assert s["busy_text_steer_enabled"] is True
+
+
+def test_read_settings_busy_text_steer_enabled_from_env(monkeypatch) -> None:
+    monkeypatch.setenv("INFOFLOW_BUSY_TEXT_STEER_ENABLED", "false")
+    s = _read_account_settings(_cfg({"busy_text_steer_enabled": True}))
+    assert s["busy_text_steer_enabled"] is False
+
+
+def test_read_settings_busy_text_steer_enabled_from_config(monkeypatch) -> None:
+    monkeypatch.delenv("INFOFLOW_BUSY_TEXT_STEER_ENABLED", raising=False)
+    s = _read_account_settings(_cfg({"busy_text_steer_enabled": "off"}))
+    assert s["busy_text_steer_enabled"] is False
+
+
 def test_read_settings_idle_session_reset_seconds_from_env(monkeypatch) -> None:
     monkeypatch.setenv("INFOFLOW_IDLE_SESSION_RESET_SECONDS", "120")
     s = _read_account_settings(_cfg({"idle_session_reset_seconds": 300}))
@@ -212,6 +230,19 @@ def test_env_enablement_includes_idle_session_reset_seconds(monkeypatch) -> None
 
     assert seed is not None
     assert seed["idle_session_reset_seconds"] == "1800"
+
+
+def test_env_enablement_includes_busy_text_steer_enabled(monkeypatch) -> None:
+    monkeypatch.setenv("INFOFLOW_APP_KEY", "k")
+    monkeypatch.setenv("INFOFLOW_APP_SECRET", "s")
+    monkeypatch.setenv("INFOFLOW_CHECK_TOKEN", "tok")
+    monkeypatch.setenv("INFOFLOW_ENCODING_AES_KEY", "aes")
+    monkeypatch.setenv("INFOFLOW_BUSY_TEXT_STEER_ENABLED", "false")
+
+    seed = _env_enablement()
+
+    assert seed is not None
+    assert seed["busy_text_steer_enabled"] == "false"
 
 
 def test_env_enablement_includes_prefixed_watch_regex(monkeypatch) -> None:
