@@ -39,7 +39,7 @@ DEFAULT_INFOFLOW_PORT = 26521
 DIST_NAME = "hermes-infoflow"
 DEFAULT_HERMES_AGENT_FORK_URL = "https://github.com/chbo297/hermes-agent.git"
 DEFAULT_HERMES_AGENT_FORK_REMOTE = "chbo"
-DEFAULT_HERMES_AGENT_FORK_BRANCH = "fix/send-message-plugin-target-routing"
+DEFAULT_HERMES_AGENT_FORK_BRANCH = "bduse"
 
 _SKIP_DIR_NAMES = {
     ".git",
@@ -502,6 +502,17 @@ def _copy_filtered(src: Path, dst: Path) -> None:
             shutil.copy2(child, target)
 
 
+def _copy_docs(layout: SourceLayout, staging: Path) -> None:
+    source_docs = layout.source_root / "docs"
+    package_docs = layout.package_dir / "docs"
+    docs_dir = source_docs if source_docs.is_dir() else package_docs
+    if not docs_dir.is_dir():
+        return
+    docs_target = staging / "docs"
+    docs_target.mkdir(parents=True, exist_ok=True)
+    _copy_filtered(docs_dir, docs_target)
+
+
 def _build_staging(layout: SourceLayout) -> tuple[Path, Path]:
     tmp_root = Path(tempfile.mkdtemp(prefix="hermes-infoflow-normalize-"))
     try:
@@ -514,6 +525,7 @@ def _build_staging(layout: SourceLayout) -> tuple[Path, Path]:
         scripts_target = staging / "scripts"
         scripts_target.mkdir(parents=True, exist_ok=True)
         _copy_filtered(layout.scripts_dir, scripts_target)
+        _copy_docs(layout, staging)
 
         if not (staging / "__init__.py").is_file():
             raise SystemExit(f"staged plugin has no __init__.py: {staging}")

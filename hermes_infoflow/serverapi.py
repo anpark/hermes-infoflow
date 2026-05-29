@@ -22,9 +22,11 @@ import base64
 import concurrent.futures
 import contextlib
 import logging
+import os
+import re
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import Enum, StrEnum
 from typing import TYPE_CHECKING, Any
@@ -40,7 +42,7 @@ from .itypes import (
     RecallResult,
     ReplyInfo,
     ReplyTarget,
-    SendOptions,
+    SentMessageReceipt,
     SentResult,
     coerce_reply_target,
 )
@@ -53,6 +55,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _MAX_PREVIEW_LENGTH = 200
+_MAX_REPLY_PREVIEW_LENGTH = 100
+_INTERNAL_AT_MARKER_RE = re.compile(
+    r"(@[^\s()]+)\s+\((?:agent_id|user_id):[^)]*\)"
+)
 
 # Group member cache: {group_id: (members_list, timestamp)}
 _MEMBERS_CACHE: dict[str, tuple[list[GroupMember], float]] = {}
@@ -64,6 +70,10 @@ _MEMBERS_CACHE_TTL = 300  # 5 minutes
 _guarded_state: dict[str, dict] = {}  # group_id → {future, task, last_ts, last_result}
 _guarded_lock = threading.Lock()
 _DEBOUNCE_SECONDS = 3.0
+_MEDIA_DIRECTIVE_RE = re.compile(
+    r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|[^\s`"']+)[`"']?'''
+)
+_SEND_AT_RE = re.compile(r"@([^\s@\n]{1,30})(?=[\s]|$)")
 
 
 class GroupMembersFetchStatus(StrEnum):
@@ -163,6 +173,491 @@ def _normalize_body_item(item: Any) -> BodyItem:
 
 def _normalize_reply_targets(targets: list[Any]) -> list[ReplyTarget]:
     return [coerce_reply_target(target) for target in targets]
+
+
+def _warning(code: str, message: str) -> dict[str, str]:
+    return {"code": code, "message": message}
+
+
+def _safe_preview(text: Any, *, limit: int = _MAX_PREVIEW_LENGTH) -> str:
+    preview = str(text or "")
+    preview = re.sub(r"data:image/[^,\s]+,[A-Za-z0-9+/=]+", "[image]", preview)
+    preview = _INTERNAL_AT_MARKER_RE.sub(r"\1", preview)
+    preview = preview.replace("\x00", "")
+    preview = re.sub(r"\s+", " ", preview).strip()
+    if limit > 0 and len(preview) > limit:
+        return preview[: max(0, limit - 3)].rstrip() + "..."
+    return preview
+
+
+def _safe_reply_preview(text: Any, *, limit: int = _MAX_REPLY_PREVIEW_LENGTH) -> str:
+    preview = _safe_preview(text, limit=0)
+    if limit > 0 and len(preview) > limit:
+        return preview[:limit].rstrip() + "..."
+    return preview
+
+
+def _coerce_string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, (list, tuple, set)):
+        return [str(item) for item in value if str(item or "").strip()]
+    return [str(value)] if str(value or "").strip() else []
+
+
+def _dedupe_keep_order(values: list[str]) -> tuple[list[str], bool]:
+    seen: set[str] = set()
+    out: list[str] = []
+    deduped = False
+    for value in values:
+        item = str(value or "").strip()
+        if not item:
+            continue
+        if item in seen:
+            deduped = True
+            continue
+        seen.add(item)
+        out.append(item)
+    return out, deduped
+
+
+def _normalize_intent_format(value: Any) -> tuple[str, str | None]:
+    fmt = str(value or "auto").strip().lower()
+    if not fmt:
+        fmt = "auto"
+    if fmt == "md":
+        fmt = "markdown"
+    if fmt not in {"auto", "text", "markdown"}:
+        return "", "format must be one of: auto, text, markdown"
+    return fmt, None
+
+
+def _quote_stripped_path(raw: str) -> str:
+    path = str(raw or "").strip()
+    if len(path) >= 2 and path[0] == path[-1] and path[0] in "`\"'":
+        path = path[1:-1].strip()
+    return os.path.expanduser(path.lstrip("`\"'").rstrip("`\"',.;:)}]"))
+
+
+def _parse_message_segments(
+    message: Any,
+    image_paths: Any,
+) -> tuple[list[dict[str, Any]], str | None, bool]:
+    text = str(message or "")
+    segments: list[dict[str, Any]] = []
+    malformed = False
+    pos = 0
+    for match in _MEDIA_DIRECTIVE_RE.finditer(text):
+        before = text[pos:match.start()]
+        if before.strip():
+            segments.append({"kind": "text", "text": before})
+        path = _quote_stripped_path(match.group("path"))
+        if path:
+            segments.append({"kind": "image", "path": path})
+        else:
+            malformed = True
+        pos = match.end()
+    tail = text[pos:]
+    if tail.strip():
+        segments.append({"kind": "text", "text": tail})
+    if "MEDIA:" in text and not any(seg["kind"] == "image" for seg in segments):
+        malformed = True
+    if malformed:
+        return [], (
+            "MEDIA directive must point to a supported local image path; "
+            "not sending local path text"
+        ), False
+
+    for raw_path in _coerce_string_list(image_paths):
+        path = _quote_stripped_path(raw_path)
+        if path:
+            segments.append({"kind": "image", "path": path})
+
+    seen_paths: set[str] = set()
+    deduped = False
+    deduped_segments: list[dict[str, Any]] = []
+    for seg in segments:
+        if seg["kind"] != "image":
+            if str(seg.get("text") or "").strip():
+                deduped_segments.append(seg)
+            continue
+        path = seg["path"]
+        key = os.path.abspath(os.path.expanduser(path))
+        if key in seen_paths:
+            deduped = True
+            continue
+        seen_paths.add(key)
+        deduped_segments.append({"kind": "image", "path": path})
+    return deduped_segments, None, deduped
+
+
+def _append_image_byte_segments(
+    segments: list[dict[str, Any]],
+    image_bytes: Any,
+) -> tuple[str | None, bool]:
+    if image_bytes is None or image_bytes == "" or image_bytes == []:
+        return None, False
+    raw_items = image_bytes if isinstance(image_bytes, (list, tuple)) else [image_bytes]
+    appended = False
+    for raw in raw_items:
+        if isinstance(raw, bytes):
+            data = raw
+        elif isinstance(raw, bytearray):
+            data = bytes(raw)
+        elif isinstance(raw, memoryview):
+            data = raw.tobytes()
+        else:
+            return "image_bytes must be bytes or a list of bytes", appended
+        segments.append({"kind": "image_bytes", "bytes": data})
+        appended = True
+    return None, appended
+
+
+def _parse_link_value(value: str) -> tuple[str, str]:
+    raw = str(value or "").strip()
+    markdown = re.fullmatch(r"\[([^\]\n]+)\]\(([^)\s]+)\)", raw)
+    if markdown:
+        label = markdown.group(1).strip()
+        href = markdown.group(2).strip()
+        if href:
+            return href, label or href
+    if raw.startswith("[") and "]" in raw:
+        idx = raw.index("]")
+        label = raw[1:idx].strip()
+        href = raw[idx + 1:].strip()
+        if label and href:
+            return href, label
+    return raw, raw
+
+
+def _normalize_links(value: Any) -> tuple[list[dict[str, str]], str | None, bool]:
+    if value in (None, "", []):
+        return [], None, False
+    raw_items = value if isinstance(value, list) else [value]
+    links: list[dict[str, str]] = []
+    for raw in raw_items:
+        if isinstance(raw, str):
+            href, label = _parse_link_value(raw)
+        elif isinstance(raw, dict):
+            href = str(raw.get("href") or "").strip()
+            label = str(raw.get("label") or "").strip() or href
+        else:
+            return [], "links items must be strings or {href, label} objects", False
+        if not href:
+            return [], "links.href is required", False
+        links.append({"href": href, "label": label or href})
+
+    seen: set[tuple[str, str]] = set()
+    out: list[dict[str, str]] = []
+    deduped = False
+    for link in links:
+        key = (link["href"], link["label"])
+        if key in seen:
+            deduped = True
+            continue
+        seen.add(key)
+        out.append(link)
+    return out, None, deduped
+
+
+def _validate_serverapi_reply_to(
+    value: Any,
+) -> tuple[list[dict[str, str]], str | None]:
+    if value in (None, [], ""):
+        return [], None
+    if not isinstance(value, list):
+        return [], "reply_to must be normalized to an array of objects"
+    targets: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            return [], "reply_to items must be objects"
+        unsupported = sorted(set(item) - {"message_id", "preview", "sender_imid"})
+        if unsupported:
+            return [], "reply_to items only support message_id, preview, and sender_imid"
+        message_id = str(item.get("message_id") or "").strip()
+        if not message_id:
+            return [], "reply_to.message_id is required"
+        target = {"message_id": message_id}
+        preview = _safe_preview(item.get("preview") or "", limit=0)
+        if preview:
+            target["preview"] = preview
+        sender_imid = str(item.get("sender_imid") or "").strip()
+        if sender_imid:
+            if not sender_imid.isdigit():
+                return [], "reply_to.sender_imid must be numeric when provided"
+            target["sender_imid"] = sender_imid
+        targets.append(target)
+    return targets, None
+
+
+_GROUP_BODY_TYPES = {"TEXT", "MD", "AT", "LINK", "IMAGE"}
+_PRIVATE_RICHTEXT_TYPES = {"text", "a"}
+
+
+def _validate_group_structured_body(
+    body: list[dict[str, Any]],
+) -> str | None:
+    for idx, item in enumerate(body):
+        if not isinstance(item, dict):
+            return f"group body item {idx} must be an object"
+        item_type = item.get("type")
+        if item_type not in _GROUP_BODY_TYPES:
+            return "group body item type must be one of: TEXT, MD, AT, LINK, IMAGE"
+        if item_type == "LINK" and not str(item.get("href") or "").strip():
+            return "group LINK body items require href"
+    return None
+
+
+def _validate_group_structured_semantics(
+    *,
+    msgtype: str,
+    body: list[dict[str, Any]],
+    has_reply: bool,
+) -> str | None:
+    types = [str(item.get("type") or "") for item in body]
+    type_set = set(types)
+    if msgtype == "MD":
+        if has_reply:
+            return "group MD payloads do not support reply_to"
+        unsupported = type_set - {"AT", "MD"}
+        if unsupported:
+            return "group msgtype MD only supports AT and MD body items"
+        if "MD" not in type_set:
+            return "group msgtype MD requires an MD body item"
+        if types.count("MD") > 1:
+            return "group msgtype MD supports exactly one MD body item"
+        if types.count("AT") > 1:
+            return "group msgtype MD supports at most one AT body item"
+        return None
+    if msgtype == "TEXT":
+        unsupported = type_set - {"TEXT", "AT", "LINK"}
+        if unsupported:
+            return "group msgtype TEXT only supports TEXT, AT, and LINK body items"
+        return None
+    if msgtype == "IMAGE":
+        unsupported = type_set - {"TEXT", "AT", "LINK", "IMAGE"}
+        if unsupported:
+            return "group msgtype IMAGE only supports TEXT, AT, LINK, and IMAGE body items"
+        if "IMAGE" not in type_set:
+            return "group msgtype IMAGE requires an IMAGE body item"
+        return None
+    return None
+
+
+def _validate_private_richtext_content(
+    value: list[dict[str, str]],
+) -> tuple[list[dict[str, str]], str | None]:
+    if not isinstance(value, list):
+        return [], "private richtext content must be an array"
+    content: list[dict[str, str]] = []
+    for idx, item in enumerate(value):
+        if not isinstance(item, dict):
+            return [], f"private richtext item {idx} must be an object"
+        item_type = item.get("type")
+        if item_type not in _PRIVATE_RICHTEXT_TYPES:
+            return [], "private richtext item type must be text or a"
+        copied = dict(item)
+        if item_type == "a":
+            if not str(copied.get("href") or "").strip():
+                return [], "private richtext link items require href"
+            if not str(copied.get("label") or "").strip():
+                return [], "private richtext link items require label"
+        content.append(copied)
+    return content, None
+
+
+def _at_item(
+    *,
+    at_all: bool = False,
+    user_ids: list[str] | None = None,
+    agent_ids: list[int] | None = None,
+) -> dict[str, Any] | None:
+    item: dict[str, Any] = {"type": "AT"}
+    if at_all:
+        item["atall"] = True
+    if user_ids:
+        item["atuserids"] = user_ids
+    if agent_ids:
+        item["atagentids"] = agent_ids
+    return item if len(item) > 1 else None
+
+
+def _group_at_placeholders(item: dict[str, Any]) -> list[str]:
+    placeholders: list[str] = []
+    if item.get("atall"):
+        placeholders.append("@all")
+    for uid in item.get("atuserids") or []:
+        uid_s = str(uid or "").strip()
+        if uid_s:
+            placeholders.append(f"@{uid_s}")
+    for aid in item.get("atagentids") or []:
+        aid_s = str(aid or "").strip()
+        if aid_s:
+            placeholders.append(f"@{aid_s}")
+    return placeholders
+
+
+def _retag_group_text_body_items(
+    body: list[dict[str, Any]],
+    text_type: str,
+) -> list[dict[str, Any]]:
+    text_item_type = "MD" if str(text_type or "").upper() == "MD" else "TEXT"
+    retagged: list[dict[str, Any]] = []
+    for item in body:
+        if str(item.get("type") or "").upper() in ("TEXT", "MD"):
+            copied = dict(item)
+            copied["type"] = text_item_type
+            retagged.append(copied)
+        else:
+            retagged.append(item)
+    return retagged
+
+
+def _normalize_group_non_md_at_items(
+    body: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Collapse duplicate group AT items for TEXT/IMAGE packets.
+
+    Infoflow accepts separate native AT items for @all and specific targets,
+    but duplicate @all items can make otherwise valid IMAGE/TEXT packets fail.
+    """
+    at_all = False
+    user_ids: list[str] = []
+    agent_ids: list[int] = []
+    first_at_index: int | None = None
+    for idx, item in enumerate(body):
+        if str(item.get("type") or "").upper() != "AT":
+            continue
+        if first_at_index is None:
+            first_at_index = idx
+        at_all = at_all or bool(item.get("atall"))
+        for uid in item.get("atuserids") or []:
+            uid_s = str(uid or "").strip()
+            if uid_s and uid_s not in user_ids:
+                user_ids.append(uid_s)
+        for aid in item.get("atagentids") or []:
+            try:
+                aid_i = int(aid)
+            except (TypeError, ValueError):
+                continue
+            if aid_i not in agent_ids:
+                agent_ids.append(aid_i)
+    if first_at_index is None:
+        return body
+
+    normalized_at: list[dict[str, Any]] = []
+    if at_all:
+        at_item = _at_item(at_all=True)
+        if at_item:
+            normalized_at.append(at_item)
+    specific = _at_item(user_ids=user_ids, agent_ids=agent_ids)
+    if specific:
+        normalized_at.append(specific)
+
+    out: list[dict[str, Any]] = []
+    inserted = False
+    for item in body:
+        if str(item.get("type") or "").upper() == "AT":
+            if not inserted:
+                out.extend(dict(at_item) for at_item in normalized_at)
+                inserted = True
+            continue
+        out.append(item)
+    return out
+
+
+def _merged_group_at_item(body: list[dict[str, Any]]) -> dict[str, Any] | None:
+    at_all = False
+    user_ids: list[str] = []
+    agent_ids: list[int] = []
+    for item in body:
+        if str(item.get("type") or "").upper() != "AT":
+            continue
+        at_all = at_all or bool(item.get("atall"))
+        for uid in item.get("atuserids") or []:
+            uid_s = str(uid or "").strip()
+            if uid_s and uid_s not in user_ids:
+                user_ids.append(uid_s)
+        for aid in item.get("atagentids") or []:
+            try:
+                aid_i = int(aid)
+            except (TypeError, ValueError):
+                continue
+            if aid_i not in agent_ids:
+                agent_ids.append(aid_i)
+    return _at_item(at_all=at_all, user_ids=user_ids, agent_ids=agent_ids)
+
+
+def _group_md_body_items(body: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    at_item = _merged_group_at_item(body)
+    md_content = "".join(
+        str(item.get("content") or "")
+        for item in body
+        if str(item.get("type") or "").upper() in ("TEXT", "MD")
+    )
+    if at_item is not None:
+        if at_item.get("atall"):
+            md_content = md_content.replace("@所有人", "@all")
+            md_content = md_content.replace("@All", "@all")
+            md_content = md_content.replace("@ALL", "@all")
+        missing = [
+            placeholder
+            for placeholder in _group_at_placeholders(at_item)
+            if placeholder not in md_content
+        ]
+        if missing:
+            md_content = " ".join(missing) + (f" {md_content}" if md_content else "")
+        if at_item.get("atall"):
+            at_item = {"type": "AT", "atall": True}
+    out: list[dict[str, Any]] = []
+    if at_item is not None:
+        out.append(at_item)
+    out.append({"type": "MD", "content": md_content})
+    return out
+
+
+def _body_preview(body: list[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    has_md = any(
+        str(item.get("type") or "").upper() == "MD"
+        and bool(str(item.get("content") or ""))
+        for item in body
+    )
+    for item in body:
+        item_type = str(item.get("type") or "").upper()
+        if item_type in ("TEXT", "MD"):
+            if item.get("content"):
+                parts.append(str(item.get("content") or ""))
+        elif item_type == "IMAGE":
+            parts.append("[image]")
+        elif item_type == "LINK":
+            parts.append(str(item.get("label") or item.get("href") or ""))
+        elif item_type == "AT":
+            if has_md:
+                continue
+            parts.extend(_group_at_placeholders(item))
+    return _safe_preview(" ".join(parts))
+
+
+def _receipt_kind(body: list[dict[str, Any]], *, default: str = "text") -> str:
+    has_at = any(str(item.get("type") or "").upper() == "AT" for item in body)
+    has_image = any(str(item.get("type") or "").upper() == "IMAGE" for item in body)
+    has_link = any(str(item.get("type") or "").upper() == "LINK" for item in body)
+    has_text = any(
+        str(item.get("type") or "").upper() in ("TEXT", "MD")
+        and bool(str(item.get("content") or ""))
+        for item in body
+    )
+    display_count = sum([has_at, has_image, has_link, has_text])
+    if display_count > 1:
+        return "mixed"
+    if has_image:
+        return "image"
+    if has_link:
+        return "richtext"
+    return default
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +782,12 @@ class ServerAPI:
     shared with :class:`Bot` for all Infoflow interactions.
     """
 
-    def __init__(self, *, settings: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        *,
+        settings: dict[str, Any],
+        image_loader: Callable[[str], Awaitable[bytes] | bytes] | None = None,
+    ) -> None:
         self._settings = settings
         api_host = settings.get("api_host", "")
         if not api_host or "baidu" not in api_host:
@@ -312,6 +812,7 @@ class ServerAPI:
         )
         self._http_session: aiohttp.ClientSession | None = None
         self._group_members_observer: Callable[[str, list[GroupMember]], None] | None = None
+        self._image_loader = image_loader
 
     # ------------------------------------------------------------------
     # Properties
@@ -344,6 +845,12 @@ class ServerAPI:
         observer: Callable[[str, list[GroupMember]], None] | None,
     ) -> None:
         self._group_members_observer = observer
+
+    def set_image_loader(
+        self,
+        loader: Callable[[str], Awaitable[bytes] | bytes] | None,
+    ) -> None:
+        self._image_loader = loader
 
     # ------------------------------------------------------------------
     # Session helpers
@@ -436,146 +943,625 @@ class ServerAPI:
         )
 
     # ------------------------------------------------------------------
-    # Send — group
+    # Send — intent payloads for tool-level reply/AT/media support
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _build_contents(
-        text: str, options: SendOptions | None
-    ) -> list[_api.ContentItem]:
-        """Translate bot-layer send params → Infoflow ``ContentItem[]``.
+    async def _load_intent_image_bytes(self, image_path: str) -> tuple[bytes | None, str | None]:
+        if self._image_loader is None:
+            return None, "Infoflow image loader is unavailable"
+        try:
+            value = self._image_loader(str(image_path))
+            if hasattr(value, "__await__"):
+                value = await value  # type: ignore[assignment]
+            return bytes(value or b""), None
+        except _ImageLoadError as exc:
+            return None, str(exc)
+        except Exception as exc:
+            return None, str(exc)
 
-        Always emits markdown ContentItems; AT items are prepended as needed.
-        """
-        options = options or SendOptions()
-        items: list[_api.ContentItem] = []
-        at_prefix_parts: list[str] = []
-
-        # --- AT items (independent — at_all, users, agents can coexist) ---
-        if options.at_all:
-            items.append(_api.ContentItem("at", "all"))
-            text_lower = text.lower()
-            if text and "@all" not in text_lower and "@所有人" not in text:
-                at_prefix_parts.append("@all")
-
-        if options.mention_user_ids:
-            user_ids_for_api: list[str] = []
-            for uid in (s.strip() for s in options.mention_user_ids.split(",") if s.strip()):
-                user_ids_for_api.append(uid)
-                if not (text and f"@{uid}" in text):
-                    at_prefix_parts.append(f"@{uid}")
-            if user_ids_for_api:
-                items.append(_api.ContentItem("at", ",".join(user_ids_for_api)))
-
-        if options.mention_agent_ids:
-            agent_ids_for_api: list[str] = []
-            for aid in (s.strip() for s in options.mention_agent_ids.split(",") if s.strip()):
-                agent_ids_for_api.append(aid)
-                if not (text and f"@{aid}" in text):
-                    at_prefix_parts.append(f"@{aid}")
-            if agent_ids_for_api:
-                items.append(_api.ContentItem("at-agent", ",".join(agent_ids_for_api)))
-
-        # --- Markdown (always MD) ---
-        if text:
-            if at_prefix_parts:
-                text = " ".join(at_prefix_parts) + " " + text
-            items.append(_api.ContentItem("markdown", text))
-        return items
-
-    async def send_to_group(
+    async def _group_member_maps(
         self,
         group_id: str,
-        text: str,
         *,
-        reply_info: ReplyInfo | None = None,
-        options: SendOptions | None = None,
+        session: aiohttp.ClientSession | None,
+    ) -> dict[str, Any]:
+        try:
+            members = await self.get_group_members(str(group_id), session=session)
+        except Exception:
+            return {}
+        human_uids = {str(m.uid) for m in members if not getattr(m, "is_bot", False)}
+        bot_aids = {
+            int(getattr(m, "agent_id", 0) or 0)
+            for m in members
+            if getattr(m, "is_bot", False) and int(getattr(m, "agent_id", 0) or 0)
+        }
+        bot_names = {
+            str(getattr(m, "name", "") or "").lower(): int(getattr(m, "agent_id", 0) or 0)
+            for m in members
+            if getattr(m, "is_bot", False)
+            and str(getattr(m, "name", "") or "")
+            and int(getattr(m, "agent_id", 0) or 0)
+        }
+        return {"human_uids": human_uids, "bot_aids": bot_aids, "bot_names": bot_names}
+
+    def _normalize_group_mentions(
+        self,
+        *,
+        at_all: Any,
+        mention_user_ids: Any,
+        mention_agent_ids: Any,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, str]], str | None]:
+        warnings: list[dict[str, str]] = []
+        raw_users: list[str] = []
+        for raw in _coerce_string_list(mention_user_ids):
+            item = raw.strip()
+            if item.startswith("infoflow:"):
+                item = item[len("infoflow:"):].strip()
+            if item.startswith("bot:"):
+                return [], [], "mention_user_ids only accepts human uuapName values"
+            if item.startswith("user:"):
+                item = item[len("user:"):].strip()
+            if item:
+                raw_users.append(item)
+        user_ids, users_deduped = _dedupe_keep_order(raw_users)
+
+        raw_agent_ids: list[str] = []
+        self_agent_id = str(self._settings.get("app_agent_id") or "").strip()
+        skipped_self = False
+        for raw in _coerce_string_list(mention_agent_ids):
+            item = raw.strip()
+            if item.startswith("infoflow:"):
+                item = item[len("infoflow:"):].strip()
+            if item.startswith("bot:"):
+                item = item[len("bot:"):].strip()
+            if item.startswith("user:"):
+                return [], [], "mention_agent_ids only accepts robot agentId values"
+            if not item:
+                continue
+            if not item.isdigit():
+                return [], [], f"mention_agent_ids must be numeric agentIds: {item}"
+            if self_agent_id and item == self_agent_id:
+                skipped_self = True
+                continue
+            raw_agent_ids.append(item)
+        agent_id_texts, agents_deduped = _dedupe_keep_order(raw_agent_ids)
+        agent_ids = [int(item) for item in agent_id_texts]
+
+        if users_deduped or agents_deduped:
+            warnings.append(_warning("deduplicated", "duplicate mentions were removed"))
+        if skipped_self:
+            warnings.append(_warning("self_mention_skipped", "current bot self mention was skipped"))
+
+        items: list[dict[str, Any]] = []
+        if coerce_bool(at_all):
+            at_item = _at_item(at_all=True)
+            if at_item:
+                items.append(at_item)
+        specific = _at_item(user_ids=user_ids, agent_ids=agent_ids)
+        if specific:
+            items.append(specific)
+        return items, warnings, None
+
+    def _group_text_body_items(
+        self,
+        text: str,
+        maps: dict[str, Any],
+        *,
+        text_type: str,
+        skip_at_all: bool = False,
+        skip_user_ids: set[str] | None = None,
+        skip_agent_ids: set[int] | None = None,
+    ) -> list[dict[str, Any]]:
+        if not text:
+            return []
+        text_item_type = "MD" if str(text_type or "").upper() == "MD" else "TEXT"
+        preserve_at_placeholders = text_item_type == "MD"
+        if not maps:
+            return [{"type": text_item_type, "content": text}]
+        human_uids: set[str] = maps.get("human_uids") or set()
+        bot_aids: set[int] = maps.get("bot_aids") or set()
+        bot_names: dict[str, int] = maps.get("bot_names") or {}
+        try:
+            self_aid = int(self._settings.get("app_agent_id") or 0)
+        except (TypeError, ValueError):
+            self_aid = 0
+        skip_user_ids = skip_user_ids or set()
+        skip_agent_ids = skip_agent_ids or set()
+        out: list[dict[str, Any]] = []
+        pos = 0
+        for match in _SEND_AT_RE.finditer(text):
+            if match.start() > 0 and text[match.start() - 1] not in " \t\r\n":
+                continue
+            token = match.group(1)
+            token_lower = token.lower()
+            item: dict[str, Any] | None = None
+            if token_lower in ("all", "所有人"):
+                if not skip_at_all:
+                    item = _at_item(at_all=True)
+            elif token.isdigit():
+                aid = int(token)
+                if aid != self_aid and aid in bot_aids and aid not in skip_agent_ids:
+                    item = _at_item(agent_ids=[aid])
+            elif token in human_uids:
+                if token not in skip_user_ids:
+                    item = _at_item(user_ids=[token])
+            elif token_lower in bot_names:
+                aid = bot_names[token_lower]
+                if aid != self_aid and aid not in skip_agent_ids:
+                    item = _at_item(agent_ids=[aid])
+
+            if item is None:
+                continue
+            text_end = match.end() if preserve_at_placeholders else match.start()
+            if text_end > pos:
+                out.append({"type": text_item_type, "content": text[pos:text_end]})
+            out.append(item)
+            pos = match.end()
+        if pos < len(text):
+            out.append({"type": text_item_type, "content": text[pos:]})
+        return out or [{"type": text_item_type, "content": text}]
+
+    async def _build_group_packets(
+        self,
+        *,
+        group_id: str,
+        segments: list[dict[str, Any]],
+        links: list[dict[str, str]],
+        explicit_at_items: list[dict[str, Any]],
+        force_text_payload: bool,
+        format_mode: str,
+        session: aiohttp.ClientSession | None,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        maps = await self._group_member_maps(group_id, session=session)
+        has_any_image = any(seg["kind"] in ("image", "image_bytes") for seg in segments)
+        packets: list[dict[str, Any]] = []
+        current: list[dict[str, Any]] = []
+        explicit_added = False
+        current_has_image = False
+        explicit_at_all = False
+        explicit_user_ids: set[str] = set()
+        explicit_agent_ids: set[int] = set()
+        for item in explicit_at_items:
+            explicit_at_all = explicit_at_all or bool(item.get("atall"))
+            for uid in item.get("atuserids") or []:
+                uid_s = str(uid or "").strip()
+                if uid_s:
+                    explicit_user_ids.add(uid_s)
+            for aid in item.get("atagentids") or []:
+                try:
+                    explicit_agent_ids.add(int(aid))
+                except (TypeError, ValueError):
+                    continue
+
+        def ensure_explicit_at() -> None:
+            nonlocal explicit_added
+            if not explicit_added:
+                current.extend(dict(item) for item in explicit_at_items)
+                explicit_added = True
+
+        def flush_current() -> None:
+            nonlocal current, current_has_image
+            if not current:
+                return
+            has_text = any(
+                str(item.get("type") or "").upper() in ("TEXT", "MD")
+                and bool(str(item.get("content") or ""))
+                for item in current
+            )
+            if current_has_image:
+                msgtype = "IMAGE"
+                body = _normalize_group_non_md_at_items(
+                    _retag_group_text_body_items(current, "TEXT")
+                )
+            elif force_text_payload or format_mode == "text" or not has_text:
+                msgtype = "TEXT"
+                body = _normalize_group_non_md_at_items(
+                    _retag_group_text_body_items(current, "TEXT")
+                )
+            else:
+                msgtype = "MD"
+                body = _group_md_body_items(current)
+            packets.append({
+                "body": body,
+                "msgtype": msgtype,
+                "kind": _receipt_kind(body, default="markdown" if msgtype == "MD" else "text"),
+                "preview": _body_preview(body) or ("[image]" if current_has_image else ""),
+            })
+            current = []
+            current_has_image = False
+
+        for seg in segments:
+            ensure_explicit_at()
+            if seg["kind"] == "text":
+                text_type = "TEXT" if (
+                    force_text_payload
+                    or has_any_image
+                    or format_mode == "text"
+                ) else "MD"
+                current.extend(
+                    self._group_text_body_items(
+                        seg.get("text") or "",
+                        maps,
+                        text_type=text_type,
+                        skip_at_all=explicit_at_all,
+                        skip_user_ids=explicit_user_ids,
+                        skip_agent_ids=explicit_agent_ids,
+                    )
+                )
+                continue
+            if seg["kind"] in ("image", "image_bytes"):
+                if seg["kind"] == "image":
+                    raw, err = await self._load_intent_image_bytes(seg["path"])
+                    if err:
+                        return [], err
+                else:
+                    raw = bytes(seg.get("bytes") or b"")
+                try:
+                    prepared = prepare_infoflow_image_bytes(raw or b"")
+                except _ImageLoadError as exc:
+                    return [], str(exc)
+                if current_has_image:
+                    flush_current()
+                    ensure_explicit_at()
+                current.append({
+                    "type": "IMAGE",
+                    "content": base64.b64encode(prepared.data).decode("ascii"),
+                })
+                current_has_image = True
+
+        ensure_explicit_at()
+        for link in links:
+            current.append({"type": "LINK", "href": link["href"], "label": link["label"]})
+        flush_current()
+        return packets, None
+
+    async def _build_private_packets(
+        self,
+        *,
+        segments: list[dict[str, Any]],
+        links: list[dict[str, str]],
+        has_reply: bool,
+        format_mode: str,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        packets: list[dict[str, Any]] = []
+        image_segments = [
+            seg for seg in segments if seg["kind"] in ("image", "image_bytes")
+        ]
+        text = "".join(seg.get("text") or "" for seg in segments if seg["kind"] == "text")
+        if links:
+            content: list[dict[str, str]] = []
+            if text:
+                content.append({"type": "text", "text": text})
+            content.extend(
+                {"type": "a", "href": link["href"], "label": link["label"]}
+                for link in links
+            )
+            packets.append({
+                "kind": "richtext",
+                "richtext_content": content,
+                "preview": _safe_preview(" ".join([text, *[link["label"] for link in links]])),
+            })
+            for seg in image_segments:
+                if seg["kind"] == "image":
+                    raw, err = await self._load_intent_image_bytes(seg["path"])
+                    if err:
+                        return [], err
+                else:
+                    raw = bytes(seg.get("bytes") or b"")
+                packets.append({"kind": "image", "image_bytes": raw or b"", "preview": "[image]"})
+            return packets, None
+
+        for seg in segments:
+            if seg["kind"] == "text":
+                body = seg.get("text") or ""
+                if not body:
+                    continue
+                if format_mode == "text" or has_reply:
+                    packets.append({"kind": "text", "text": body, "preview": _safe_preview(body)})
+                else:
+                    packets.append({"kind": "markdown", "markdown": body, "preview": _safe_preview(body)})
+                continue
+            if seg["kind"] == "image":
+                raw, err = await self._load_intent_image_bytes(seg["path"])
+                if err:
+                    return [], err
+            else:
+                raw = bytes(seg.get("bytes") or b"")
+            packets.append({"kind": "image", "image_bytes": raw or b"", "preview": "[image]"})
+        return packets, None
+
+    @staticmethod
+    def _receipts_from_result(
+        result: SentResult,
+        *,
+        fallback_kind: str,
+        fallback_preview: str,
+    ) -> list[SentMessageReceipt]:
+        if result.sent_messages:
+            return list(result.sent_messages)
+        receipts: list[SentMessageReceipt] = []
+        continuation_ids = list(result.continuation_message_ids or ())
+        continuation_seqs = list(result.continuation_msgseqids or ())
+        for idx, mid in enumerate(continuation_ids):
+            mid_s = str(mid or "")
+            if not mid_s:
+                continue
+            receipts.append(SentMessageReceipt(
+                message_id=mid_s,
+                msgseqid=str(continuation_seqs[idx] if idx < len(continuation_seqs) else ""),
+                kind=fallback_kind,
+                preview=fallback_preview,
+            ))
+        if result.message_id and all(r.message_id != result.message_id for r in receipts):
+            receipts.append(SentMessageReceipt(
+                message_id=result.message_id,
+                msgseqid=result.msgseqid,
+                kind=fallback_kind,
+                preview=fallback_preview,
+            ))
+        return receipts
+
+    @staticmethod
+    def _result_from_receipts(
+        *,
+        success: bool,
+        receipts: list[SentMessageReceipt],
+        warnings: list[dict[str, str]],
+        raw_responses: list[dict[str, Any]],
+        error: str = "",
+    ) -> SentResult:
+        primary = receipts[-1] if receipts else None
+        continuations = tuple(r.message_id for r in receipts[:-1])
+        continuation_seqs = tuple(r.msgseqid for r in receipts[:-1])
+        return SentResult(
+            success=success,
+            message_id=primary.message_id if primary else "",
+            msgseqid=primary.msgseqid if primary else "",
+            continuation_message_ids=continuations,
+            continuation_msgseqids=continuation_seqs,
+            sent_messages=tuple(receipts),
+            warnings=tuple(warnings),
+            raw_response={"responses": raw_responses},
+            error=error,
+        )
+
+    async def send_group_message_intent(
+        self,
+        group_id: str,
+        *,
+        message: str | None = None,
+        format: str = "auto",
+        links: Any = None,
+        image_paths: Any = None,
+        image_bytes: Any = None,
+        reply_to: list[dict[str, str]] | None = None,
+        at_all: Any = False,
+        mention_user_ids: Any = None,
+        mention_agent_ids: Any = None,
         session: aiohttp.ClientSession | None = None,
     ) -> SentResult:
-        """Send a text/markdown message to a group."""
-        contents = self._build_contents(text, options)
+        fmt, err = _normalize_intent_format(format)
+        if err:
+            return SentResult(success=False, error=err)
+        reply_targets, err = _validate_serverapi_reply_to(reply_to)
+        if err:
+            return SentResult(success=False, error=err)
+        warnings: list[dict[str, str]] = []
+        link_items, err, deduped_links = _normalize_links(links)
+        if err:
+            return SentResult(success=False, error=err)
+        segments, err, deduped_images = _parse_message_segments(message, image_paths)
+        if err:
+            return SentResult(success=False, error=err)
+        err, _appended_image_bytes = _append_image_byte_segments(segments, image_bytes)
+        if err:
+            return SentResult(success=False, error=err)
+        at_items, mention_warnings, err = self._normalize_group_mentions(
+            at_all=at_all,
+            mention_user_ids=mention_user_ids,
+            mention_agent_ids=mention_agent_ids,
+        )
+        if err:
+            return SentResult(success=False, error=err)
+        warnings.extend(mention_warnings)
+        if deduped_links or deduped_images:
+            warnings.append(_warning("deduplicated", "duplicate links or images were removed"))
+        if len(reply_targets) > 1:
+            warnings.append(_warning("group_reply_truncated", "group messages support only one reply target; using the first"))
+            reply_targets = reply_targets[:1]
 
-        reply_ctx = None
-        if reply_info:
-            reply_ctx = _api.ReplyContext(
-                messageid=reply_info.message_id,
-                preview=reply_info.preview[:_MAX_PREVIEW_LENGTH],
-                replytype=reply_info.replytype,
-                imid=reply_info.sender_imid or self._robot_id,
-            )
-
-        async with self._ensure_session(session) as sess:
-            try:
-                res = await _api.send_group_message(
-                    self._api_account,
-                    group_id=int(group_id),
-                    contents=contents,
-                    reply_to=reply_ctx,
-                    session=sess,
-                )
-            except Exception as exc:
-                return SentResult(success=False, error=str(exc))
-
-            if res.get("ok"):
-                return _sent_result_from_api_response(
-                    res,
-                    success=True,
-                    default_error="send failed",
-                )
-            return _sent_result_from_api_response(
-                res,
+        if not segments and not link_items and not at_items and not reply_targets:
+            return SentResult(
                 success=False,
-                default_error="send failed",
+                error_code="empty_message",
+                error="message, image_paths, image_bytes, links, reply_to, or group @ mention is required",
             )
 
-    # ------------------------------------------------------------------
-    # Send — DM
-    # ------------------------------------------------------------------
+        force_text_payload = bool(reply_targets or link_items)
+        packets, err = await self._build_group_packets(
+            group_id=group_id,
+            segments=segments,
+            links=link_items,
+            explicit_at_items=at_items,
+            force_text_payload=force_text_payload,
+            format_mode=fmt,
+            session=session,
+        )
+        if err:
+            return SentResult(success=False, error=err, warnings=tuple(warnings))
+        if not packets and reply_targets:
+            packets = [{
+                "body": [{"type": "TEXT", "content": ""}],
+                "msgtype": "TEXT",
+                "kind": "text",
+                "preview": "",
+            }]
+        if not packets:
+            return SentResult(
+                success=False,
+                error_code="empty_message",
+                error="no valid content for group message",
+                warnings=tuple(warnings),
+            )
 
-    async def send_to_dm(
+        receipts: list[SentMessageReceipt] = []
+        raw_responses: list[dict[str, Any]] = []
+        for idx, packet in enumerate(packets):
+            result = await self.send_group_structured(
+                group_id,
+                body=packet["body"],
+                msgtype=packet["msgtype"],
+                reply_to=reply_targets if idx == 0 and reply_targets else None,
+                session=session,
+            )
+            raw_responses.append(result.raw_response)
+            if not result.success:
+                receipts.extend(self._receipts_from_result(
+                    result,
+                    fallback_kind=packet["kind"],
+                    fallback_preview=packet["preview"],
+                ))
+                return self._result_from_receipts(
+                    success=False,
+                    receipts=receipts,
+                    warnings=warnings + list(result.warnings or ()),
+                    raw_responses=raw_responses,
+                    error=result.error or "send failed",
+                )
+            receipts.extend(self._receipts_from_result(
+                result,
+                fallback_kind=packet["kind"],
+                fallback_preview=packet["preview"],
+            ))
+            warnings.extend(list(result.warnings or ()))
+
+        return self._result_from_receipts(
+            success=True,
+            receipts=receipts,
+            warnings=warnings,
+            raw_responses=raw_responses,
+        )
+
+    async def send_private_message_intent(
         self,
         user_id: str,
-        text: str,
         *,
-        options: SendOptions | None = None,
+        message: str | None = None,
+        format: str = "auto",
+        links: Any = None,
+        image_paths: Any = None,
+        image_bytes: Any = None,
+        reply_to: list[dict[str, str]] | None = None,
         session: aiohttp.ClientSession | None = None,
     ) -> SentResult:
-        """Send a text/markdown message to a user (DM)."""
-        contents = self._build_contents(text, options)
+        fmt, err = _normalize_intent_format(format)
+        if err:
+            return SentResult(success=False, error=err)
+        reply_targets, err = _validate_serverapi_reply_to(reply_to)
+        if err:
+            return SentResult(success=False, error=err)
+        warnings: list[dict[str, str]] = []
+        link_items, err, deduped_links = _normalize_links(links)
+        if err:
+            return SentResult(success=False, error=err)
+        segments, err, deduped_images = _parse_message_segments(message, image_paths)
+        if err:
+            return SentResult(success=False, error=err)
+        err, _appended_image_bytes = _append_image_byte_segments(segments, image_bytes)
+        if err:
+            return SentResult(success=False, error=err)
 
-        async with self._ensure_session(session) as sess:
-            try:
-                res = await _api.send_private_message(
-                    self._api_account,
-                    to_user=user_id,
-                    contents=contents,
-                    session=sess,
+        if deduped_links or deduped_images:
+            warnings.append(_warning("deduplicated", "duplicate links or images were removed"))
+        if link_items and any(seg["kind"] in ("image", "image_bytes") for seg in segments):
+            warnings.append(_warning("message_split", "private links and images are sent as separate messages; reply applies to the first message"))
+        if not segments and not link_items and not reply_targets:
+            return SentResult(
+                success=False,
+                error_code="empty_message",
+                error="message, image_paths, image_bytes, links, or reply_to is required",
+            )
+
+        packets, err = await self._build_private_packets(
+            segments=segments,
+            links=link_items,
+            has_reply=bool(reply_targets),
+            format_mode=fmt,
+        )
+        if err:
+            return SentResult(success=False, error=err, warnings=tuple(warnings))
+        if not packets and reply_targets:
+            packets = [{"kind": "text", "text": "", "preview": ""}]
+        if not packets:
+            return SentResult(
+                success=False,
+                error_code="empty_message",
+                error="no valid content for private message",
+                warnings=tuple(warnings),
+            )
+
+        receipts: list[SentMessageReceipt] = []
+        raw_responses: list[dict[str, Any]] = []
+        for idx, packet in enumerate(packets):
+            packet_reply_targets = reply_targets if idx == 0 else []
+            if packet["kind"] == "image":
+                result = await self.send_private_structured(
+                    user_id,
+                    image_bytes=packet["image_bytes"],
+                    reply_to=packet_reply_targets,
+                    session=session,
                 )
-            except Exception as exc:
-                return SentResult(success=False, error=str(exc))
-
-            # Enrich opaque API errors with actionable hints.
-            if not res.get("ok") and user_id:
-                err = res.get("error", "")
-                if "可见范围" in err or "关注" in err:
-                    res["error"] = (
-                        f"{err} "
-                        f"(to_user={user_id!r} — Infoflow private send requires the "
-                        f"recipient to have an existing conversation with the bot, "
-                        f"or the chat_id must be a uuapName rather than an accountId)"
-                    )
-
-            if res.get("ok"):
-                return SentResult(
-                    success=True,
-                    message_id=str(res.get("messageid") or res.get("msgkey") or ""),
-                    msgseqid=str(res.get("msgseqid") or ""),
-                    raw_response=res,
+            elif packet["kind"] == "richtext":
+                result = await self.send_private_structured(
+                    user_id,
+                    richtext_content=packet["richtext_content"],
+                    reply_to=packet_reply_targets,
+                    session=session,
                 )
-            return SentResult(success=False, error=res.get("error") or "send failed", raw_response=res)
+            elif packet["kind"] == "markdown":
+                result = await self.send_private_structured(
+                    user_id,
+                    markdown=packet["markdown"],
+                    reply_to=packet_reply_targets,
+                    session=session,
+                )
+            else:
+                result = await self.send_private_structured(
+                    user_id,
+                    text=packet.get("text") or "",
+                    reply_to=packet_reply_targets,
+                    session=session,
+                )
+            raw_responses.append(result.raw_response)
+            if not result.success:
+                receipts.extend(self._receipts_from_result(
+                    result,
+                    fallback_kind=packet["kind"],
+                    fallback_preview=packet["preview"],
+                ))
+                return self._result_from_receipts(
+                    success=False,
+                    receipts=receipts,
+                    warnings=warnings + list(result.warnings or ()),
+                    raw_responses=raw_responses,
+                    error=result.error or "send failed",
+                )
+            receipts.extend(self._receipts_from_result(
+                result,
+                fallback_kind=packet["kind"],
+                fallback_preview=packet["preview"],
+            ))
+            warnings.extend(list(result.warnings or ()))
+
+        return self._result_from_receipts(
+            success=True,
+            receipts=receipts,
+            warnings=warnings,
+            raw_responses=raw_responses,
+        )
 
     # ------------------------------------------------------------------
-    # Send — structured payloads for tool-level reply/AT/media support
+    # Send — structured payloads for exact wire payload support
     # ------------------------------------------------------------------
 
     async def send_private_structured(
@@ -583,11 +1569,19 @@ class ServerAPI:
         user_id: str,
         *,
         text: str | None = None,
+        markdown: str | None = None,
+        richtext_content: list[dict[str, str]] | None = None,
         image_bytes: bytes | None = None,
-        reply_targets: list[dict[str, str]] | None = None,
+        reply_to: list[dict[str, str]] | None = None,
         session: aiohttp.ClientSession | None = None,
     ) -> SentResult:
-        """Send one private text or image message with optional reply metadata."""
+        """Send one private text, richtext, or image message with optional reply metadata."""
+        reply_targets, err = _validate_serverapi_reply_to(reply_to)
+        if err:
+            return SentResult(success=False, error=err)
+        if markdown is not None and reply_targets:
+            return SentResult(success=False, error="private markdown payloads do not support reply_to")
+
         agent_id = str(self._settings.get("app_agent_id") or "").strip()
         if not agent_id:
             return SentResult(
@@ -601,6 +1595,30 @@ class ServerAPI:
             "totag": "",
             "agentid": agent_id,
         }
+        content_modes = sum(
+            value is not None
+            for value in (text, image_bytes, richtext_content, markdown)
+        )
+        if content_modes > 1:
+            return SentResult(success=False, error="private message content modes are mutually exclusive")
+        if content_modes == 0 and not reply_targets:
+            return SentResult(
+                success=False,
+                error_code="empty_message",
+                error="private message content or reply_to is required",
+            )
+        if text is not None and not str(text or "").strip() and not reply_targets:
+            return SentResult(
+                success=False,
+                error_code="empty_message",
+                error="private text content or reply_to is required",
+            )
+        if markdown is not None and not str(markdown or "").strip():
+            return SentResult(
+                success=False,
+                error_code="empty_message",
+                error="private markdown content is required",
+            )
         if image_bytes is not None:
             try:
                 prepared_image = prepare_infoflow_image_bytes(image_bytes)
@@ -610,23 +1628,47 @@ class ServerAPI:
             payload["image"] = {
                 "content": base64.b64encode(prepared_image.data).decode("ascii")
             }
+            receipt_kind = "image"
+            receipt_preview = "[image]"
+        elif richtext_content is not None:
+            content, err = _validate_private_richtext_content(richtext_content)
+            if err:
+                return SentResult(success=False, error=err)
+            if not content:
+                return SentResult(success=False, error="private richtext content is empty")
+            payload["msgtype"] = "richtext"
+            payload["richtext"] = {"content": content}
+            receipt_kind = "richtext"
+            receipt_preview = _safe_preview(
+                " ".join(str(item.get("text") or item.get("label") or item.get("href") or "") for item in content)
+            )
+        elif markdown is not None:
+            payload["msgtype"] = "md"
+            payload["md"] = {"content": str(markdown or "")}
+            receipt_kind = "markdown"
+            receipt_preview = _safe_preview(markdown or "")
         else:
             payload["msgtype"] = "text"
             payload["text"] = {"content": str(text or "")}
+            receipt_kind = "text"
+            receipt_preview = _safe_preview(text or "")
 
         reply_payload: list[dict[str, str]] = []
         for target in reply_targets or []:
             mid = str(target.get("message_id") or "").strip()
             if not mid:
                 continue
+            sender_imid = str(target.get("sender_imid") or "").strip()
             item = {
-                "content": str(target.get("preview") or "")[:_MAX_PREVIEW_LENGTH],
-                "uid": "0",
                 "msgid": mid,
             }
-            msgid2 = str(target.get("msgid2") or "").strip()
-            if msgid2:
-                item["msgid2"] = msgid2
+            if sender_imid:
+                item["uid"] = sender_imid
+            preview = _safe_reply_preview(
+                target.get("preview") or "",
+            )
+            if preview:
+                item["content"] = preview
             reply_payload.append(item)
         if reply_payload:
             payload["reply"] = reply_payload
@@ -642,10 +1684,20 @@ class ServerAPI:
                 return SentResult(success=False, error=str(exc))
 
             if res.get("ok"):
+                message_id = str(res.get("messageid") or res.get("msgkey") or "")
+                msgseqid = str(res.get("msgseqid") or "")
                 return SentResult(
                     success=True,
-                    message_id=str(res.get("messageid") or res.get("msgkey") or ""),
-                    msgseqid=str(res.get("msgseqid") or ""),
+                    message_id=message_id,
+                    msgseqid=msgseqid,
+                    sent_messages=(
+                        SentMessageReceipt(
+                            message_id=message_id,
+                            msgseqid=msgseqid,
+                            kind=receipt_kind,
+                            preview=receipt_preview,
+                        ),
+                    ) if message_id else (),
                     raw_response=res,
                 )
             return SentResult(
@@ -660,35 +1712,57 @@ class ServerAPI:
         *,
         body: list[dict[str, Any]],
         msgtype: str,
-        reply_target: dict[str, str] | None = None,
+        reply_to: list[dict[str, str]] | None = None,
         session: aiohttp.ClientSession | None = None,
     ) -> SentResult:
         """Send one group payload with explicit body order and optional reply."""
+        warnings: list[dict[str, str]] = []
+        reply_targets, err = _validate_serverapi_reply_to(reply_to)
+        if err:
+            return SentResult(success=False, error=err)
+        if len(reply_targets) > 1:
+            warnings.append(_warning(
+                "group_reply_truncated",
+                "group messages support only one reply target; using the first",
+            ))
+            reply_targets = reply_targets[:1]
+
+        msgtype_s = str(msgtype or "")
+        if msgtype_s not in {"TEXT", "MD", "IMAGE"}:
+            return SentResult(success=False, error="group msgtype must be TEXT, MD, or IMAGE")
+        if not body:
+            return SentResult(success=False, error="group body is empty")
+        err = _validate_group_structured_body(body)
+        if err:
+            return SentResult(success=False, error=err)
+        err = _validate_group_structured_semantics(
+            msgtype=msgtype_s,
+            body=body,
+            has_reply=bool(reply_targets),
+        )
+        if err:
+            return SentResult(success=False, error=err)
         async with self._ensure_session(session) as sess:
             reply_ctx = None
-            if reply_target is not None:
+            if reply_targets:
+                reply_target = reply_targets[0]
                 mid = str(reply_target.get("message_id") or "").strip()
                 if not mid:
                     return SentResult(success=False, error="reply_to.message_id is required")
-                if not self._robot_id:
-                    await self._discover_own_robot_id_from_group(group_id, session=sess)
-                if not self._robot_id:
-                    return SentResult(
-                        success=False,
-                        error="Infoflow robot imid is required for group reply",
-                    )
                 reply_ctx = _api.ReplyContext(
                     messageid=mid,
-                    preview=str(reply_target.get("preview") or "")[:_MAX_PREVIEW_LENGTH],
+                    preview=_safe_reply_preview(
+                        reply_target.get("preview") or "",
+                    ),
                     replytype="",
-                    imid=self._robot_id,
+                    imid=str(reply_target.get("sender_imid") or "").strip(),
                 )
             try:
                 res = await _api.send_group_payload(
                     self._api_account,
                     group_id=int(group_id),
                     body=body,
-                    msgtype=msgtype,
+                    msgtype=msgtype_s,
                     reply_to=reply_ctx,
                     session=sess,
                 )
@@ -696,16 +1770,30 @@ class ServerAPI:
                 return SentResult(success=False, error=str(exc))
 
             if res.get("ok"):
-                return _sent_result_from_api_response(
+                result = _sent_result_from_api_response(
                     res,
                     success=True,
                     default_error="send failed",
                 )
-            return _sent_result_from_api_response(
+                result.sent_messages = tuple(self._receipts_from_result(
+                    result,
+                    fallback_kind=_receipt_kind(
+                        body,
+                        default="markdown" if msgtype_s == "MD" else "text",
+                    ),
+                    fallback_preview=_body_preview(body),
+                ))
+                if warnings:
+                    result.warnings = tuple([*result.warnings, *warnings])
+                return result
+            result = _sent_result_from_api_response(
                 res,
                 success=False,
                 default_error="send failed",
             )
+            if warnings:
+                result.warnings = tuple([*result.warnings, *warnings])
+            return result
 
     async def _discover_own_robot_id_from_group(
         self,
@@ -734,142 +1822,6 @@ class ServerAPI:
             if imid:
                 self.robot_id = imid
                 return
-
-    # ------------------------------------------------------------------
-    # Send image — group
-    # ------------------------------------------------------------------
-
-    async def send_image_to_group(
-        self,
-        group_id: str,
-        image_bytes: bytes,
-        *,
-        caption: str | None = None,
-        reply_info: ReplyInfo | None = None,
-        session: aiohttp.ClientSession | None = None,
-    ) -> SentResult:
-        """Send an image (optionally with caption) to a group."""
-        try:
-            prepared_image = prepare_infoflow_image_bytes(image_bytes)
-        except _ImageLoadError as exc:
-            return SentResult(success=False, error=str(exc))
-
-        b64 = base64.b64encode(prepared_image.data).decode("ascii")
-        contents: list[_api.ContentItem] = [_api.ContentItem("image", b64)]
-        if caption:
-            contents.insert(0, _api.ContentItem("markdown", caption))
-
-        reply_ctx = None
-        if reply_info:
-            reply_ctx = _api.ReplyContext(
-                messageid=reply_info.message_id,
-                preview=reply_info.preview[:_MAX_PREVIEW_LENGTH],
-                replytype=reply_info.replytype,
-                imid=reply_info.sender_imid or self._robot_id,
-            )
-
-        async with self._ensure_session(session) as sess:
-            try:
-                res = await _api.send_group_message(
-                    self._api_account,
-                    group_id=int(group_id),
-                    contents=contents,
-                    reply_to=reply_ctx,
-                    session=sess,
-                )
-            except Exception as exc:
-                return SentResult(success=False, error=str(exc))
-
-            if res.get("ok"):
-                return _sent_result_from_api_response(
-                    res,
-                    success=True,
-                    default_error="image send failed",
-                )
-            return _sent_result_from_api_response(
-                res,
-                success=False,
-                default_error="image send failed",
-            )
-
-    # ------------------------------------------------------------------
-    # Send image — DM
-    # ------------------------------------------------------------------
-
-    async def send_image_to_dm(
-        self,
-        user_id: str,
-        image_bytes: bytes,
-        *,
-        caption: str | None = None,
-        session: aiohttp.ClientSession | None = None,
-    ) -> SentResult:
-        """Send an image to a user (DM). Caption and image sent separately."""
-        try:
-            prepared_image = prepare_infoflow_image_bytes(image_bytes)
-        except _ImageLoadError as exc:
-            return SentResult(success=False, error=str(exc))
-
-        b64 = base64.b64encode(prepared_image.data).decode("ascii")
-
-        caption_items: list[_api.ContentItem] = []
-        image_items: list[_api.ContentItem] = [_api.ContentItem("image", b64)]
-        if caption:
-            caption_items = [_api.ContentItem("markdown", caption)]
-
-        async with self._ensure_session(session) as sess:
-            try:
-                # Send caption first (text), then image.
-                res_caption: dict[str, Any] = {"ok": True}
-                if caption_items:
-                    res_caption = await _api.send_private_message(
-                        self._api_account, to_user=user_id, contents=caption_items, session=sess,
-                    )
-                res = await _api.send_private_message(
-                    self._api_account, to_user=user_id, contents=image_items, session=sess,
-                )
-            except Exception as exc:
-                return SentResult(success=False, error=str(exc))
-
-            caption_mid = str(res_caption.get("messageid") or res_caption.get("msgkey") or "")
-            caption_seq = str(res_caption.get("msgseqid") or "")
-            raw_response = dict(res)
-            if caption_items:
-                raw_response["caption_response"] = res_caption
-
-            if res.get("ok"):
-                primary = str(res.get("messageid") or res.get("msgkey") or "")
-                continuation_ids = (caption_mid,) if caption_mid and caption_mid != primary else ()
-                continuation_seqs = (caption_seq,) if continuation_ids else ()
-                if not res_caption.get("ok"):
-                    return SentResult(
-                        success=False,
-                        message_id=primary,
-                        msgseqid=str(res.get("msgseqid") or ""),
-                        raw_response=raw_response,
-                        error=str(res_caption.get("error") or "image caption send failed"),
-                    )
-                return SentResult(
-                    success=True,
-                    message_id=primary,
-                    msgseqid=str(res.get("msgseqid") or ""),
-                    continuation_message_ids=continuation_ids,
-                    continuation_msgseqids=continuation_seqs,
-                    raw_response=raw_response,
-                )
-            if caption_mid:
-                return SentResult(
-                    success=False,
-                    message_id=caption_mid,
-                    msgseqid=caption_seq,
-                    raw_response=raw_response,
-                    error=str(res.get("error") or "image send failed"),
-                )
-            return SentResult(
-                success=False,
-                error=str(res.get("error") or "image send failed"),
-                raw_response=raw_response,
-            )
 
     # ------------------------------------------------------------------
     # Recall — group

@@ -148,9 +148,11 @@ def _make_send_result(*, success: bool, message_id: str = "", error: str = "", r
         return SendResult(**kwargs)
 
 
-def _metadata_reply_type(metadata: dict[str, Any] | None) -> str:
-    raw = str((metadata or {}).get("reply_type") or (metadata or {}).get("replytype") or "1")
-    return raw if raw in {"1", "2"} else "1"
+def _reply_to_from_inbound(message_id: str | None) -> tuple[list[dict[str, str]], str]:
+    mid = str(message_id or "").strip()
+    if not mid:
+        return [], ""
+    return [{"message_id": mid}], get_inbound_sender_id(mid)
 
 
 # ── Context var: propagate inbound mid → send() for tracing ────
@@ -202,7 +204,7 @@ from .iftools import (
     make_recall_handler,
     make_send_message_handler,
 )
-from .itypes import IncomingMessage, ReplyInfo, reply_target_to_dict
+from .itypes import IncomingMessage, reply_target_to_dict
 from .llm_format import (
     DMAttention,
     GroupAttention,
@@ -232,6 +234,7 @@ from .policy import (
 from .prompt_rules import INFOFLOW_DELIVERY_TOOL_RULES
 from .recall import get_inbound_body, get_inbound_sender_id, get_inbound_sender_imid
 from .recall_silence import RecallSilenceTracker
+from .send_service import InfoflowSendService
 from .sent_store import SentMessageStore
 from .serverapi import ServerAPI
 from .settings import (
@@ -242,7 +245,6 @@ from .settings import (
     DEFAULT_WEBHOOK_PATH,
     GROUP_TARGET_RE,
     MAX_MESSAGE_LENGTH,
-    MAX_PREVIEW_LENGTH,
     _check_requirements,
     _env_enablement,
     _interactive_setup,
@@ -372,12 +374,20 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         self._serverapi.set_group_members_observer(
             self._message_store.upsert_group_members
         )
+        self._serverapi.set_image_loader(self._load_image_bytes)
+        self._send_service = InfoflowSendService(
+            serverapi=self._serverapi,
+            message_store=self._message_store,
+            inbound_body_lookup=get_inbound_body,
+            inbound_sender_imid_lookup=get_inbound_sender_imid,
+        )
 
         # ── Bot (business logic) ──────────────────────────────────────
         self._bot = Bot(
             settings=self._settings,
             policy=self._policy,
             serverapi=self._serverapi,
+            send_service=self._send_service,
             sent_store=self._sent_store,
             dedup_set=self._dedup_set,
             message_store=self._message_store,
@@ -1923,18 +1933,9 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             )
             return SendResult(success=True)
 
-        # Build reply_info from inbound context
-        reply_info: ReplyInfo | None = None
-        if reply_to:
-            body = get_inbound_body(reply_to)
-            if body:
-                reply_info = ReplyInfo(
-                    message_id=reply_to,
-                    preview=body[:MAX_PREVIEW_LENGTH],
-                    replytype=_metadata_reply_type(metadata),
-                    sender_imid=get_inbound_sender_imid(reply_to),
-                    sender_id=get_inbound_sender_id(reply_to),
-                )
+        # Build normalized reply_to from inbound context. Preview enrichment
+        # happens in InfoflowSendService before ServerAPI sees the intent.
+        normalized_reply_to, reply_to_sender_id = _reply_to_from_inbound(reply_to)
 
         content, options = await prepare_outbound_message(
             content,
@@ -1950,7 +1951,8 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             group_id=str(group_id) if group_id is not None else None,
             dm_user_id=dm_user or None,
             text=content,
-            reply_info=reply_info,
+            reply_to=normalized_reply_to or None,
+            reply_to_sender_id=reply_to_sender_id,
             options=options,
             session=session,
             reaction_message_id=reply_to,
@@ -2064,24 +2066,15 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         except _ImageLoadError as exc:
             return SendResult(success=False, error=str(exc), retryable=False)
 
-        reply_info: ReplyInfo | None = None
-        if reply_to:
-            body = get_inbound_body(reply_to)
-            if body:
-                reply_info = ReplyInfo(
-                    message_id=reply_to,
-                    preview=body[:MAX_PREVIEW_LENGTH],
-                    replytype=_metadata_reply_type(metadata),
-                    sender_imid=get_inbound_sender_imid(reply_to),
-                    sender_id=get_inbound_sender_id(reply_to),
-                )
+        normalized_reply_to, reply_to_sender_id = _reply_to_from_inbound(reply_to)
 
         bot_result = await self._bot.send_image(
             group_id=str(group_id) if group_id is not None else None,
             dm_user_id=dm_user or None,
             image_bytes=prepared_image.data,
             caption=caption,
-            reply_info=reply_info,
+            reply_to=normalized_reply_to or None,
+            reply_to_sender_id=reply_to_sender_id,
             session=session,
             reaction_message_id=reply_to,
         )
@@ -2371,37 +2364,38 @@ def register(ctx: Any) -> None:
             "（加粗/斜体/代码/列表/链接）。\n"
             "\n"
             "【发送消息】\n"
-            "回复当前会话时，优先直接输出最终回复；需要显式跨会话发送、"
-            "引用/quote、图片或群聊 @ 时使用 `infoflow_send_message`。"
-            "`infoflow_send_message.target` 必填。\n"
-            "跨会话外发时，target 格式为：\n"
+            "当前会话普通文字回复优先直接输出最终回复。"
+            "需要指定 target、跨会话发送、发送链接/图片、"
+            "控制图文顺序、群聊 @ 或引用消息时，使用 `infoflow_send_message`。\n"
+            "`infoflow_send_message.target` 必填：\n"
             "- 私信：`infoflow:<uuapName>` 或 `user:<uuapName>`（如 `infoflow:chengbo05`）\n"
             "- 群聊：`infoflow:group:<群组ID>`（如 `infoflow:group:4507088`）\n"
             "- `bot:<agentId>` 不能作为私聊发送目标；机器人只能在群聊 @ 字段中使用 agentId\n"
             "- 不要用裸 `infoflow` 作为当前会话目标；裸平台名会路由到 home channel\n"
             "\n"
-            "【发送图片与外发工具】\n"
+            "【发送参数】\n"
+            "`message` 是正文，可包含 `MEDIA:<本地图片绝对路径>` 控制图文顺序；"
+            "`image_paths` 用于追加图片。只发送链接、图片、群聊 @ 或引用时，"
+            "`message` 可为空字符串。\n"
+            "`message` 支持 Markdown 语法；普通正文保持 `format=auto` 即可。\n"
+            "`links` 支持 URL、`[展示文本](URL)`、`{href, label}`，"
+            "可单独发送或与正文、图片、群聊 @、引用组合。\n"
+            "群聊 @ 可写 `@uuapName`、`@agentId`、`@all`，"
+            "也可用 `at_all`、`mention_user_ids`、`mention_agent_ids`；"
+            "私聊 `@xxx` 按普通文本展示。\n"
+            "引用消息用 `reply_to`：message_id、`{message_id, preview}`，或数组。"
+            "引用整条消息时只传 message_id；只想展示原文中的某一句或某一段时，"
+            "传 `{message_id, preview}`，preview 填该片段。"
+            "群聊最终只引用一条，私聊可传数组引用多条。\n"
+            "\n"
             f"{INFOFLOW_DELIVERY_TOOL_RULES}\n"
-            "普通当前会话图片可使用 `send_message`；需要引用回复、跨会话图片或"
-            "精确控制文本/图片顺序时使用 `infoflow_send_message`，"
-            "把说明文字和 `MEDIA:<路径>` 一起放入 `message`，或用 `image_paths` "
-            "追加图片。\n"
-            "\n"
-            "【@提及】群聊中两种方式均可：\n"
-            "① 直接在消息文本中写 `@uuapName`（人）、"
-            "`@机器人显示名` 或 `@agentId`（机器人）、"
-            "`@所有人` 或 `@all`（全员）——插件自动解析群成员并替换\n"
-            "② 通过 metadata 参数：`metadata.at_all=true`、"
-            "`metadata.mention_user_ids='u1,u2'`、"
-            "`metadata.mention_agent_ids='17212,33333'`\n"
-            "\n"
             "【消息格式】每条消息使用结构化 envelope："
             "`[Attention: ...]`、`[Sender: ...]`、"
             "`[Message: message_id:'...'; created_time:'2025.05.21 19.56.59']`。"
             "`message_id` 是该消息的唯一 ID；`created_time` 是插件首次看到该消息的时间，"
             "也是历史查询和排序使用的时间（系统注入，可信）。"
             "结构化标签内字符串值使用单引号，布尔/数字保持裸值。"
-            "需要引用回复时将该 ID 传给 `infoflow_send_message.reply_to`。\n"
+            "需要引用该消息时将该 ID 传给 `infoflow_send_message.reply_to`。\n"
             "当 `[Unread Message Context: ...]` 出现时，"
             "说明提示指定的历史范围内有未读消息。"
             "除非当前消息显然无需上下文，否则应按提示优先调用 "
@@ -2424,13 +2418,6 @@ def register(ctx: Any) -> None:
             "- 撤回成功且用户只要求撤回时，最终输出单独一行 `NO_REPLY`，"
             "不要输出\"已撤回\"或\"撤回成功\"。若同一条用户消息还有其它任务，"
             "只回复其它任务结果，不要提及撤回已成功\n"
-            "\n"
-            "【引用回复】使用 `infoflow_send_message` 引用某条消息并附带原文预览。"
-            "`target` 必填；`reply_to` 可传 message_id、"
-            "`{message_id, preview, msgid2}` 或数组。群聊一次最多引用一条；"
-            "私聊可引用多条。可省略 `message`，只发送引用卡片或群聊 @。"
-            "引用回复图片时在 `message` 内包含 `MEDIA:<本地图片绝对路径>`，"
-            "或用 `image_paths`，不要发送路径正文。\n"
             "\n"
             "【群成员】使用 `infoflow_get_group_members` 查询群成员列表（人类与机器人），"
             "便于在 @ 提及前确认 user_id、agent_id 或机器人显示名。\n"
@@ -2468,8 +2455,8 @@ def register(ctx: Any) -> None:
                 handler=make_send_message_handler(),
                 is_async=True,
                 description=(
-                    "Send an Infoflow message to a required target with optional "
-                    "reply quote, group @ mentions, and images."
+                    "Send an Infoflow message to a required target with text, "
+                    "reply references, links, images, or group @ mentions."
                 ),
                 emoji="💬",
             )

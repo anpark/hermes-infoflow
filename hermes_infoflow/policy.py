@@ -528,8 +528,6 @@ _INFOFLOW_REFERENCE_RULES_DOC = """\
 - 人类用户：`user_id`、`name`。
 - 机器人用户：`agent_id`、`name`。
 
-不要猜测、要求或输出 `robot_id`、`imid`、`msg_id2` 等底层内部标识；需要这些标识时由插件代码自动转换。
-
 只是提到某位用户/机器人、但不需要真正 @ 对方时：
 - 提到人类用户：优先使用 `name`；没有 `name` 时使用 `user_id`。
 - 提到机器人用户：优先使用 `name`；没有 `name` 时使用 `agent_id`。
@@ -562,10 +560,10 @@ _GROUP_FORMAT_DOC = """\
 _GROUP_MENTION_RULES_DOC = """\
 ## 群聊 @ 规则
 
-只有需要真正 @ 对方时才使用以下规则。需要 @ 时，优先同时使用 send_message metadata 和正文占位文本：
-- 人类用户：正文写 `@<user_id>`，例如 `@chengbo05`；metadata.mention_user_ids 填 user_id。
-- 机器人：正文写 `@<agent_id>`，例如 `@6471`；metadata.mention_agent_ids 填 agent_id。
-- 所有人：正文写 `@all`；metadata.at_all=true。
+只有需要真正 @ 对方时才使用以下规则：
+- 人类用户：正文写 `@<user_id>`，例如 `@chengbo05`；也可把 user_id 传给 `infoflow_send_message.mention_user_ids`。
+- 机器人：正文写 `@<agent_id>`，例如 `@6471`；也可把 agent_id 传给 `infoflow_send_message.mention_agent_ids`。
+- 所有人：正文写 `@all`；也可传 `infoflow_send_message.at_all=true`。
 
 @ 占位必须是完整 token：`@` 和 id 中间不要有空格；token 前面应为行首或空白，后面应为空白、换行或消息结束。
 正确示例：`请看 @chengbo05 这个问题`
@@ -603,8 +601,9 @@ _INFOFLOW_TOOL_RULES_DOC = f"""\
 - 成功且同一条用户消息还要求其它任务时，只回复其它任务结果，不要提及撤回已成功。
 - 失败后在当前会话简短回复“撤回失败，消息可能已过期”。
 
-发送图片：
-- 普通发送用 `send_message`；需要引用/quote 原消息、群聊 @ 或精确图片顺序时，用 `infoflow_send_message` 的 `message` 参数携带正文和 `MEDIA:<本地图片绝对路径>`。
+显式发送：
+- 当前会话普通文字回复：直接输出最终回复。
+- 需要显式调用如流发送工具时，使用 `infoflow_send_message`；适用于指定 target、跨会话发送、发送链接/图片、群聊 @、控制图文顺序或引用消息。
 
 调用 `infoflow_get_message_history`：
 - 需要补足上下文时必须使用该工具。

@@ -5,7 +5,7 @@ way a Hermes cron child process would: with a ``SimpleNamespace`` config
 and only the env vars from ``~/.hermes/.env`` for credentials.
 
 After the refactor, this path uses the shared ``prepare_outbound_message``
-helper and the same ``ServerAPI.send_to_group()`` as the live adapter —
+helper and the same ``ServerAPI.send_group_message_intent()`` as the live adapter —
 so this script verifies the cron path produces identical wire payloads
 (including @-mention extraction, which was previously broken).
 
@@ -61,8 +61,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--mention", action="append", default=[],
         help="Append @mention(s) to the text. May repeat.",
     )
-    parser.add_argument("--mention-user", default="", help="metadata.mention_user_ids CSV.")
-    parser.add_argument("--mention-agent", default="", help="metadata.mention_agent_ids CSV.")
+    parser.add_argument("--mention-user", default="", help="Structured human mention user ids CSV.")
+    parser.add_argument("--mention-agent", default="", help="Structured robot mention agent ids CSV.")
     parser.add_argument("--at-all", action="store_true", help="Set metadata.at_all=true.")
     return parser
 

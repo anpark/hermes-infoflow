@@ -29,7 +29,7 @@ Baidu Infoflow（如流）Channel 插件 for [Hermes Agent](https://github.com/n
 
 主推 directory-style：所有推荐路径都使用固定插件 ID `infoflow`，并最终写入同一个目录 `~/.hermes/plugins/infoflow/`。完整部署都会运行同一个归一化步骤：先校验并对齐 `~/.hermes/hermes-agent`，再把源码扁平化到插件目录根、写入 `plugin.yaml`、同步 `scripts/`、补齐 `plugins.enabled` / `platform_toolsets.infoflow`，并维护 `~/.hermes/.env` 里的 `INFOFLOW_PORT`。因此 A / B / C / D 可以互相覆盖，最终 Hermes 里看到的插件名、平台名、工具集名都保持一致。
 
-当前版本硬性要求 gateway runtime 使用补丁版 Hermes Agent：`~/.hermes/hermes-agent` 必须是 git checkout，部署/归一化命令会 fetch `https://github.com/chbo297/hermes-agent.git` 的 `fix/send-message-plugin-target-routing` 分支并对齐到 `chbo/fix/send-message-plugin-target-routing` 最新节点。若 worktree 有本地改动，会自动 `git stash push -u` 并输出 stash 名；若当前 HEAD/分支需要切换，会先创建 `hermes-infoflow/backup/<timestamp>` 备份分支。若 agent 缺失、不是 git repo、fetch/switch 失败，或 gateway Python 不能从该 checkout import `gateway`，部署会在替换插件目录前失败。
+当前版本硬性要求 gateway runtime 使用补丁版 Hermes Agent：`~/.hermes/hermes-agent` 必须是 git checkout，部署/归一化命令会 fetch `https://github.com/chbo297/hermes-agent.git` 的 `bduse` 分支并对齐到 `chbo/bduse` 最新节点。若 worktree 有本地改动，会自动 `git stash push -u` 并输出 stash 名；若当前 HEAD/分支需要切换，会先创建 `hermes-infoflow/backup/<timestamp>` 备份分支。若 agent 缺失、不是 git repo、fetch/switch 失败，或 gateway Python 不能从该 checkout import `gateway`，部署会在替换插件目录前失败。
 
 旧式 `pip install hermes-infoflow` 只安装 entry-point，不再视为完整部署；完整 pip 部署需要再执行 `hermes-infoflow-deploy`。如果 Hermes runtime 中残留同名 entry-point，归一化步骤默认会尝试移除它，避免遮挡目录插件；可用 `HERMES_INFOFLOW_ENTRYPOINT_POLICY=warn` 只告警，或 `keep` 保留。
 
@@ -177,7 +177,7 @@ bash scripts/deploy.sh --dry-run   # 仅打印操作
 bash scripts/deploy.sh --port 9000 # 指定 webhook 端口并写入 ~/.hermes/.env
 ```
 
-所有完整部署入口都会先把 `~/.hermes/hermes-agent` 对齐到 `chbo297/hermes-agent` 的 `fix/send-message-plugin-target-routing` 分支最新节点，再同步插件并自动选择 Python：优先显式 `HERMES_INFOFLOW_GATEWAY_PYTHON`，其次 launchd plist 里的 gateway Python，再其次 `hermes` / `pipx` 的 `hermes-agent` venv。若目标 Python 没有从该 checkout import `gateway`，脚本会先尝试 `python -m pip install -e ~/.hermes/hermes-agent`，仍不满足则终止且不替换插件目录。若缺少 `cryptography` / `aiohttp` / `pyyaml` / `Pillow`，默认会尝试 `pipx inject hermes-agent …` 或对目标解释器 `pip install`（可用 `HERMES_DEPLOY_AUTO_PIP=0` 关闭）。若目标 venv 没有 pip，脚本会提示先用 `ensurepip` 或修复 Hermes agent 环境。
+所有完整部署入口都会先把 `~/.hermes/hermes-agent` 对齐到 `chbo297/hermes-agent` 的 `bduse` 分支最新节点，再同步插件并自动选择 Python：优先显式 `HERMES_INFOFLOW_GATEWAY_PYTHON`，其次 launchd plist 里的 gateway Python，再其次 `hermes` / `pipx` 的 `hermes-agent` venv。若目标 Python 没有从该 checkout import `gateway`，脚本会先尝试 `python -m pip install -e ~/.hermes/hermes-agent`，仍不满足则终止且不替换插件目录。若缺少 `cryptography` / `aiohttp` / `pyyaml` / `Pillow`，默认会尝试 `pipx inject hermes-agent …` 或对目标解释器 `pip install`（可用 `HERMES_DEPLOY_AUTO_PIP=0` 关闭）。若目标 venv 没有 pip，脚本会提示先用 `ensurepip` 或修复 Hermes agent 环境。
 
 部署时还会维护 `~/.hermes/.env` 中的 `INFOFLOW_PORT`：传 `--port` 则写入指定端口；未传时若 `.env` 已有 `INFOFLOW_PORT` 则保留，否则写入默认 `26521`（便于查看当前监听端口）。同时会补齐 `~/.hermes/config.yaml` 里的 `platform_toolsets.infoflow`，让 Infoflow 会话拥有与 CLI 会话一致的基础工具权限，并包含 `infoflow` 插件工具集。
 

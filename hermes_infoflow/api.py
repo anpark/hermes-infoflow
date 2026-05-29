@@ -3,8 +3,8 @@
 Port of openclaw-infoflow/src/send.ts. Covers:
 
 * App access token acquisition + caching (keyed by appKey, 7200s − 5min buffer).
-* Private (DM) message send: text / markdown / richtext (link).
-* Group message send: TEXT / MD / AT / LINK / IMAGE body items.
+* Private (DM) raw payload send: text / markdown / richtext / image.
+* Group raw payload send: TEXT / MD / AT / LINK / IMAGE body items.
 * Group message recall.
 * Private message recall.
 
@@ -18,9 +18,8 @@ Non-obvious wire contract bits (do NOT change without an upstream notice):
   serialised as **raw JSON integers** to preserve precision. We hand-build
   the body string instead of going through ``json.dumps`` so 19-digit IDs
   survive intact.
-* LINK and IMAGE body items must be sent as their own group messages
-  (one body item per request). TEXT / MD / AT items batch into a single
-  request. (send.ts:472-475)
+* Group sends use structured payloads. Higher-level format routing, splitting,
+  and reply/mention compatibility live in ``ServerAPI``.
 """
 
 from __future__ import annotations
@@ -163,11 +162,11 @@ class InfoflowAccountAPI:
 
 @dataclass
 class ContentItem:
-    """A single piece of outbound content.
+    """A single piece of generic private outbound content.
 
-    ``type`` ∈ {``text``, ``markdown``, ``link``, ``image``, ``at``,
-    ``at-agent``}. ``content`` is the payload (URL, base64 image,
-    user-id CSV, etc).
+    ``type`` is one of ``text``, ``markdown``, ``link``, or ``image``.
+    ``content`` is the payload, such as text, a URL/link expression, or a
+    base64 image string.
     """
 
     type: str
@@ -179,13 +178,15 @@ class ReplyContext:
     """Reply / quote context for group messages.
 
     Per the Infoflow API docs, reply sits at the same level as header
-    and body inside the ``message`` object.
+    and body inside the ``message`` object. ``imid`` is the quoted message
+    sender's Infoflow imid, carried by webhook ``fromid`` / ``FromId``;
+    omit it when unknown.
     """
 
     messageid: str
     preview: str = ""
     replytype: str = "1"  # "1" = reply (default), "2" = quote
-    imid: str = ""        # robot imid (required by the API)
+    imid: str = ""        # quoted sender imid, optional when unknown
 
 
 @dataclass
@@ -413,7 +414,7 @@ def _auth_headers(token: str, *, content_type: str = "application/json; charset=
 
 
 # ---------------------------------------------------------------------------
-# Private (DM) send
+# Private (DM) payload builder
 # ---------------------------------------------------------------------------
 
 
@@ -425,8 +426,8 @@ def _build_private_payload(to_user: str, contents: list[ContentItem]) -> dict[st
     # this shape (media.ts).
     image_items = [item for item in contents if item.type.lower() == "image"]
     if image_items:
-        # If more than one image was passed, only the first is sent in this call;
-        # callers (the adapter) loop and call us once per image.
+        # If more than one image was passed, only the first is represented in
+        # this raw payload. Higher-level callers split images before sending.
         return {
             "touser": to_user,
             "msgtype": "image",
@@ -484,48 +485,6 @@ def _extract_id(raw_json: str, *fields: str) -> str | None:
     return None
 
 
-async def send_private_message(
-    account: InfoflowAccountAPI,
-    to_user: str,
-    contents: list[ContentItem],
-    *,
-    session: aiohttp.ClientSession | None = None,
-    timeout: float = DEFAULT_TIMEOUT_SECONDS,
-) -> dict[str, Any]:
-    """Send a private (DM) Infoflow message.
-
-    Returns ``{"ok": True, "msgkey": str | None}`` on success, or
-    ``{"ok": False, "error": str, "invaliduser": ...}`` on failure.
-    """
-    if not account.app_key or not account.app_secret:
-        return {"ok": False, "error": "Infoflow appKey/appSecret not configured"}
-
-    payload = _build_private_payload(to_user, contents)
-    if payload is None:
-        return {"ok": False, "error": "no valid content for private message"}
-
-    try:
-        token = await get_app_access_token(account, session=session, timeout=timeout)
-    except InfoflowAPIError as exc:
-        logger.error("[infoflow:sendPrivate] token error: %s", exc)
-        return {"ok": False, "error": str(exc)}
-
-    url = _join(account.api_host, INFOFLOW_PRIVATE_SEND_PATH)
-    body_str = json.dumps(payload, ensure_ascii=False)
-    _log_payload = _truncate_image_payload(body_str)
-    gw_log().info("[infoflow:send_payload] %s", _log_payload)
-    headers = _auth_headers(token)
-
-    async with _ensure_session(session) as sess, sess.post(
-        url,
-        data=body_str.encode("utf-8"),
-        headers=headers,
-        timeout=aiohttp.ClientTimeout(total=timeout),
-    ) as resp:
-        text = await resp.text()
-    return _parse_send_response(text, kind="private")
-
-
 async def send_private_payload(
     account: InfoflowAccountAPI,
     payload: dict[str, Any],
@@ -535,9 +494,10 @@ async def send_private_payload(
 ) -> dict[str, Any]:
     """Send an already-formed private-message payload.
 
-    This is used by the reply-aware send tool. The generic private text path
-    emits ``msgtype=md``, but Infoflow private replies only render reliably
-    when the payload uses plain ``msgtype=text`` with a top-level ``reply``.
+    This low-level helper preserves the payload exactly. Higher-level callers
+    should use ``ServerAPI.send_private_message_intent()`` or
+    ``ServerAPI.send_private_structured()`` so reply/link/image compatibility
+    is validated before the HTTP request is sent.
     """
     if not account.app_key or not account.app_secret:
         return {"ok": False, "error": "Infoflow appKey/appSecret not configured"}
@@ -599,231 +559,6 @@ def _parse_send_response(response_text: str, *, kind: str) -> dict[str, Any]:
     return {"ok": True}
 
 
-# ---------------------------------------------------------------------------
-# Group send
-# ---------------------------------------------------------------------------
-
-
-def _build_group_body_items(contents: list[ContentItem]) -> tuple[list[dict[str, Any]], bool]:
-    """Translate generic ``ContentItem`` into Infoflow's group body item shape.
-
-    All text content is emitted as MD body items.  AT items are prepended
-    before the first MD item.
-    """
-    body: list[dict[str, Any]] = []
-
-    # ── Pass 1: collect AT fields into a single merged dict ──
-    at_all = False
-    at_user_ids: list[str] = []
-    at_agent_ids: list[int] = []
-
-    for item in contents:
-        t = item.type.lower()
-        if t == "at":
-            if item.content == "all":
-                at_all = True
-            else:
-                ids = [s.strip() for s in item.content.split(",") if s.strip()]
-                at_user_ids.extend(ids)
-        elif t == "at-agent":
-            for raw in item.content.split(","):
-                s = raw.strip()
-                if not s:
-                    continue
-                try:
-                    at_agent_ids.append(int(s))
-                except ValueError:
-                    continue
-
-    # ── Pass 2: build body items ──
-    md_items: list[dict[str, Any]] = []
-    for item in contents:
-        t = item.type.lower()
-        if t in ("md", "markdown"):
-            md_content = item.content or ""
-            # Normalize @all variants to lowercase for proper MD rendering
-            if at_all:
-                md_content = md_content.replace("@所有人", "@all")
-                md_content = md_content.replace("@All", "@all")
-                md_content = md_content.replace("@ALL", "@all")
-            md_items.append({"type": "MD", "content": md_content})
-        elif t == "link":
-            if item.content:
-                href, _ = _parse_link_content(item.content)
-                body.append({"type": "LINK", "href": href})
-        elif t == "image":
-            if item.content:
-                body.append({"type": "IMAGE", "content": item.content})
-        # "text", "at", "at-agent" are skipped (text always sent as MD now)
-
-    # Build a single merged AT body item — Infoflow API requires one AT item
-    # containing all at fields (atall, atuserids, atagentids).
-    at_item: dict[str, Any] = {"type": "AT"}
-    if at_all:
-        at_item["atall"] = True
-    if at_user_ids:
-        at_item["atuserids"] = at_user_ids
-    if at_agent_ids:
-        at_item["atagentids"] = at_agent_ids
-
-    at_prefix = [at_item] if len(at_item) > 1 else []
-
-    body = at_prefix + md_items + body
-    return body, True  # has_markdown always True
-
-
-async def send_group_message(
-    account: InfoflowAccountAPI,
-    group_id: int,
-    contents: list[ContentItem],
-    *,
-    reply_to: ReplyContext | None = None,
-    session: aiohttp.ClientSession | None = None,
-    timeout: float = DEFAULT_TIMEOUT_SECONDS,
-) -> dict[str, Any]:
-    """Send a group Infoflow message (splits LINK/IMAGE into separate messages)."""
-    if not account.app_key or not account.app_secret:
-        return {"ok": False, "error": "Infoflow appKey/appSecret not configured"}
-    if not contents:
-        return {"ok": False, "error": "contents array is empty"}
-
-    body_items, has_markdown = _build_group_body_items(contents)
-    logger.info(
-        "[infoflow:debug] contents=%s body_items=%s",
-        _content_items_for_log(contents),
-        _body_items_for_log(body_items),
-    )
-    if not body_items:
-        return {"ok": False, "error": "no valid content for group message"}
-
-    text_items = [b for b in body_items if b["type"] not in ("LINK", "IMAGE")]
-    link_items = [b for b in body_items if b["type"] == "LINK"]
-    image_items = [b for b in body_items if b["type"] == "IMAGE"]
-
-    try:
-        token = await get_app_access_token(account, session=session, timeout=timeout)
-    except InfoflowAPIError as exc:
-        logger.error("[infoflow:sendGroup] token error: %s", exc)
-        return {"ok": False, "error": str(exc)}
-
-    url = _join(account.api_host, INFOFLOW_GROUP_SEND_PATH)
-    headers = _auth_headers(token, content_type="application/json")
-
-    async def _post(body: list[dict[str, Any]], msgtype: str, reply: ReplyContext | None):
-        payload: dict[str, Any] = {
-            "message": {
-                "header": {
-                    "toid": group_id,
-                    "totype": "GROUP",
-                    "msgtype": msgtype,
-                    "clientmsgid": _next_clientmsgid(),
-                    "role": "robot",
-                },
-                "body": body,
-            }
-        }
-        if reply is not None:
-            # Per Infoflow docs: reply sits at the same level as header
-            # and body inside the message object.
-            reply_block: dict[str, Any] = {
-                "messageid": reply.messageid,
-                "preview": reply.preview,
-            }
-            if reply.replytype:
-                reply_block["replytype"] = reply.replytype
-            if reply.imid:
-                reply_block["imid"] = reply.imid
-            payload["message"]["reply"] = reply_block
-        logger.debug(
-            "[infoflow] reply payload: messageid=%s preview=%r replytype=%s",
-            reply.messageid if reply else None,
-            reply.preview[:80] if reply else None,
-            reply.replytype if reply else None,
-        )
-        body_str = json.dumps(payload, ensure_ascii=False)
-        _log_payload = _truncate_image_payload(body_str)
-        gw_log().info("[infoflow:send_payload] %s", _log_payload)
-        async with _ensure_session(session) as sess, sess.post(
-            url,
-            data=body_str.encode("utf-8"),
-            headers=headers,
-            timeout=aiohttp.ClientTimeout(total=timeout),
-        ) as resp:
-            text = await resp.text()
-        return _parse_send_response(text, kind="group")
-
-    last_messageid: str | None = None
-    last_msgseqid: str | None = None
-    messageids: list[str] = []
-    msgseqids: list[str] = []
-    first_error: str | None = None
-    reply_applied = False
-
-    if text_items:
-        msgtype = "MD"
-        res = await _post(
-            text_items,
-            msgtype,
-            reply_to if not reply_applied else None,
-        )
-        reply_applied = True
-        if res.get("ok"):
-            mid = res.get("messageid")
-            seq = res.get("msgseqid")
-            last_messageid = mid or last_messageid
-            last_msgseqid = seq or last_msgseqid
-            if mid:
-                messageids.append(str(mid))
-                msgseqids.append(str(seq or ""))
-        else:
-            first_error = first_error or res.get("error")
-
-    for link in link_items:
-        res = await _post([link], "TEXT", reply_to if not reply_applied else None)
-        reply_applied = True
-        if res.get("ok"):
-            mid = res.get("messageid")
-            seq = res.get("msgseqid")
-            last_messageid = mid or last_messageid
-            last_msgseqid = seq or last_msgseqid
-            if mid:
-                messageids.append(str(mid))
-                msgseqids.append(str(seq or ""))
-        else:
-            first_error = first_error or res.get("error")
-
-    for img in image_items:
-        res = await _post([img], "IMAGE", reply_to if not reply_applied else None)
-        reply_applied = True
-        if res.get("ok"):
-            mid = res.get("messageid")
-            seq = res.get("msgseqid")
-            last_messageid = mid or last_messageid
-            last_msgseqid = seq or last_msgseqid
-            if mid:
-                messageids.append(str(mid))
-                msgseqids.append(str(seq or ""))
-        else:
-            first_error = first_error or res.get("error")
-
-    if first_error:
-        return {
-            "ok": False,
-            "error": first_error,
-            "messageid": last_messageid,
-            "msgseqid": last_msgseqid,
-            "messageids": messageids,
-            "msgseqids": msgseqids,
-        }
-    return {
-        "ok": True,
-        "messageid": last_messageid,
-        "msgseqid": last_msgseqid,
-        "messageids": messageids,
-        "msgseqids": msgseqids,
-    }
-
-
 async def send_group_payload(
     account: InfoflowAccountAPI,
     group_id: int,
@@ -851,7 +586,7 @@ async def send_group_payload(
             "header": {
                 "toid": int(group_id),
                 "totype": "GROUP",
-                "msgtype": str(msgtype or "TEXT").upper(),
+                "msgtype": str(msgtype or "TEXT"),
                 "clientmsgid": _next_clientmsgid(),
                 "role": "robot",
             },
@@ -861,8 +596,9 @@ async def send_group_payload(
     if reply_to is not None:
         reply_block: dict[str, Any] = {
             "messageid": reply_to.messageid,
-            "preview": reply_to.preview,
         }
+        if reply_to.preview:
+            reply_block["preview"] = reply_to.preview
         if reply_to.imid:
             reply_block["imid"] = reply_to.imid
         if reply_to.replytype:
@@ -1408,8 +1144,6 @@ __all__ = [
     "get_group_members",
     "recall_group_message",
     "recall_private_message",
-    "send_group_message",
-    "send_private_message",
 ]
 
 

@@ -38,9 +38,9 @@ def extract_mentions(
 
     When *bot_agent_id* is provided, mentions resolving to the bot itself
     (either by display name or by literal agentId) are dropped silently:
-    no rewrite to ``@<agentId>``, no entry in ``agent_ids``, no entry in
-    ``unmatched`` — the original ``@<name>`` stays as plain text. This
-    avoids Infoflow's server-side "被@机器人不能包含自身" rejection.
+    no rewrite to ``@<agentId>``, no structured mention, no entry in
+    ``unmatched``. The original ``@<name>`` stays as plain text. This avoids
+    Infoflow's server-side "被@机器人不能包含自身" rejection.
     """
     user_ids: list[str] = []
     agent_ids: list[int] = []
@@ -209,8 +209,8 @@ async def prepare_outbound_message(
 
     *bot_agent_id* is the running bot's own ``agentId``. When provided, any
     @-mention that resolves to this id (via text or metadata) is dropped:
-    the original text is preserved, but no ``at-agent`` ContentItem is built
-    for self — Infoflow rejects "bot @ self" with a hard error.
+    the original text is preserved, but no structured self mention is emitted
+    because Infoflow rejects "bot @ self" with a hard error.
 
     If group member lookup fails, the message is still sent with metadata-only
     options. This keeps transient directory failures from blocking outbound

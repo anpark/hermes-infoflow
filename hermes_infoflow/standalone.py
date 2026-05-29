@@ -52,6 +52,14 @@ def _load_standalone_image_payloads(media_files: list[Any] | None) -> list[bytes
 
 
 def _sent_ids(result: SentResult) -> list[tuple[str, str]]:
+    receipts = [
+        (str(receipt.message_id or ""), str(receipt.msgseqid or ""))
+        for receipt in result.sent_messages or ()
+        if str(receipt.message_id or "")
+    ]
+    if receipts:
+        return receipts
+
     ids: list[tuple[str, str]] = []
     for mid, seq in zip(
         tuple(getattr(result, "continuation_message_ids", ()) or ()),
@@ -63,6 +71,10 @@ def _sent_ids(result: SentResult) -> list[tuple[str, str]]:
     if result.message_id:
         ids.append((str(result.message_id), str(result.msgseqid or "")))
     return ids
+
+
+def _csv_values(value: str | None) -> list[str]:
+    return [item.strip() for item in str(value or "").split(",") if item.strip()]
 
 
 def _record_sent_result(
@@ -113,6 +125,7 @@ async def standalone_send(
     """
     # Lazy import to avoid circular dependency — adapter.py imports this module.
     from .adapter import InfoflowAdapter
+    from .send_service import InfoflowSendService
     from .serverapi import ServerAPI
     from .settings import _read_account_settings
 
@@ -130,6 +143,7 @@ async def standalone_send(
         return {"error": str(exc)}
 
     serverapi = ServerAPI(settings=settings)
+    send_service = InfoflowSendService(serverapi=serverapi)
     prepared_message = ""
     options = SendOptions()
     if message.strip():
@@ -151,23 +165,34 @@ async def standalone_send(
         if prepared_message.strip() and kind == "group":
             if group_id is None:
                 return {"error": "Infoflow standalone send: invalid group target"}
-            result = await serverapi.send_to_group(
+            result = await send_service.send_group(
                 str(group_id),
-                prepared_message,
-                options=options,
+                message=prepared_message,
+                at_all=options.at_all,
+                mention_user_ids=_csv_values(options.mention_user_ids),
+                mention_agent_ids=_csv_values(options.mention_agent_ids),
             )
             sent_results.append((result, prepared_message[:80]))
         elif prepared_message.strip():
-            result = await serverapi.send_to_dm(dm_user, prepared_message, options=options)
+            result = await send_service.send_private(
+                dm_user,
+                message=prepared_message,
+            )
             sent_results.append((result, prepared_message[:80]))
 
         for image_payload in image_payloads:
             if kind == "group":
                 if group_id is None:
                     return {"error": "Infoflow standalone send: invalid group target"}
-                result = await serverapi.send_image_to_group(str(group_id), image_payload)
+                result = await send_service.send_group(
+                    str(group_id),
+                    image_bytes=image_payload,
+                )
             else:
-                result = await serverapi.send_image_to_dm(dm_user, image_payload)
+                result = await send_service.send_private(
+                    dm_user,
+                    image_bytes=image_payload,
+                )
             sent_results.append((result, "[image]"))
     except Exception as exc:
         return {"error": f"Infoflow standalone send failed: {exc}"}

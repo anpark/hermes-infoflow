@@ -38,12 +38,18 @@ def test_standalone_media_only_image_dm(monkeypatch, tmp_path) -> None:
         def __init__(self, settings):
             self.settings = settings
 
-        async def send_to_dm(self, user, text, options=None):
-            calls.append(("text_dm", user, len(text)))
-            return SentResult(success=True, message_id="TXT")
-
-        async def send_image_to_dm(self, user, image_bytes):
-            calls.append(("image_dm", user, len(image_bytes)))
+        async def send_private_message_intent(
+            self,
+            user,
+            *,
+            message=None,
+            image_bytes=None,
+            **_kwargs,
+        ):
+            if image_bytes is not None:
+                calls.append(("image_dm", user, len(image_bytes)))
+                return SentResult(success=True, message_id="IMG")
+            calls.append(("text_dm", user, len(message or "")))
             return SentResult(success=True, message_id="IMG")
 
     monkeypatch.setattr(settings_mod, "_read_account_settings", lambda pconfig: _settings(tmp_path))
@@ -72,13 +78,22 @@ def test_standalone_text_and_image_group(monkeypatch, tmp_path) -> None:
         async def get_group_members(self, *args, **kwargs):
             return []
 
-        async def send_to_group(self, group_id, text, options=None):
-            calls.append(("text_group", group_id, text))
+        async def send_group_message_intent(
+            self,
+            group_id,
+            *,
+            message=None,
+            image_bytes=None,
+            at_all=False,
+            mention_user_ids=None,
+            mention_agent_ids=None,
+            **_kwargs,
+        ):
+            if image_bytes is not None:
+                calls.append(("image_group", group_id, len(image_bytes)))
+                return SentResult(success=True, message_id="IMG")
+            calls.append(("text_group", group_id, message or ""))
             return SentResult(success=True, message_id="TXT")
-
-        async def send_image_to_group(self, group_id, image_bytes):
-            calls.append(("image_group", group_id, len(image_bytes)))
-            return SentResult(success=True, message_id="IMG")
 
     async def fake_prepare(message, **kwargs):
         return message, SendOptions()

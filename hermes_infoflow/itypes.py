@@ -227,6 +227,16 @@ class SendOptions:
 
 
 @dataclass
+class SentMessageReceipt:
+    """One concrete Infoflow message emitted by a send operation."""
+
+    message_id: str
+    msgseqid: str = ""
+    kind: str = "text"
+    preview: str = ""
+
+
+@dataclass
 class SentResult:
     """Result from serverapi after sending a message."""
 
@@ -235,6 +245,9 @@ class SentResult:
     msgseqid: str = ""  # Message sequence ID
     continuation_message_ids: tuple[str, ...] = ()
     continuation_msgseqids: tuple[str, ...] = ()
+    sent_messages: tuple[SentMessageReceipt, ...] = ()
+    warnings: tuple[dict[str, str], ...] = ()
+    error_code: str = ""
     raw_response: dict[str, Any] = field(default_factory=dict)
     error: str = ""
 

@@ -166,7 +166,8 @@ Your name is chengbo5.2 (agentId: 6533).
 **排查步骤**：
 1. 检查 `[iflow:send]` 的 `success` 字段
 2. 检查 `[infoflow:send_payload]`：payload 格式是否正确
-3. 检查网络连接和 API 凭据（token 是否过期）
+3. 群消息渲染或 reply 异常时，对照 `docs/infoflow-message-format.md` 检查 `header.msgtype` 和 `body[].type`
+4. 检查网络连接和 API 凭据（token 是否过期）
 
 ### 4.5 端到端排查示例
 

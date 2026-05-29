@@ -6,7 +6,7 @@ policy evaluation, message store, and dispatch orchestration) lives in
 one focused module.
 
 The adapter remains a thin format-translation layer:
-  ``Hermes format ←→ bot format ←→ serverapi format``
+  ``Hermes format ←→ bot format ←→ send service ←→ serverapi format``
 """
 
 from __future__ import annotations
@@ -49,9 +49,12 @@ from .recall import (
     _register_inbound_context,
     correct_inbound_confusion,
     format_recall_candidates,
+    get_inbound_body,
+    get_inbound_sender_imid,
     no_recall_error,
     reply_to_bot_from_current_inbound,
 )
+from .send_service import InfoflowSendService
 from .sent_store import SentMessageStore
 from .settings import infoflow_op_channel_from_env, parse_infoflow_admin_users
 from .utils import gw_log
@@ -234,6 +237,7 @@ class Bot:
         sent_store: SentMessageStore,
         dedup_set: set[str],
         message_store: MessageStore,
+        send_service: InfoflowSendService | None = None,
         admin_uid: str = "",
     ) -> None:
         self._settings = settings
@@ -242,6 +246,7 @@ class Bot:
         self._sent_store = sent_store
         self._dedup_set = dedup_set
         self._message_store = message_store
+        self._send_service = send_service or self._make_send_service()
         self._admin_users = parse_infoflow_admin_users(admin_uid)
         self._admin_uid = ",".join(self._admin_users)
         self._robot_id: str = str(settings.get("robot_id") or "")
@@ -284,6 +289,22 @@ class Bot:
     def serverapi(self) -> ServerAPI:
         return self._serverapi
 
+    def _make_send_service(self) -> InfoflowSendService:
+        return InfoflowSendService(
+            serverapi=self._serverapi,
+            message_store=self._message_store,
+            inbound_body_lookup=get_inbound_body,
+            inbound_sender_imid_lookup=get_inbound_sender_imid,
+        )
+
+    def _active_send_service(self) -> InfoflowSendService:
+        if (
+            getattr(self._send_service, "_serverapi", None) is not self._serverapi
+            or getattr(self._send_service, "_message_store", None) is not self._message_store
+        ):
+            self._send_service = self._make_send_service()
+        return self._send_service
+
     async def _broadcast_mixed_no_reply_to_ops(
         self,
         *,
@@ -320,16 +341,17 @@ class Bot:
             f"{text}"
         )
         try:
+            send_service = self._active_send_service()
             if target.startswith("group:"):
-                await self._serverapi.send_to_group(
+                await send_service.send_group(
                     target.split(":", 1)[1],
-                    notice,
+                    message=notice,
                     session=session,
                 )
             else:
-                await self._serverapi.send_to_dm(
+                await send_service.send_private(
                     target,
-                    notice,
+                    message=notice,
                     session=session,
                 )
             gw_log().info(
@@ -1302,7 +1324,8 @@ class Bot:
         group_id: str | None = None,
         dm_user_id: str | None = None,
         text: str,
-        reply_info: ReplyInfo | None = None,
+        reply_to: list[dict[str, str]] | None = None,
+        reply_to_sender_id: str = "",
         options: SendOptions | None = None,
         session: Any = None,
         reaction_message_id: str | None = None,
@@ -1368,20 +1391,32 @@ class Bot:
         first_error: str = ""
         failed = 0
         succeeded = 0
+        send_service = self._active_send_service()
 
         for idx, chunk in enumerate(chunks):
             # Options (mention metadata) only apply to the first chunk
             opts = options if idx == 0 else None
 
             if group_id is not None:
-                result = await self._serverapi.send_to_group(
-                    group_id, chunk,
-                    reply_info=reply_info if idx == 0 else None,
-                    options=opts, session=session,
+                result = await send_service.send_group(
+                    group_id,
+                    message=chunk,
+                    reply_to=reply_to if idx == 0 else None,
+                    at_all=opts.at_all if opts is not None else False,
+                    mention_user_ids=self._send_option_values(
+                        opts.mention_user_ids if opts is not None else ""
+                    ),
+                    mention_agent_ids=self._send_option_values(
+                        opts.mention_agent_ids if opts is not None else ""
+                    ),
+                    session=session,
                 )
             elif dm_user_id is not None:
-                result = await self._serverapi.send_to_dm(
-                    dm_user_id, chunk, options=opts, session=session,
+                result = await send_service.send_private(
+                    dm_user_id,
+                    message=chunk,
+                    reply_to=reply_to if idx == 0 else None,
+                    session=session,
                 )
             else:
                 result = SentResult(success=False, error="no target specified")
@@ -1414,7 +1449,7 @@ class Bot:
 
         # Follow-up window: record bot reply timestamp for group messages
         if succeeded and group_id:
-            _reply_key = getattr(reply_info, 'sender_id', '') or ''
+            _reply_key = str(reply_to_sender_id or "")
             self._policy.record_bot_reply(
                 group_id,
                 reply_to_sender=_reply_key,
@@ -1471,20 +1506,29 @@ class Bot:
         dm_user_id: str | None = None,
         image_bytes: bytes,
         caption: str | None = None,
-        reply_info: ReplyInfo | None = None,
+        reply_to: list[dict[str, str]] | None = None,
+        reply_to_sender_id: str = "",
         session: Any = None,
         reaction_message_id: str | None = None,
     ) -> SentResult:
         """Send an image (optionally with caption)."""
         from .adapter import _inbound_mid as _mid_var
+        send_service = self._active_send_service()
         if group_id is not None:
-            result = await self._serverapi.send_image_to_group(
-                group_id, image_bytes,
-                caption=caption, reply_info=reply_info, session=session,
+            result = await send_service.send_group(
+                group_id,
+                message=caption or "",
+                image_bytes=image_bytes,
+                reply_to=reply_to,
+                session=session,
             )
         elif dm_user_id is not None:
-            result = await self._serverapi.send_image_to_dm(
-                dm_user_id, image_bytes, caption=caption, session=session,
+            result = await send_service.send_private(
+                dm_user_id,
+                message=caption or "",
+                image_bytes=image_bytes,
+                reply_to=reply_to,
+                session=session,
             )
         else:
             await self._finish_reaction_for_send_target(
@@ -1498,9 +1542,24 @@ class Bot:
         sent_ids = self._sent_result_ids(result)
         if sent_ids:
             store_key = self._normalize_store_key(group_id, dm_user_id)
-            caption_ids = self._image_caption_message_ids(result)
+            receipt_by_id = {
+                receipt.message_id: receipt
+                for receipt in result.sent_messages or ()
+                if receipt.message_id
+            }
+            ambiguous_group_image_ids = (
+                not receipt_by_id
+                and bool(group_id)
+                and bool(caption)
+                and len(sent_ids) > 1
+            )
             for mid, seq in sent_ids:
-                stored_text = (caption or "") if caption and mid in caption_ids else "[image]"
+                receipt = receipt_by_id.get(mid)
+                stored_text = (
+                    receipt.preview
+                    if receipt and receipt.preview
+                    else ("[image]" if ambiguous_group_image_ids else (caption or "[image]"))
+                )
                 self._sent_store.record(
                     chat_id=store_key, messageid=mid,
                     msgseqid=seq, digest=stored_text[:80],
@@ -1510,7 +1569,7 @@ class Bot:
                     group_id=group_id, dm_user_id=dm_user_id,
                 )
             if group_id:
-                _reply_key = getattr(reply_info, 'sender_id', '') or ''
+                _reply_key = str(reply_to_sender_id or "")
                 self._policy.record_bot_reply(
                     group_id,
                     reply_to_sender=_reply_key,
@@ -1659,6 +1718,14 @@ class Bot:
 
     @staticmethod
     def _sent_result_ids(result: SentResult) -> list[tuple[str, str]]:
+        receipts = [
+            (str(receipt.message_id or ""), str(receipt.msgseqid or ""))
+            for receipt in result.sent_messages or ()
+            if str(receipt.message_id or "")
+        ]
+        if receipts:
+            return receipts
+
         ids: list[tuple[str, str]] = []
         continuation_ids = list(getattr(result, "continuation_message_ids", ()) or ())
         continuation_seqs = list(getattr(result, "continuation_msgseqids", ()) or ())
@@ -1672,6 +1739,10 @@ class Bot:
         if primary and all(mid != primary for mid, _seq in ids):
             ids.append((primary, str(result.msgseqid or "")))
         return ids
+
+    @staticmethod
+    def _send_option_values(value: str | None) -> list[str]:
+        return [item.strip() for item in str(value or "").split(",") if item.strip()]
 
     @staticmethod
     def _image_caption_message_ids(result: SentResult) -> set[str]:

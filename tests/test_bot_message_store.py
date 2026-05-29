@@ -8,7 +8,13 @@ import pytest
 
 from hermes_infoflow import message_store as ms
 from hermes_infoflow.bot import Bot
-from hermes_infoflow.itypes import BodyItem, IncomingMessage, ReplyTarget, SentResult
+from hermes_infoflow.itypes import (
+    BodyItem,
+    IncomingMessage,
+    ReplyTarget,
+    SentMessageReceipt,
+    SentResult,
+)
 from hermes_infoflow.message_store import MessageStore
 from hermes_infoflow.policy import GroupPolicy
 from hermes_infoflow.recall import get_inbound_body
@@ -438,7 +444,7 @@ async def test_send_message_records_partial_ids_from_failed_result(
     _install_gateway_stub(monkeypatch)
     bot, store, sent_store = _bot(tmp_path, monkeypatch)
 
-    async def fake_send_to_group(*args, **kwargs):
+    async def fake_send_group_message_intent(*args, **kwargs):
         return SentResult(
             success=False,
             message_id="G-2",
@@ -448,7 +454,10 @@ async def test_send_message_records_partial_ids_from_failed_result(
             error="second segment failed",
         )
 
-    bot._serverapi = SimpleNamespace(robot_id="999", send_to_group=fake_send_to_group)
+    bot._serverapi = SimpleNamespace(
+        robot_id="999",
+        send_group_message_intent=fake_send_group_message_intent,
+    )
 
     result = await bot.send_message(group_id="1", text="hello")
 
@@ -467,7 +476,7 @@ async def test_send_image_records_dm_caption_content(
 ) -> None:
     bot, store, sent_store = _bot(tmp_path, monkeypatch)
 
-    async def fake_send_image_to_dm(*args, **kwargs):
+    async def fake_send_private_message_intent(*args, **kwargs):
         return SentResult(
             success=False,
             message_id="CAP-1",
@@ -476,7 +485,10 @@ async def test_send_image_records_dm_caption_content(
             error="image failed",
         )
 
-    bot._serverapi = SimpleNamespace(robot_id="999", send_image_to_dm=fake_send_image_to_dm)
+    bot._serverapi = SimpleNamespace(
+        robot_id="999",
+        send_private_message_intent=fake_send_private_message_intent,
+    )
 
     result = await bot.send_image(
         dm_user_id="alice",
@@ -497,17 +509,23 @@ async def test_send_image_records_group_caption_content(
 ) -> None:
     bot, store, sent_store = _bot(tmp_path, monkeypatch)
 
-    async def fake_send_image_to_group(*args, **kwargs):
+    async def fake_send_group_message_intent(*args, **kwargs):
         return SentResult(
             success=True,
             message_id="IMG-1",
             msgseqid="IMG-SEQ",
             continuation_message_ids=("CAP-1",),
             continuation_msgseqids=("CAP-SEQ",),
-            raw_response={"caption_messageids": ["CAP-1"]},
+            sent_messages=(
+                SentMessageReceipt("CAP-1", "CAP-SEQ", "text", "caption text"),
+                SentMessageReceipt("IMG-1", "IMG-SEQ", "image", "[image]"),
+            ),
         )
 
-    bot._serverapi = SimpleNamespace(robot_id="999", send_image_to_group=fake_send_image_to_group)
+    bot._serverapi = SimpleNamespace(
+        robot_id="999",
+        send_group_message_intent=fake_send_group_message_intent,
+    )
 
     result = await bot.send_image(
         group_id="1",
@@ -532,7 +550,7 @@ async def test_send_image_records_group_caption_as_image_without_explicit_marker
 ) -> None:
     bot, store, sent_store = _bot(tmp_path, monkeypatch)
 
-    async def fake_send_image_to_group(*args, **kwargs):
+    async def fake_send_group_message_intent(*args, **kwargs):
         return SentResult(
             success=True,
             message_id="IMG-1",
@@ -545,7 +563,10 @@ async def test_send_image_records_group_caption_as_image_without_explicit_marker
             },
         )
 
-    bot._serverapi = SimpleNamespace(robot_id="999", send_image_to_group=fake_send_image_to_group)
+    bot._serverapi = SimpleNamespace(
+        robot_id="999",
+        send_group_message_intent=fake_send_group_message_intent,
+    )
 
     result = await bot.send_image(
         group_id="1",

@@ -34,7 +34,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 _DEPLOY_SCRIPT = _REPO_ROOT / "scripts" / "deploy.sh"
 _DEPLOY_COMMON_SCRIPT = _REPO_ROOT / "scripts" / "lib" / "deploy-common.sh"
 _EDIT_ENV_SCRIPT = _REPO_ROOT / "scripts" / "lib" / "edit_hermes_env.py"
-_AGENT_BRANCH = "fix/send-message-plugin-target-routing"
+_AGENT_BRANCH = "bduse"
 
 
 def _expected_package_files() -> set[str]:
@@ -238,7 +238,7 @@ def _install_fake_git_for_agent_sync(fakebin: Path) -> Path:
         "  repo=\"\"\n"
         "fi\n"
         "state=\"$FAKE_GIT_LOG.state\"\n"
-        "target_branch=\"fix/send-message-plugin-target-routing\"\n"
+        "target_branch=\"bduse\"\n"
         "state_branch() { [ -f \"$state.branch\" ] && cat \"$state.branch\" || printf 'main\\n'; }\n"
         "state_head() { [ -f \"$state.head\" ] && cat \"$state.head\" || printf 'oldhead\\n'; }\n"
         "printf 'repo=%s cmd=%s\\n' \"$repo\" \"$*\" >> \"$FAKE_GIT_LOG\"\n"
@@ -482,20 +482,18 @@ def test_tools_extract_syncs_hermes_agent_before_replacing_plugin(
     assert f"repo={agent_dir} cmd=remote add chbo {remote_dir}" in log
     assert (
         f"repo={agent_dir} cmd=fetch chbo "
-        "+refs/heads/fix/send-message-plugin-target-routing:"
-        "refs/remotes/chbo/fix/send-message-plugin-target-routing"
+        "+refs/heads/bduse:"
+        "refs/remotes/chbo/bduse"
     ) in log
     assert (
         f"repo={agent_dir} cmd=switch --detach "
-        "refs/remotes/chbo/fix/send-message-plugin-target-routing"
+        "refs/remotes/chbo/bduse"
     ) in log
     assert (
-        f"repo={agent_dir} cmd=branch -f fix/send-message-plugin-target-routing "
-        "refs/remotes/chbo/fix/send-message-plugin-target-routing"
+        f"repo={agent_dir} cmd=branch -f bduse "
+        "refs/remotes/chbo/bduse"
     ) in log
-    assert (
-        f"repo={agent_dir} cmd=switch fix/send-message-plugin-target-routing"
-    ) in log
+    assert f"repo={agent_dir} cmd=switch bduse" in log
     assert "sync_before_replace=yes" in log
     assert not marker.exists()
     assert (plugin_dir / "adapter.py").is_file()
@@ -979,6 +977,11 @@ def test_scripts_synced_for_extract_mode_reruns(readonly_deployed: Path) -> None
     assert (readonly_deployed / "scripts" / "lib" / "deploy-common.sh").is_file()
     assert (readonly_deployed / "scripts" / "lib" / "edit_hermes_config.py").is_file()
     assert (readonly_deployed / "scripts" / "lib" / "edit_hermes_env.py").is_file()
+
+
+def test_docs_synced_to_deployed_plugin(readonly_deployed: Path) -> None:
+    assert (readonly_deployed / "docs" / "infoflow-message-format.md").is_file()
+    assert (readonly_deployed / "docs" / "infoflow-send-message-refactor-plan.md").is_file()
 
 
 def test_flat_layout_config_script_loads_shared_editor(readonly_deployed: Path) -> None:

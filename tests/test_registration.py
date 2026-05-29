@@ -82,14 +82,40 @@ def test_register_registers_platform_and_tool() -> None:
     assert "infoflow_create_group" in platform["platform_hint"]
     assert "infoflow_send_message" in platform["platform_hint"]
     assert "infoflow_reply" not in platform["platform_hint"]
+    for forbidden in (
+        "richtext_links",
+        "msgid2",
+        "msg_id2",
+        "imid",
+        "旧字段",
+        "旧格式",
+        "底层",
+        "兼容",
+    ):
+        assert forbidden not in platform["platform_hint"]
 
     assert any(t["name"] == "infoflow_send_message" for t in ctx.tools)
     send_tool = next(t for t in ctx.tools if t["name"] == "infoflow_send_message")
     assert send_tool["toolset"] == "infoflow"
     assert send_tool["is_async"] is True
     assert send_tool["schema"]["parameters"]["required"] == ["target"]
+    schemas_text = str([tool["schema"] for tool in ctx.tools])
+    for forbidden in (
+        "richtext_links",
+        "msgid2",
+        "msg_id2",
+        "imid",
+        "imId",
+        "旧字段",
+        "旧格式",
+        "底层",
+        "兼容",
+    ):
+        assert forbidden not in schemas_text
     send_props = send_tool["schema"]["parameters"]["properties"]
     assert "image_paths" in send_props
+    assert "links" in send_props
+    assert "richtext_links" not in send_props
     assert "reply_to" in send_props
     assert "mention_user_ids" in send_props
     assert not any(t["name"] == "infoflow_reply" for t in ctx.tools)

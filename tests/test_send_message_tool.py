@@ -6,6 +6,7 @@ import json
 from types import SimpleNamespace
 
 from hermes_infoflow import tools as tools_mod
+from hermes_infoflow.itypes import SentMessageReceipt
 from hermes_infoflow.tools import SEND_MESSAGE_TOOL_SCHEMA, make_send_message_handler
 
 _TINY_PNG_BYTES = base64.b64decode(
@@ -34,6 +35,18 @@ class _MessageStore:
     def find_any(self, message_id: str):
         if message_id == "MID":
             return SimpleNamespace(content="引用预览", msg_id2="MSGID2")
+        if message_id == "MID_LONG":
+            return SimpleNamespace(
+                content="1" * 101,
+                msg_id2="MSGID2",
+            )
+        return None
+
+
+class _AltMessageStore:
+    def find_any(self, message_id: str):
+        if message_id == "MID":
+            return SimpleNamespace(content="替换后的引用预览")
         return None
 
 
@@ -41,36 +54,83 @@ class _ServerAPI:
     def __init__(self) -> None:
         self.group_calls: list[dict] = []
         self.private_calls: list[dict] = []
+        self.fail_next_group = False
 
-    async def get_group_members(self, group_id: str, **_kwargs):
-        assert group_id == "4507088"
-        return [
-            SimpleNamespace(uid="chengbo05", is_bot=False, agent_id=0, name="成博"),
-            SimpleNamespace(uid="17212", is_bot=True, agent_id=17212, name="Robot A"),
-        ]
-
-    async def send_group_structured(self, group_id: str, **kwargs):
-        self.group_calls.append({"group_id": group_id, **kwargs})
-        idx = len(self.group_calls)
+    @staticmethod
+    def _result(
+        *,
+        prefix: str,
+        idx: int,
+        success: bool = True,
+        kind: str = "text",
+        preview: str = "",
+        error: str = "",
+        error_code: str = "",
+        warnings: tuple[dict[str, str], ...] = (),
+        with_receipt: bool = True,
+    ):
+        message_id = f"{prefix}{idx}" if with_receipt else ""
         return SimpleNamespace(
-            success=True,
-            message_id=f"G{idx}",
-            msgseqid=f"S{idx}",
+            success=success,
+            message_id=message_id,
+            msgseqid=f"S{idx}" if with_receipt and prefix == "G" else "",
             continuation_message_ids=(),
             continuation_msgseqids=(),
-            error="",
+            error=error,
+            error_code=error_code,
+            warnings=warnings,
+            sent_messages=(
+                SentMessageReceipt(
+                    message_id=message_id,
+                    msgseqid=f"S{idx}" if prefix == "G" else "",
+                    kind=kind,
+                    preview=preview,
+                ),
+            ) if with_receipt else (),
+            raw_response={},
         )
 
-    async def send_private_structured(self, user_id: str, **kwargs):
+    async def send_group_message_intent(self, group_id: str, **kwargs):
+        self.group_calls.append({"group_id": group_id, **kwargs})
+        idx = len(self.group_calls)
+        if self.fail_next_group:
+            return self._result(
+                prefix="G",
+                idx=idx,
+                success=False,
+                kind="markdown",
+                preview=str(kwargs.get("message") or ""),
+                error="downstream timeout after send",
+            )
+        return self._result(
+            prefix="G",
+            idx=idx,
+            kind="markdown",
+            preview=str(kwargs.get("message") or ""),
+        )
+
+    async def send_private_message_intent(self, user_id: str, **kwargs):
         self.private_calls.append({"user_id": user_id, **kwargs})
         idx = len(self.private_calls)
-        return SimpleNamespace(
-            success=True,
-            message_id=f"P{idx}",
-            msgseqid="",
-            continuation_message_ids=(),
-            continuation_msgseqids=(),
-            error="",
+        if not (
+            kwargs.get("message")
+            or kwargs.get("links")
+            or kwargs.get("image_paths")
+            or kwargs.get("reply_to")
+        ):
+            return self._result(
+                prefix="P",
+                idx=idx,
+                success=False,
+                error_code="empty_message",
+                error="message, image_paths, links, or reply_to is required",
+                with_receipt=False,
+            )
+        return self._result(
+            prefix="P",
+            idx=idx,
+            kind="text",
+            preview=str(kwargs.get("message") or ""),
         )
 
 
@@ -100,9 +160,26 @@ def test_infoflow_send_message_schema_exposes_expected_inputs() -> None:
     props = SEND_MESSAGE_TOOL_SCHEMA["parameters"]["properties"]
     assert SEND_MESSAGE_TOOL_SCHEMA["parameters"]["required"] == ["target"]
     assert "image_paths" in props
+    assert "links" in props
+    assert "richtext_links" not in props
     assert "reply_to" in props
     assert "mention_agent_ids" in props
     assert "bot:<agentId>" in props["mention_agent_ids"]["description"]
+    schema_json = json.dumps(SEND_MESSAGE_TOOL_SCHEMA, ensure_ascii=False)
+    assert "msgid2" not in schema_json
+    assert "imid" not in schema_json
+    assert "richtext_links" not in schema_json
+    assert "底层" not in schema_json
+    assert "旧字段" not in schema_json
+    assert "兼容" not in schema_json
+    assert "新增" not in schema_json
+    assert "LINK body" not in schema_json
+    assert "richtext" not in schema_json
+    assert "metadata.mention" not in schema_json
+    assert "省略时仍可只发送" not in schema_json
+    assert "引用整条消息时只传 message_id" in schema_json
+    assert "指定原文片段时用 preview" in schema_json
+    assert "私聊可引用多条" in schema_json
 
 
 def test_infoflow_send_message_rejects_bot_private_target(monkeypatch) -> None:
@@ -119,27 +196,91 @@ def test_infoflow_send_message_rejects_bot_private_target(monkeypatch) -> None:
     assert "unsupported_target" in result["error"]
 
 
-def test_infoflow_send_message_rejects_private_mentions(monkeypatch) -> None:
-    monkeypatch.setattr(tools_mod, "_get_live_adapter", lambda: _Adapter())
+def test_infoflow_send_message_rejects_removed_richtext_links(monkeypatch) -> None:
+    adapter = _Adapter()
+    monkeypatch.setattr(tools_mod, "_get_live_adapter", lambda: adapter)
+
+    raw = asyncio.run(make_send_message_handler()({
+        "target": "group:4507088",
+        "message": "link",
+        "richtext_links": ["[示例]https://example.com"],
+    }))
+
+    result = json.loads(raw)
+    assert result["success"] is False
+    assert result["reason"] == "invalid_parameter"
+    assert result["error"] == "unsupported link parameter; use links"
+    assert adapter._serverapi.group_calls == []
+
+
+def test_infoflow_send_message_private_mentions_are_ignored_with_warning(
+    monkeypatch,
+) -> None:
+    adapter = _Adapter()
+    monkeypatch.setattr(tools_mod, "_get_live_adapter", lambda: adapter)
 
     raw = asyncio.run(make_send_message_handler()({
         "target": "user:chengbo05",
-        "message": "hello",
+        "message": "hello @chengbo05",
+        "mention_user_ids": ["chengbo05"],
+    }))
+
+    result = json.loads(raw)
+    assert result["success"] is True
+    assert result["warnings"] == [
+        {
+            "code": "private_mentions_ignored",
+            "message": "structured @ mention fields are ignored for private messages",
+        }
+    ]
+    call = adapter._serverapi.private_calls[0]
+    assert call["user_id"] == "chengbo05"
+    assert call["message"] == "hello @chengbo05"
+    assert "mention_user_ids" not in call
+
+
+def test_infoflow_send_message_private_mentions_only_is_empty_message(
+    monkeypatch,
+) -> None:
+    adapter = _Adapter()
+    monkeypatch.setattr(tools_mod, "_get_live_adapter", lambda: adapter)
+
+    raw = asyncio.run(make_send_message_handler()({
+        "target": "user:chengbo05",
         "mention_user_ids": ["chengbo05"],
     }))
 
     result = json.loads(raw)
     assert result["success"] is False
-    assert result["reason"] == "invalid_mentions"
+    assert result["reason"] == "empty_message"
+    assert result["warnings"] == [
+        {
+            "code": "private_mentions_ignored",
+            "message": "structured @ mention fields are ignored for private messages",
+        }
+    ]
+    assert adapter._serverapi.private_calls == [
+        {
+            "user_id": "chengbo05",
+            "message": None,
+            "format": "auto",
+            "links": None,
+            "image_paths": None,
+            "reply_to": [],
+            "session": None,
+        }
+    ]
 
 
-def test_infoflow_send_message_private_reply_only_uses_text_payload(monkeypatch) -> None:
+def test_infoflow_send_message_private_reply_preview_is_tool_normalized(
+    monkeypatch,
+) -> None:
     adapter = _Adapter()
     monkeypatch.setattr(tools_mod, "_get_live_adapter", lambda: adapter)
 
     raw = asyncio.run(make_send_message_handler()({
         "target": "infoflow:user:chengbo05",
-        "reply_to": "MID",
+        "reply_to": "MID_LONG",
     }))
 
     result = json.loads(raw)
@@ -153,98 +294,170 @@ def test_infoflow_send_message_private_reply_only_uses_text_payload(monkeypatch)
     }
     call = adapter._serverapi.private_calls[0]
     assert call["user_id"] == "chengbo05"
-    assert call["text"] == ""
-    assert call["reply_targets"] == [
-        {"message_id": "MID", "preview": "引用预览", "msgid2": "MSGID2"}
+    assert call["message"] is None
+    assert call["reply_to"] == [
+        {"message_id": "MID_LONG", "preview": f"{'1' * 100}..."}
     ]
     assert adapter._sent_store.records[0]["chat_id"] == "chengbo05"
     assert adapter._bot.records[0]["dm_user_id"] == "chengbo05"
 
 
-def test_infoflow_send_message_group_media_order_and_reply_once(
+def test_infoflow_send_message_explicit_reply_preview_is_not_20_char_truncated(
+    monkeypatch,
+) -> None:
+    adapter = _Adapter()
+    monkeypatch.setattr(tools_mod, "_get_live_adapter", lambda: adapter)
+
+    raw = asyncio.run(make_send_message_handler()({
+        "target": "infoflow:user:chengbo05",
+        "message": "ok",
+        "reply_to": {
+            "message_id": "MID",
+            "preview": "1234567890123456789012345\n第二行\x00",
+        },
+    }))
+
+    result = json.loads(raw)
+    assert result["success"] is True
+    call = adapter._serverapi.private_calls[0]
+    assert call["reply_to"] == [
+        {"message_id": "MID", "preview": "1234567890123456789012345 第二行"}
+    ]
+
+
+def test_infoflow_send_message_reply_to_accepts_json_object_string(
+    monkeypatch,
+) -> None:
+    adapter = _Adapter()
+    monkeypatch.setattr(tools_mod, "_get_live_adapter", lambda: adapter)
+
+    raw = asyncio.run(make_send_message_handler()({
+        "target": "infoflow:group:4507088",
+        "message": "ok",
+        "reply_to": json.dumps({
+            "message_id": "MID",
+            "preview": "第二段核心结论",
+        }, ensure_ascii=False),
+    }))
+
+    result = json.loads(raw)
+    assert result["success"] is True
+    call = adapter._serverapi.group_calls[0]
+    assert call["reply_to"] == [
+        {"message_id": "MID", "preview": "第二段核心结论"}
+    ]
+
+
+def test_infoflow_send_message_private_links_dispatch_to_serverapi(
+    monkeypatch,
+) -> None:
+    adapter = _Adapter()
+    monkeypatch.setattr(tools_mod, "_get_live_adapter", lambda: adapter)
+
+    raw = asyncio.run(make_send_message_handler()({
+        "target": "infoflow:user:chengbo05",
+        "message": "请看链接：",
+        "links": [{"href": "https://example.com", "label": "示例"}],
+        "reply_to": "MID",
+    }))
+
+    result = json.loads(raw)
+    assert result["success"] is True
+    call = adapter._serverapi.private_calls[0]
+    assert call["user_id"] == "chengbo05"
+    assert call["message"] == "请看链接："
+    assert call["links"] == [{"href": "https://example.com", "label": "示例"}]
+    assert call["reply_to"] == [{"message_id": "MID", "preview": "引用预览"}]
+
+
+def test_infoflow_send_message_refreshes_stale_adapter_send_service(
+    monkeypatch,
+) -> None:
+    adapter = _Adapter()
+    monkeypatch.setattr(tools_mod, "_get_live_adapter", lambda: adapter)
+    handler = make_send_message_handler()
+
+    raw = asyncio.run(handler({
+        "target": "group:4507088",
+        "message": "first",
+        "reply_to": "MID",
+    }))
+    assert json.loads(raw)["success"] is True
+    assert adapter._serverapi.group_calls[-1]["reply_to"] == [
+        {"message_id": "MID", "preview": "引用预览"}
+    ]
+
+    adapter._message_store = _AltMessageStore()
+    raw = asyncio.run(handler({
+        "target": "group:4507088",
+        "message": "second",
+        "reply_to": "MID",
+    }))
+
+    assert json.loads(raw)["success"] is True
+    assert adapter._serverapi.group_calls[-1]["reply_to"] == [
+        {"message_id": "MID", "preview": "替换后的引用预览"}
+    ]
+
+
+def test_infoflow_send_message_group_dispatches_semantic_parameters(
+    monkeypatch,
+) -> None:
+    adapter = _Adapter()
+    monkeypatch.setattr(tools_mod, "_get_live_adapter", lambda: adapter)
+
+    raw = asyncio.run(make_send_message_handler()({
+        "target": "group:4507088",
+        "message": "**reply body**",
+        "reply_to": {"message_id": "MID"},
+        "links": ["[示例]https://example.com"],
+        "mention_user_ids": ["chengbo05"],
+        "mention_agent_ids": ["bot:17212"],
+    }))
+
+    result = json.loads(raw)
+    assert result["success"] is True
+    call = adapter._serverapi.group_calls[0]
+    assert call["group_id"] == "4507088"
+    assert call["message"] == "**reply body**"
+    assert call["format"] == "auto"
+    assert call["links"] == ["[示例]https://example.com"]
+    assert call["reply_to"] == [{"message_id": "MID", "preview": "引用预览"}]
+    assert call["mention_user_ids"] == ["chengbo05"]
+    assert call["mention_agent_ids"] == ["bot:17212"]
+
+
+def test_infoflow_send_message_group_media_paths_stay_semantic(
     monkeypatch,
     tmp_path,
 ) -> None:
-    image1 = tmp_path / "one.png"
-    image2 = tmp_path / "two.png"
-    image3 = tmp_path / "three.png"
-    for path in (image1, image2, image3):
-        path.write_bytes(_TINY_PNG_BYTES)
+    image = tmp_path / "one.png"
+    image.write_bytes(_TINY_PNG_BYTES)
     adapter = _Adapter()
     monkeypatch.setattr(tools_mod, "_get_live_adapter", lambda: adapter)
 
     raw = asyncio.run(make_send_message_handler()({
         "target": "4507088",
-        "message": f"正文1 MEDIA:{image1} 正文2 MEDIA:{image2}",
-        "image_paths": [str(image2), str(image3)],
+        "message": f"正文 MEDIA:{image}",
+        "image_paths": [str(image)],
         "reply_to": {"message_id": "MID"},
     }))
 
     result = json.loads(raw)
     assert result["success"] is True
     assert result["target"] == "group:4507088"
-    assert result["chat_type"] == "group"
-    assert result["sent_messages"] == [
-        {"message_id": "G1", "kind": "mixed", "preview": "正文1 [image] 正文2"},
-        {"message_id": "G2", "kind": "image", "preview": "[image]"},
-        {"message_id": "G3", "kind": "image", "preview": "[image]"},
-    ]
-    assert len(adapter._serverapi.group_calls) == 3
-    first = adapter._serverapi.group_calls[0]
-    assert first["group_id"] == "4507088"
-    assert first["msgtype"] == "IMAGE"
-    assert [item["type"] for item in first["body"]] == ["TEXT", "IMAGE", "TEXT"]
-    assert first["body"][0]["content"] == "正文1 "
-    assert first["body"][2]["content"] == " 正文2 "
-    assert first["reply_target"] == {
-        "message_id": "MID",
-        "preview": "引用预览",
-        "msgid2": "MSGID2",
-    }
-    assert adapter._serverapi.group_calls[1]["reply_target"] is None
-    assert adapter._serverapi.group_calls[2]["reply_target"] is None
-    assert all("msgseqid" not in item for item in result["sent_messages"])
-    assert all(str(tmp_path) not in item["preview"] for item in result["sent_messages"])
+    call = adapter._serverapi.group_calls[0]
+    assert call["group_id"] == "4507088"
+    assert call["message"] == f"正文 MEDIA:{image}"
+    assert call["image_paths"] == [str(image)]
+    assert call["reply_to"] == [{"message_id": "MID", "preview": "引用预览"}]
 
 
-def test_infoflow_send_message_group_at_items_keep_body_order(monkeypatch) -> None:
+def test_infoflow_send_message_records_failed_result_ids_as_partial(
+    monkeypatch,
+) -> None:
     adapter = _Adapter()
-    monkeypatch.setattr(tools_mod, "_get_live_adapter", lambda: adapter)
-
-    raw = asyncio.run(make_send_message_handler()({
-        "target": "group:4507088",
-        "message": "hi @chengbo05 then @17212",
-    }))
-
-    result = json.loads(raw)
-    assert result["success"] is True
-    assert result["sent_messages"] == [
-        {"message_id": "G1", "kind": "mixed", "preview": "hi @chengbo05 then @17212"}
-    ]
-    body = adapter._serverapi.group_calls[0]["body"]
-    assert body == [
-        {"type": "TEXT", "content": "hi "},
-        {"type": "AT", "atuserids": ["chengbo05"]},
-        {"type": "TEXT", "content": " then "},
-        {"type": "AT", "atagentids": [17212]},
-    ]
-
-
-def test_infoflow_send_message_records_failed_result_ids_as_partial(monkeypatch) -> None:
-    adapter = _Adapter()
-
-    async def fail_with_id(group_id: str, **kwargs):
-        adapter._serverapi.group_calls.append({"group_id": group_id, **kwargs})
-        return SimpleNamespace(
-            success=False,
-            message_id="G-PARTIAL",
-            msgseqid="S-PARTIAL",
-            continuation_message_ids=(),
-            continuation_msgseqids=(),
-            error="downstream timeout after send",
-        )
-
-    adapter._serverapi.send_group_structured = fail_with_id
+    adapter._serverapi.fail_next_group = True
     monkeypatch.setattr(tools_mod, "_get_live_adapter", lambda: adapter)
 
     raw = asyncio.run(make_send_message_handler()({
@@ -256,7 +469,7 @@ def test_infoflow_send_message_records_failed_result_ids_as_partial(monkeypatch)
     assert result["success"] is False
     assert result["reason"] == "partial_failure"
     assert result["sent_messages"] == [
-        {"message_id": "G-PARTIAL", "kind": "text", "preview": "可能已发出"}
+        {"message_id": "G1", "kind": "markdown", "preview": "可能已发出"}
     ]
     assert "do not resend" in result["retry_note"]
-    assert adapter._sent_store.records[0]["messageid"] == "G-PARTIAL"
+    assert adapter._sent_store.records[0]["messageid"] == "G1"

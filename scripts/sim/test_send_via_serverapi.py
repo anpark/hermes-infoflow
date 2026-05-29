@@ -5,9 +5,9 @@ This exercises the exact code that both ``adapter.send()`` and
 
     prepare_outbound_message(...)   # outbound.py — metadata + @-mention
         ↓
-    ServerAPI.send_to_group(...)    # serverapi.py — builds ContentItem[]
+    ServerAPI.send_group_message_intent(...)  # serverapi.py — picks wire format
         ↓
-    api.send_group_message(...)     # api.py — actual HTTP POST
+    api.send_group_payload(...)     # api.py — actual HTTP POST
 
 It does **not** depend on hermes-agent / gateway being importable, so
 it is the lowest-friction way to verify the refactor against the real
@@ -63,7 +63,21 @@ async def _run(args: argparse.Namespace) -> int:
         f"agents={options.mention_agent_ids!r}"
     )
 
-    result = await serverapi.send_to_group(args.group, text, options=options)
+    result = await serverapi.send_group_message_intent(
+        args.group,
+        message=text,
+        at_all=options.at_all,
+        mention_user_ids=[
+            item.strip()
+            for item in str(options.mention_user_ids or "").split(",")
+            if item.strip()
+        ],
+        mention_agent_ids=[
+            item.strip()
+            for item in str(options.mention_agent_ids or "").split(",")
+            if item.strip()
+        ],
+    )
     print("[sim:serverapi] result:", json.dumps({
         "success": result.success,
         "message_id": result.message_id,
@@ -89,13 +103,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--mention-user", default="",
-        help="Comma-separated uuapNames forwarded via metadata.mention_user_ids.",
+        help="Comma-separated uuapNames forwarded to mention_user_ids.",
     )
     parser.add_argument(
         "--mention-agent", default="",
-        help="Comma-separated agentIds forwarded via metadata.mention_agent_ids.",
+        help="Comma-separated agentIds forwarded to mention_agent_ids.",
     )
-    parser.add_argument("--at-all", action="store_true", help="Set metadata.at_all=true.")
+    parser.add_argument("--at-all", action="store_true", help="Send with at_all=true.")
     return parser
 
 

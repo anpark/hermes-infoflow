@@ -57,30 +57,6 @@ def test_build_private_payload_link_promotes_to_richtext() -> None:
     ]
 
 
-def test_build_group_body_items_handles_all_types() -> None:
-    body, has_md = api._build_group_body_items(
-        [
-            api.ContentItem("text", "hi"),
-            api.ContentItem("markdown", "**x**"),
-            api.ContentItem("at", "all"),
-            api.ContentItem("at", "alice,bob"),
-            api.ContentItem("at-agent", "42,43"),
-            api.ContentItem("link", "https://x.com"),
-            api.ContentItem("image", "BASE64..."),
-        ]
-    )
-    assert has_md is True
-    types = [b["type"] for b in body]
-    assert "MD" in types
-    assert "TEXT" not in types  # plain text is folded into MD-only outbound path
-    assert "LINK" in types
-    assert "IMAGE" in types
-    at_items = [b for b in body if b["type"] == "AT"]
-    assert any(b.get("atall") for b in at_items)
-    assert any("alice" in b.get("atuserids", []) for b in at_items)
-    assert any(42 in b.get("atagentids", []) for b in at_items)
-
-
 def test_truncate_image_payload_redacts_private_image_content() -> None:
     payload = json.dumps(
         {"touser": "alice", "msgtype": "image", "image": {"content": "A" * 1200}}
@@ -103,6 +79,13 @@ def test_truncate_image_payload_redacts_group_image_content() -> None:
     assert "<base64 1300 chars>" in redacted
 
 
+def test_legacy_send_helpers_are_removed() -> None:
+    assert not hasattr(api, "send_group_message")
+    assert not hasattr(api, "send_private_message")
+    assert "send_group_message" not in api.__all__
+    assert "send_private_message" not in api.__all__
+
+
 def test_image_debug_log_helpers_redact_image_content() -> None:
     contents = [api.ContentItem("image", "C" * 1400)]
     body = [{"type": "IMAGE", "content": "D" * 1500}]
@@ -115,26 +98,22 @@ def test_image_debug_log_helpers_redact_image_content() -> None:
     ]
 
 
-def test_send_group_message_keeps_msgseqids_aligned(monkeypatch) -> None:
-    """Each successful messageid must have a same-index msgseqid slot."""
-    responses = [
-        '{"code":"ok","data":{"errcode":0},"messageid":"1111111111111111111"}',
-        '{"code":"ok","data":{"errcode":0},"messageid":"2222222222222222222","msgseqid":"222"}',
-    ]
+def test_send_group_payload_omits_empty_reply_preview(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
 
     class _Resp:
-        def __init__(self, text):
-            self._text = text
         async def __aenter__(self): return self
         async def __aexit__(self, *_): return None
-        async def text(self): return self._text
+        async def text(self):
+            return '{"code":"ok","data":{"errcode":0},"messageid":"111"}'
 
     class _Sess:
         async def __aenter__(self): return self
         async def __aexit__(self, *_): return None
         def post(self, url, *, data, headers, timeout):
-            del url, data, headers, timeout
-            return _Resp(responses.pop(0))
+            del url, headers, timeout
+            captured["payload"] = json.loads(data.decode("utf-8"))
+            return _Resp()
         async def close(self): return None
 
     async def fake_token(*a, **k):
@@ -147,20 +126,65 @@ def test_send_group_message_keeps_msgseqids_aligned(monkeypatch) -> None:
         app_secret="s",
     )
 
-    async def _go():
-        return await api.send_group_message(
-            account,
-            group_id=4507088,
-            contents=[
-                api.ContentItem("markdown", "hello"),
-                api.ContentItem("image", "BASE64"),
-            ],
-            session=_Sess(),
-        )
+    result = asyncio.run(api.send_group_payload(
+        account,
+        group_id=4507088,
+        body=[{"type": "TEXT", "content": "hello"}],
+        msgtype="TEXT",
+        reply_to=api.ReplyContext(
+            messageid="MID",
+            preview="",
+            imid="999",
+            replytype="",
+        ),
+        session=_Sess(),
+    ))
 
-    result = asyncio.run(_go())
-    assert result["messageids"] == ["1111111111111111111", "2222222222222222222"]
-    assert result["msgseqids"] == ["", "222"]
+    assert result["ok"] is True
+    assert captured["payload"]["message"]["reply"] == {
+        "messageid": "MID",
+        "imid": "999",
+    }
+
+
+def test_send_group_payload_preserves_msgtype_casing(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    class _Resp:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): return None
+        async def text(self):
+            return '{"code":"ok","data":{"errcode":0},"messageid":"111"}'
+
+    class _Sess:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): return None
+        def post(self, url, *, data, headers, timeout):
+            del url, headers, timeout
+            captured["payload"] = json.loads(data.decode("utf-8"))
+            return _Resp()
+        async def close(self): return None
+
+    async def fake_token(*a, **k):
+        return "TOK"
+
+    monkeypatch.setattr(api, "get_app_access_token", fake_token)
+    account = api.InfoflowAccountAPI(
+        api_host="https://api.example.com",
+        app_key="k",
+        app_secret="s",
+    )
+
+    result = asyncio.run(api.send_group_payload(
+        account,
+        group_id=4507088,
+        body=[{"type": "TEXT", "content": "hello"}],
+        msgtype="text",
+        session=_Sess(),
+    ))
+
+    assert result["ok"] is True
+    assert captured["payload"]["message"]["header"]["msgtype"] == "text"
 
 
 def test_create_group_posts_expected_payload(monkeypatch) -> None:

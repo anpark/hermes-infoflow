@@ -1264,10 +1264,9 @@ def test_handle_webhook_returns_200_before_dispatch_completes(configured_env, mo
 def test_outbound_send_records_dedup_id(configured_env, monkeypatch) -> None:
     adapter = InfoflowAdapter(_make_config())
 
-    async def fake_send_private(account, to_user, contents, *, session=None):
-        return {"ok": True, "msgkey": "MSG-1"}
-
-    monkeypatch.setattr(_api, "send_private_message", fake_send_private)
+    adapter._serverapi.send_private_message_intent = AsyncMock(
+        return_value=SentResult(success=True, message_id="MSG-1")
+    )
 
     async def _go():
         return await adapter.send("alice", "hello")
@@ -1472,14 +1471,47 @@ def test_send_image_private_sends_native_image(configured_env, monkeypatch, tmp_
         return _TINY_PNG_BYTES
     monkeypatch.setattr(InfoflowAdapter, "_load_image_bytes", fake_load)
 
-    captured = {}
-    async def fake_send_private(account, to_user, contents, *, session=None):
-        captured.setdefault("calls", []).append(
-            {"to_user": to_user, "types": [c.type for c in contents], "first_content": contents[0].content[:20]}
-        )
-        return {"ok": True, "msgkey": "MSG-IMG"}
+    captured: dict[str, list[dict[str, object]]] = {"calls": []}
 
-    monkeypatch.setattr(_api, "send_private_message", fake_send_private)
+    async def fake_send_private_structured(
+        user_id,
+        *,
+        text=None,
+        markdown=None,
+        richtext_content=None,
+        image_bytes=None,
+        reply_to=None,
+        session=None,
+    ):
+        del reply_to, session
+        if image_bytes is not None:
+            kind = "image"
+            message_id = "MSG-IMG"
+            first_content = image_bytes[:20]
+        elif richtext_content is not None:
+            kind = "richtext"
+            message_id = "MSG-CAPTION"
+            first_content = str(richtext_content)[:20]
+        elif markdown is not None:
+            kind = "markdown"
+            message_id = "MSG-CAPTION"
+            first_content = markdown[:20]
+        else:
+            kind = "text"
+            message_id = "MSG-CAPTION"
+            first_content = str(text or "")[:20]
+        captured["calls"].append({
+            "to_user": user_id,
+            "types": [kind],
+            "first_content": first_content,
+        })
+        return SentResult(success=True, message_id=message_id)
+
+    monkeypatch.setattr(
+        adapter._serverapi,
+        "send_private_structured",
+        fake_send_private_structured,
+    )
 
     import asyncio
     async def _go():
@@ -1507,13 +1539,39 @@ def test_send_image_file_private_sends_native_image_without_path_text(
 
     captured = {}
 
-    async def fake_send_private(account, to_user, contents, *, session=None):
+    async def fake_send_private_structured(
+        user_id,
+        *,
+        text=None,
+        markdown=None,
+        richtext_content=None,
+        image_bytes=None,
+        reply_to=None,
+        session=None,
+    ):
+        del text, reply_to, session
+        if image_bytes is not None:
+            kind = "image"
+            message_id = "MSG-FILE-IMG"
+        elif richtext_content is not None:
+            kind = "richtext"
+            message_id = "MSG-FILE-CAPTION"
+        elif markdown is not None:
+            kind = "markdown"
+            message_id = "MSG-FILE-CAPTION"
+        else:
+            kind = "text"
+            message_id = "MSG-FILE-CAPTION"
         captured.setdefault("calls", []).append(
-            {"to_user": to_user, "types": [c.type for c in contents]}
+            {"to_user": user_id, "types": [kind]}
         )
-        return {"ok": True, "msgkey": "MSG-FILE-IMG"}
+        return SentResult(success=True, message_id=message_id)
 
-    monkeypatch.setattr(_api, "send_private_message", fake_send_private)
+    monkeypatch.setattr(
+        adapter._serverapi,
+        "send_private_structured",
+        fake_send_private_structured,
+    )
 
     async def _go():
         return await adapter.send_image_file("alice", str(image_path), caption="see this")
@@ -1608,13 +1666,18 @@ def test_send_partial_failure_returns_error_with_last_messageid(
     )
     call_count = {"n": 0}
 
-    async def fake_send_private(account, to_user, contents, *, session=None):
+    async def fake_send_private_intent(user_id, *, message=None, session=None, **kwargs):
+        del user_id, message, session, kwargs
         call_count["n"] += 1
         if call_count["n"] == 2:
-            return {"ok": False, "error": "transient"}
-        return {"ok": True, "msgkey": f"MID-{call_count['n']}"}
+            return SentResult(success=False, error="transient")
+        return SentResult(success=True, message_id=f"MID-{call_count['n']}")
 
-    monkeypatch.setattr(_api, "send_private_message", fake_send_private)
+    monkeypatch.setattr(
+        adapter._serverapi,
+        "send_private_message_intent",
+        fake_send_private_intent,
+    )
 
     async def _go():
         return await adapter.send("alice", "abcdefghijklmnop")
@@ -1629,10 +1692,9 @@ def test_send_partial_failure_returns_error_with_last_messageid(
 def test_send_records_bot_reply_for_follow_up(configured_env, monkeypatch) -> None:
     adapter = InfoflowAdapter(_make_config())
 
-    async def fake_send_group(account, *, group_id, contents, reply_to=None, session=None):
-        return {"ok": True, "messageid": "M1", "msgseqid": "S1"}
-
-    monkeypatch.setattr(_api, "send_group_message", fake_send_group)
+    adapter._serverapi.send_group_message_intent = AsyncMock(
+        return_value=SentResult(success=True, message_id="M1", msgseqid="S1")
+    )
 
     async def _go():
         return await adapter.send("group:42", "hello")
@@ -1670,10 +1732,9 @@ def test_group_runtime_status_is_suppressed_and_broadcast_to_ops(
     )
     adapter._push_infoflow_event = MagicMock()
 
-    async def fake_send_group(*args, **kwargs):
-        raise AssertionError("group send must not be called for runtime status")
-
-    monkeypatch.setattr(_api, "send_group_message", fake_send_group)
+    adapter._serverapi.send_group_message_intent = AsyncMock(
+        side_effect=AssertionError("group send must not be called for runtime status")
+    )
 
     async def _go():
         return await adapter.send("group:42", content)
@@ -1713,10 +1774,9 @@ def test_group_runtime_status_can_send_to_numeric_ops_group(
     )
     adapter._push_infoflow_event = MagicMock()
 
-    async def fake_send_group(*args, **kwargs):
-        raise AssertionError("group send must not be called for runtime status")
-
-    monkeypatch.setattr(_api, "send_group_message", fake_send_group)
+    adapter._serverapi.send_group_message_intent = AsyncMock(
+        side_effect=AssertionError("group send must not be called for runtime status")
+    )
 
     async def _go():
         return await adapter.send("group:42", "⚠️ Gateway shutting down")
@@ -1746,10 +1806,9 @@ def test_group_runtime_status_suppression_survives_ops_broadcast_exception(
     adapter._bot.send_message = AsyncMock(side_effect=RuntimeError("boom"))
     adapter._push_infoflow_event = MagicMock()
 
-    async def fake_send_group(*args, **kwargs):
-        raise AssertionError("group send must not be called for runtime status")
-
-    monkeypatch.setattr(_api, "send_group_message", fake_send_group)
+    adapter._serverapi.send_group_message_intent = AsyncMock(
+        side_effect=AssertionError("group send must not be called for runtime status")
+    )
 
     async def _go():
         return await adapter.send("group:42", content)
@@ -1783,10 +1842,9 @@ def test_group_runtime_status_does_not_fallback_to_admin(
     adapter._bot.send_message = AsyncMock()
     adapter._push_infoflow_event = MagicMock()
 
-    async def fake_send_group(*args, **kwargs):
-        raise AssertionError("group send must not be called for runtime status")
-
-    monkeypatch.setattr(_api, "send_group_message", fake_send_group)
+    adapter._serverapi.send_group_message_intent = AsyncMock(
+        side_effect=AssertionError("group send must not be called for runtime status")
+    )
 
     async def _go():
         return await adapter.send("group:42", "⚠️ Gateway shutting down")
@@ -1822,10 +1880,9 @@ def test_group_compression_status_is_suppressed_without_admin_redirect(
     adapter._bot.send_message = AsyncMock()
     adapter._push_infoflow_event = MagicMock()
 
-    async def fake_send_group(*args, **kwargs):
-        raise AssertionError("group send must not be called for compression status")
-
-    monkeypatch.setattr(_api, "send_group_message", fake_send_group)
+    adapter._serverapi.send_group_message_intent = AsyncMock(
+        side_effect=AssertionError("group send must not be called for compression status")
+    )
 
     async def _go():
         return await adapter.send("group:4507088", content)
@@ -2203,16 +2260,15 @@ def test_send_then_delete_with_infoflow_prefix(configured_env, monkeypatch) -> N
     """
     adapter = InfoflowAdapter(_make_config())
 
-    async def fake_send_private(account, to_user, contents, *, session=None):
-        return {"ok": True, "msgkey": "MID-X"}
-
     captured = {}
 
     async def fake_recall_private(account, *, msgkey, session=None):
         captured["msgkey"] = msgkey
         return {"ok": True}
 
-    monkeypatch.setattr(_api, "send_private_message", fake_send_private)
+    adapter._serverapi.send_private_message_intent = AsyncMock(
+        return_value=SentResult(success=True, message_id="MID-X")
+    )
     monkeypatch.setattr(_api, "recall_private_message", fake_recall_private)
 
     async def _go():
@@ -2229,16 +2285,15 @@ def test_send_with_canonical_then_delete_with_prefix(configured_env, monkeypatch
     """And the symmetric direction: send canonical, recall via prefixed form."""
     adapter = InfoflowAdapter(_make_config())
 
-    async def fake_send_private(account, to_user, contents, *, session=None):
-        return {"ok": True, "msgkey": "MID-Y"}
-
     captured = {}
 
     async def fake_recall_private(account, *, msgkey, session=None):
         captured["msgkey"] = msgkey
         return {"ok": True}
 
-    monkeypatch.setattr(_api, "send_private_message", fake_send_private)
+    adapter._serverapi.send_private_message_intent = AsyncMock(
+        return_value=SentResult(success=True, message_id="MID-Y")
+    )
     monkeypatch.setattr(_api, "recall_private_message", fake_recall_private)
 
     async def _go():

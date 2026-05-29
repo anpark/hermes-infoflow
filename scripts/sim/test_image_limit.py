@@ -82,10 +82,19 @@ def _parse_size(raw: str) -> int:
 async def _send_dm(account, user: str, b64: str, session):
     from hermes_infoflow import api as _api
 
-    return await _api.send_private_message(
+    agent_id = str(account.app_agent_id or "").strip()
+    if not agent_id:
+        return {"ok": False, "error": "INFOFLOW_APP_AGENT_ID is required for DM image sends"}
+    return await _api.send_private_payload(
         account,
-        to_user=user,
-        contents=[_api.ContentItem("image", b64)],
+        {
+            "touser": user,
+            "toparty": "",
+            "totag": "",
+            "agentid": agent_id,
+            "msgtype": "image",
+            "image": {"content": b64},
+        },
         session=session,
     )
 
@@ -93,10 +102,11 @@ async def _send_dm(account, user: str, b64: str, session):
 async def _send_group(account, group_id: str, b64: str, session):
     from hermes_infoflow import api as _api
 
-    return await _api.send_group_message(
+    return await _api.send_group_payload(
         account,
         group_id=int(group_id),
-        contents=[_api.ContentItem("image", b64)],
+        body=[{"type": "IMAGE", "content": b64}],
+        msgtype="IMAGE",
         session=session,
     )
 
