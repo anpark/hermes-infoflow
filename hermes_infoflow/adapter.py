@@ -37,6 +37,7 @@ import socket as _socket
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
 from urllib.parse import urljoin as _urljoin
 from urllib.parse import urlparse as _urlparse
@@ -76,6 +77,12 @@ _GROUP_STATUS_TRACKER_ONLY_TEXT_PREFIXES = (
 class _UnreadMessageContext:
     history_before_count: int = 0
     effective_unread_count: int = 0
+
+
+@dataclass
+class _BusySteerReplyScope:
+    chat_key: str
+    message_ids: list[str]
 
 
 def _looks_like_progress_line(text: str) -> bool:
@@ -424,6 +431,10 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         self._http_session: aiohttp.ClientSession | None = None
         self._infoflow_original_busy_session_handler = None
         self._busy_steer_reaction_by_session: dict[str, Any] = {}
+        self._busy_steer_reply_scope_by_session: dict[
+            str,
+            _BusySteerReplyScope,
+        ] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -481,6 +492,22 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             self._busy_steer_reaction_by_session[session_key] = token
         return token
 
+    def _remember_busy_steer_reply_scope(self, session_key: str, event: Any) -> None:
+        message_id = self._event_message_id(event)
+        chat_key, _group_id, _dm_user = self._chat_key_for_event(event)
+        if not session_key or not message_id or not chat_key:
+            return
+        scope = self._busy_steer_reply_scope_by_session.get(session_key)
+        if scope is None or scope.chat_key != chat_key:
+            self._busy_steer_reply_scope_by_session[session_key] = (
+                _BusySteerReplyScope(chat_key=chat_key, message_ids=[message_id])
+            )
+            return
+        if message_id not in scope.message_ids:
+            scope.message_ids.append(message_id)
+            if len(scope.message_ids) > 20:
+                del scope.message_ids[:-20]
+
     async def _finish_busy_steer_reaction_for_event(
         self,
         event: Any,
@@ -490,14 +517,14 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         if not session_key:
             return
         token = self._busy_steer_reaction_by_session.pop(session_key, None)
-        if token is None:
-            return
-        finish_token = getattr(self._bot, "finish_processing_reaction_token", None)
-        if callable(finish_token):
-            await finish_token(
-                token,
-                reason=f"busy_steer_parent_{outcome_label}",
-            )
+        self._busy_steer_reply_scope_by_session.pop(session_key, None)
+        if token is not None:
+            finish_token = getattr(self._bot, "finish_processing_reaction_token", None)
+            if callable(finish_token):
+                await finish_token(
+                    token,
+                    reason=f"busy_steer_parent_{outcome_label}",
+                )
 
     @staticmethod
     def _config_bool(raw: Any, *, default: bool) -> bool:
@@ -642,6 +669,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
 
             if accepted:
                 reaction_token = self._remember_busy_steer_reaction(session_key)
+                self._remember_busy_steer_reply_scope(session_key, event)
                 try:
                     self._mark_event_llm_visible(event)
                 except Exception as exc:
@@ -1000,6 +1028,135 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             if user_id:
                 parts.append(user_id)
             return ":".join(parts)
+
+    def _session_key_for_dm_record(self, dm_record: Any, message_id: str) -> str:
+        dm_user = raw_id_from_key(getattr(dm_record, "peer", "")) or str(
+            getattr(dm_record, "dm_user_id", "") or ""
+        )
+        if not dm_user:
+            return ""
+        sender_id = raw_id_from_key(getattr(dm_record, "sender", "")) or dm_user
+        source = self.build_source(
+            chat_id=dm_user,
+            chat_name=dm_user,
+            chat_type="dm",
+            user_id=sender_id,
+            user_name=sender_id,
+            message_id=message_id,
+        )
+        return self._llm_context_key_for_event(SimpleNamespace(source=source))
+
+    def _session_key_for_group_record(self, group_record: Any, message_id: str) -> str:
+        group_id = str(getattr(group_record, "group_id", "") or "").strip()
+        sender_id = raw_id_from_key(getattr(group_record, "sender", "")) or str(
+            getattr(group_record, "sender_id", "") or ""
+        )
+        if not group_id or not sender_id:
+            return ""
+        source = self.build_source(
+            chat_id=f"group:{group_id}",
+            chat_name=f"group:{group_id}",
+            chat_type="group",
+            user_id=sender_id,
+            user_name=sender_id,
+            message_id=message_id,
+        )
+        return self._llm_context_key_for_event(SimpleNamespace(source=source))
+
+    def _session_key_for_stored_message_id(
+        self,
+        message_id: str,
+        chat_id: str = "",
+    ) -> str:
+        mid = str(message_id or "").strip()
+        if not mid:
+            return ""
+
+        if chat_id:
+            kind, group_id, dm_user = self._parse_target(chat_id)
+            if kind == "group" and group_id is not None:
+                group_record = self._message_store.find_group(mid)
+                if group_record is None:
+                    return ""
+                if str(getattr(group_record, "group_id", "") or "") != str(group_id):
+                    return ""
+                return self._session_key_for_group_record(group_record, mid)
+
+            dm_record = self._message_store.find_dm(mid)
+            if dm_record is None:
+                return ""
+            record_dm_user = raw_id_from_key(getattr(dm_record, "peer", "")) or str(
+                getattr(dm_record, "dm_user_id", "") or ""
+            )
+            if dm_user and record_dm_user and record_dm_user != dm_user:
+                return ""
+            return self._session_key_for_dm_record(dm_record, mid)
+
+        dm_record = self._message_store.find_dm(mid)
+        if dm_record is not None:
+            return self._session_key_for_dm_record(dm_record, mid)
+
+        group_record = self._message_store.find_group(mid)
+        if group_record is not None:
+            return self._session_key_for_group_record(group_record, mid)
+
+        return ""
+
+    def _resolve_busy_steer_outbound_reply_to(
+        self,
+        chat_id: str,
+        reply_to: str | None,
+    ) -> str | None:
+        original_reply_to = str(reply_to or "").strip()
+        if not original_reply_to:
+            return None
+
+        context_inbound_mid = str(_inbound_mid.get("") or "").strip()
+        if not context_inbound_mid or original_reply_to != context_inbound_mid:
+            return original_reply_to
+
+        session_key = self._session_key_for_stored_message_id(
+            original_reply_to,
+            chat_id,
+        )
+        if not session_key:
+            return original_reply_to
+        scope = self._busy_steer_reply_scope_by_session.get(session_key)
+        if scope is None:
+            return original_reply_to
+
+        _kind, group_id, dm_user = self._parse_target(chat_id)
+        target_chat_key = self._chat_key_for_target(
+            str(group_id) if group_id is not None else None,
+            dm_user or None,
+        )
+        if target_chat_key != scope.chat_key:
+            return original_reply_to
+
+        scoped_message_ids = [mid for mid in scope.message_ids if mid]
+        if len(scoped_message_ids) == 1:
+            scoped_reply_to = scoped_message_ids[0]
+            if scoped_reply_to != original_reply_to:
+                gw_log().info(
+                    "[infoflow:busy-steer] redirect auto reply anchor "
+                    "session_key=%s from_mid=%s to_mid=%s",
+                    session_key,
+                    original_reply_to,
+                    scoped_reply_to,
+                )
+            return scoped_reply_to
+
+        if len(scoped_message_ids) > 1:
+            gw_log().info(
+                "[infoflow:busy-steer] suppress auto reply anchor "
+                "session_key=%s from_mid=%s steer_count=%d",
+                session_key,
+                original_reply_to,
+                len(scoped_message_ids),
+            )
+            return None
+
+        return original_reply_to
 
     def _record_for_event(self, event: Any) -> Any | None:
         message_id = str(getattr(event, "message_id", "") or "")
@@ -1983,9 +2140,17 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             )
             return SendResult(success=True)
 
+        original_reply_to = reply_to
+        outbound_reply_to = self._resolve_busy_steer_outbound_reply_to(
+            chat_id,
+            reply_to,
+        )
+
         # Build normalized reply_to from inbound context. Preview enrichment
         # happens in InfoflowSendService before ServerAPI sees the intent.
-        normalized_reply_to, reply_to_sender_id = _reply_to_from_inbound(reply_to)
+        normalized_reply_to, reply_to_sender_id = _reply_to_from_inbound(
+            outbound_reply_to
+        )
 
         content, options = await prepare_outbound_message(
             content,
@@ -2005,7 +2170,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             reply_to_sender_id=reply_to_sender_id,
             options=options,
             session=session,
-            reaction_message_id=reply_to,
+            reaction_message_id=original_reply_to,
         )
 
         # Trace outbound with inbound mid (if available via contextvar)
@@ -2116,7 +2281,14 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         except _ImageLoadError as exc:
             return SendResult(success=False, error=str(exc), retryable=False)
 
-        normalized_reply_to, reply_to_sender_id = _reply_to_from_inbound(reply_to)
+        original_reply_to = reply_to
+        outbound_reply_to = self._resolve_busy_steer_outbound_reply_to(
+            chat_id,
+            reply_to,
+        )
+        normalized_reply_to, reply_to_sender_id = _reply_to_from_inbound(
+            outbound_reply_to
+        )
 
         bot_result = await self._bot.send_image(
             group_id=str(group_id) if group_id is not None else None,
@@ -2126,7 +2298,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             reply_to=normalized_reply_to or None,
             reply_to_sender_id=reply_to_sender_id,
             session=session,
-            reaction_message_id=reply_to,
+            reaction_message_id=original_reply_to,
         )
 
         # Trace outbound with inbound mid

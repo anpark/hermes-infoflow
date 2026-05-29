@@ -522,6 +522,48 @@ def _attach_busy_gateway(adapter, event, agent, *, authorized=True, draining=Fal
     return gateway, session_key
 
 
+def _dm_text_event(adapter, user_id: str, message_id: str, text: str = "message"):
+    source = adapter.build_source(
+        chat_id=user_id,
+        chat_name=user_id,
+        chat_type="dm",
+        user_id=user_id,
+        user_name=user_id,
+        message_id=message_id,
+    )
+    return MessageEvent(
+        text=f"[Message: message_id:'{message_id}']\n{text}",
+        message_type=MessageType.TEXT,
+        source=source,
+        raw_message={"infoflow_standard_message": True},
+        message_id=message_id,
+    )
+
+
+def _group_text_event(
+    adapter,
+    group_id: str,
+    user_id: str,
+    message_id: str,
+    text: str = "message",
+):
+    source = adapter.build_source(
+        chat_id=f"group:{group_id}",
+        chat_name=f"group:{group_id}",
+        chat_type="group",
+        user_id=user_id,
+        user_name=user_id,
+        message_id=message_id,
+    )
+    return MessageEvent(
+        text=f"[Message: message_id:'{message_id}']\n{text}",
+        message_type=MessageType.TEXT,
+        source=source,
+        raw_message={"infoflow_standard_message": True},
+        message_id=message_id,
+    )
+
+
 async def _settle_adapter_reaction_tasks(adapter) -> None:
     while adapter._bot._reactions._tasks:
         tasks = list(adapter._bot._reactions._tasks)
@@ -723,6 +765,229 @@ def test_busy_steer_reaction_waits_for_parent_complete(
         assert state.last_llm_visible_message_id == "D2"
 
     asyncio.run(_go())
+
+
+def test_busy_steer_single_reply_scope_redirects_final_reply(
+    configured_env,
+) -> None:
+    adapter = InfoflowAdapter(_make_config())
+    adapter._bot.send_message = AsyncMock(
+        return_value=SentResult(success=True, message_id="OUT-1")
+    )
+    adapter._message_store.persist_dm(
+        message_id="D1",
+        dm_user_id="alice",
+        sender_id="alice",
+        content="parent",
+    )
+    adapter._message_store.persist_dm(
+        message_id="D2",
+        dm_user_id="alice",
+        sender_id="alice",
+        content="steer",
+    )
+    steer_event = _dm_text_event(adapter, "alice", "D2", "steer")
+    session_key = adapter._llm_context_key_for_event(steer_event)
+    adapter._remember_busy_steer_reply_scope(session_key, steer_event)
+
+    async def _go():
+        token = _inbound_mid.set("D1")
+        try:
+            return await adapter.send("alice", "friday", reply_to="D1")
+        finally:
+            _inbound_mid.reset(token)
+
+    result = asyncio.run(_go())
+
+    assert result.success is True
+    kwargs = adapter._bot.send_message.await_args.kwargs
+    assert kwargs["reply_to"] == [{"message_id": "D2"}]
+    assert kwargs["reaction_message_id"] == "D1"
+
+
+def test_busy_steer_multi_reply_scope_suppresses_auto_reply(
+    configured_env,
+) -> None:
+    adapter = InfoflowAdapter(_make_config())
+    adapter._bot.send_message = AsyncMock(
+        return_value=SentResult(success=True, message_id="OUT-1")
+    )
+    for mid, content in (("D1", "parent"), ("D2", "steer one"), ("D3", "steer two")):
+        adapter._message_store.persist_dm(
+            message_id=mid,
+            dm_user_id="alice",
+            sender_id="alice",
+            content=content,
+        )
+
+    first_steer = _dm_text_event(adapter, "alice", "D2", "steer one")
+    second_steer = _dm_text_event(adapter, "alice", "D3", "steer two")
+    session_key = adapter._llm_context_key_for_event(first_steer)
+    assert adapter._llm_context_key_for_event(second_steer) == session_key
+    adapter._remember_busy_steer_reply_scope(session_key, first_steer)
+    adapter._remember_busy_steer_reply_scope(session_key, second_steer)
+
+    async def _go():
+        token = _inbound_mid.set("D1")
+        try:
+            return await adapter.send("alice", "combined reply", reply_to="D1")
+        finally:
+            _inbound_mid.reset(token)
+
+    result = asyncio.run(_go())
+
+    assert result.success is True
+    kwargs = adapter._bot.send_message.await_args.kwargs
+    assert kwargs["reply_to"] is None
+    assert kwargs["reaction_message_id"] == "D1"
+
+
+def test_busy_steer_reply_scope_does_not_rewrite_without_bound_inbound(
+    configured_env,
+) -> None:
+    adapter = InfoflowAdapter(_make_config())
+    adapter._bot.send_message = AsyncMock(
+        return_value=SentResult(success=True, message_id="OUT-1")
+    )
+    adapter._message_store.persist_dm(
+        message_id="D1",
+        dm_user_id="alice",
+        sender_id="alice",
+        content="parent",
+    )
+    adapter._message_store.persist_dm(
+        message_id="D2",
+        dm_user_id="alice",
+        sender_id="alice",
+        content="steer",
+    )
+    steer_event = _dm_text_event(adapter, "alice", "D2", "steer")
+    session_key = adapter._llm_context_key_for_event(steer_event)
+    adapter._remember_busy_steer_reply_scope(session_key, steer_event)
+
+    result = asyncio.run(adapter.send("alice", "explicit", reply_to="D1"))
+
+    assert result.success is True
+    kwargs = adapter._bot.send_message.await_args.kwargs
+    assert kwargs["reply_to"] == [{"message_id": "D1"}]
+    assert kwargs["reaction_message_id"] == "D1"
+
+
+def test_busy_steer_group_reply_scope_is_sender_scoped(
+    configured_env,
+) -> None:
+    adapter = InfoflowAdapter(_make_config())
+    adapter._bot.send_message = AsyncMock(
+        return_value=SentResult(success=True, message_id="OUT-1")
+    )
+    for mid, sender in (("GA1", "alice"), ("GA2", "alice"), ("GB1", "bob")):
+        adapter._message_store.persist_group(
+            message_id=mid,
+            group_id="4507088",
+            sender_id=sender,
+            content=mid,
+        )
+
+    steer_event = _group_text_event(adapter, "4507088", "alice", "GA2", "steer")
+    session_key = adapter._llm_context_key_for_event(steer_event)
+    adapter._remember_busy_steer_reply_scope(session_key, steer_event)
+
+    async def _send(inbound_mid: str, reply_to: str):
+        token = _inbound_mid.set(inbound_mid)
+        try:
+            return await adapter.send("group:4507088", "reply", reply_to=reply_to)
+        finally:
+            _inbound_mid.reset(token)
+
+    result_a = asyncio.run(_send("GA1", "GA1"))
+    result_b = asyncio.run(_send("GB1", "GB1"))
+
+    assert result_a.success is True
+    assert result_b.success is True
+    first_call = adapter._bot.send_message.await_args_list[0].kwargs
+    second_call = adapter._bot.send_message.await_args_list[1].kwargs
+    assert first_call["reply_to"] == [{"message_id": "GA2"}]
+    assert second_call["reply_to"] == [{"message_id": "GB1"}]
+
+
+def test_busy_steer_reply_scope_clears_on_parent_complete(
+    configured_env,
+) -> None:
+    adapter = InfoflowAdapter(_make_config())
+    adapter._bot.finish_processing_reaction = AsyncMock()
+    adapter._message_store.persist_dm(
+        message_id="D1",
+        dm_user_id="alice",
+        sender_id="alice",
+        content="parent",
+    )
+    adapter._message_store.persist_dm(
+        message_id="D2",
+        dm_user_id="alice",
+        sender_id="alice",
+        content="steer",
+    )
+    steer_event = _dm_text_event(adapter, "alice", "D2", "steer")
+    session_key = adapter._llm_context_key_for_event(steer_event)
+    adapter._remember_busy_steer_reply_scope(session_key, steer_event)
+    assert session_key in adapter._busy_steer_reply_scope_by_session
+
+    parent_event = _dm_text_event(adapter, "alice", "D1", "parent")
+    asyncio.run(
+        adapter.on_processing_complete(parent_event, SimpleNamespace(value="success"))
+    )
+
+    assert session_key not in adapter._busy_steer_reply_scope_by_session
+
+
+def test_busy_steer_send_image_uses_reply_scope_without_changing_reaction_anchor(
+    configured_env,
+    monkeypatch,
+) -> None:
+    adapter = InfoflowAdapter(_make_config())
+    adapter._bot.send_image = AsyncMock(
+        return_value=SentResult(success=True, message_id="IMG-1")
+    )
+    adapter._message_store.persist_dm(
+        message_id="D1",
+        dm_user_id="alice",
+        sender_id="alice",
+        content="parent",
+    )
+    adapter._message_store.persist_dm(
+        message_id="D2",
+        dm_user_id="alice",
+        sender_id="alice",
+        content="steer",
+    )
+
+    async def fake_load(self, url):
+        del self, url
+        return _TINY_PNG_BYTES
+
+    monkeypatch.setattr(InfoflowAdapter, "_load_image_bytes", fake_load)
+    steer_event = _dm_text_event(adapter, "alice", "D2", "steer")
+    session_key = adapter._llm_context_key_for_event(steer_event)
+    adapter._remember_busy_steer_reply_scope(session_key, steer_event)
+
+    async def _go():
+        token = _inbound_mid.set("D1")
+        try:
+            return await adapter.send_image(
+                "alice",
+                "https://example.com/x.png",
+                caption="see this",
+                reply_to="D1",
+            )
+        finally:
+            _inbound_mid.reset(token)
+
+    result = asyncio.run(_go())
+
+    assert result.success is True
+    kwargs = adapter._bot.send_image.await_args.kwargs
+    assert kwargs["reply_to"] == [{"message_id": "D2"}]
+    assert kwargs["reaction_message_id"] == "D1"
 
 
 def test_busy_steer_reaction_tracks_only_latest_steer(configured_env) -> None:
