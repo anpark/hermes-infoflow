@@ -522,6 +522,13 @@ def _attach_busy_gateway(adapter, event, agent, *, authorized=True, draining=Fal
     return gateway, session_key
 
 
+async def _settle_adapter_reaction_tasks(adapter) -> None:
+    while adapter._bot._reactions._tasks:
+        tasks = list(adapter._bot._reactions._tasks)
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.sleep(0)
+
+
 def test_busy_steer_dm_text_runs_hooks_and_updates_context(
     configured_env, monkeypatch, tmp_path,
 ) -> None:
@@ -575,7 +582,7 @@ def test_busy_steer_dm_text_runs_hooks_and_updates_context(
     )
     assert "before_count=1、after_count=0" in steered_text
     assert event.raw_message["infoflow_unread_message_context_count"] == 1
-    adapter._bot.finish_processing_reaction.assert_awaited_once()
+    adapter._bot.finish_processing_reaction.assert_not_awaited()
     state = adapter._message_store.get_llm_context_state(session_key)
     assert state is not None
     assert state.last_llm_visible_message_id == "D2"
@@ -611,7 +618,299 @@ def test_busy_steer_group_same_user_text(configured_env) -> None:
     assert handled is True
     original_handler.assert_not_awaited()
     agent.steer.assert_called_once_with("[Message: message_id:'G1']\nfollow up")
-    adapter._bot.finish_processing_reaction.assert_awaited_once()
+    adapter._bot.finish_processing_reaction.assert_not_awaited()
+
+
+def test_busy_steer_reaction_waits_for_parent_complete(
+    configured_env, monkeypatch, tmp_path,
+) -> None:
+    monkeypatch.setattr(ms, "_STATE_BASE_DIR", tmp_path)
+    adapter = InfoflowAdapter(_make_config())
+    adapter._serverapi.add_message_reaction = AsyncMock(
+        return_value=RecallResult(success=True)
+    )
+    adapter._serverapi.delete_message_reaction = AsyncMock(
+        return_value=RecallResult(success=True)
+    )
+    base_time = int(__import__("time").time() * 1000)
+    adapter._message_store.persist_dm(
+        message_id="D1",
+        dm_user_id="alice",
+        sender_id="alice",
+        content="parent",
+        created_time=base_time + 1_000,
+    )
+    adapter._message_store.persist_dm(
+        message_id="D2",
+        dm_user_id="alice",
+        sender_id="alice",
+        content="steer",
+        created_time=base_time + 2_000,
+    )
+
+    async def _go() -> None:
+        steer_token = await adapter._bot._start_reaction_run(
+            {
+                "chat_type": "dm",
+                "from_uid": "alice",
+                "base_msg_id": "D2",
+                "msgid2": "300016044",
+                "emoji_code": "d135",
+                "emoji_desc": "(qjp)",
+            }
+        )
+        assert steer_token is not None
+        await _settle_adapter_reaction_tasks(adapter)
+        adapter._serverapi.delete_message_reaction.assert_not_awaited()
+
+        source = adapter.build_source(
+            chat_id="alice",
+            chat_name="alice",
+            chat_type="dm",
+            user_id="alice",
+            user_name="alice",
+            message_id="D2",
+        )
+        event = MessageEvent(
+            text="[Message: message_id:'D2']\nsteer",
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message={"infoflow_standard_message": True},
+            message_id="D2",
+        )
+        agent = MagicMock()
+        agent.steer = MagicMock(return_value=True)
+        _gateway, session_key = _attach_busy_gateway(adapter, event, agent)
+        original_handler = AsyncMock(return_value=True)
+        adapter.set_busy_session_handler(original_handler)
+
+        handled = await adapter._busy_session_handler(event, session_key)
+
+        assert handled is True
+        assert adapter._busy_steer_reaction_by_session[session_key] is steer_token
+        await _settle_adapter_reaction_tasks(adapter)
+        adapter._serverapi.delete_message_reaction.assert_not_awaited()
+        state = adapter._message_store.get_llm_context_state(session_key)
+        assert state is not None
+        assert state.last_llm_visible_message_id == "D2"
+
+        parent_event = MessageEvent(
+            text="[Message: message_id:'D1']\nparent",
+            message_type=MessageType.TEXT,
+            source=adapter.build_source(
+                chat_id="alice",
+                chat_name="alice",
+                chat_type="dm",
+                user_id="alice",
+                user_name="alice",
+                message_id="D1",
+            ),
+            raw_message={"infoflow_standard_message": True},
+            message_id="D1",
+        )
+        await adapter.on_processing_complete(
+            parent_event,
+            SimpleNamespace(value="success"),
+        )
+        await _settle_adapter_reaction_tasks(adapter)
+
+        assert session_key not in adapter._busy_steer_reaction_by_session
+        adapter._serverapi.delete_message_reaction.assert_awaited_once()
+        deleted = adapter._serverapi.delete_message_reaction.call_args.kwargs
+        assert deleted["base_msg_id"] == "D2"
+        state = adapter._message_store.get_llm_context_state(session_key)
+        assert state is not None
+        assert state.last_llm_visible_message_id == "D2"
+
+    asyncio.run(_go())
+
+
+def test_busy_steer_reaction_tracks_only_latest_steer(configured_env) -> None:
+    adapter = InfoflowAdapter(_make_config())
+    adapter._serverapi.add_message_reaction = AsyncMock(
+        return_value=RecallResult(success=True)
+    )
+    adapter._serverapi.delete_message_reaction = AsyncMock(
+        return_value=RecallResult(success=True)
+    )
+
+    async def _steer(mid: str):
+        token = await adapter._bot._start_reaction_run(
+            {
+                "chat_type": "group",
+                "group_id": "4507088",
+                "from_uid": "bob",
+                "base_msg_id": mid,
+                "msgid2": f"seq-{mid}",
+                "emoji_code": "d135",
+                "emoji_desc": "(qjp)",
+            }
+        )
+        assert token is not None
+        await _settle_adapter_reaction_tasks(adapter)
+        source = adapter.build_source(
+            chat_id="group:4507088",
+            chat_name="group:4507088",
+            chat_type="group",
+            user_id="bob",
+            user_name="bob",
+            message_id=mid,
+        )
+        event = MessageEvent(
+            text=f"[Message: message_id:'{mid}']\n{mid}",
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message={"infoflow_standard_message": True},
+            message_id=mid,
+        )
+        agent = MagicMock()
+        agent.steer = MagicMock(return_value=True)
+        _gateway, session_key = _attach_busy_gateway(adapter, event, agent)
+        original_handler = AsyncMock(return_value=True)
+        adapter.set_busy_session_handler(original_handler)
+        assert await adapter._busy_session_handler(event, session_key) is True
+        return token, session_key
+
+    async def _go() -> None:
+        token_2, session_key = await _steer("G2")
+        assert adapter._busy_steer_reaction_by_session[session_key] is token_2
+        token_3, same_session_key = await _steer("G3")
+        assert same_session_key == session_key
+        assert adapter._busy_steer_reaction_by_session[session_key] is token_3
+        await _settle_adapter_reaction_tasks(adapter)
+
+        deleted_before_parent = [
+            call.kwargs["base_msg_id"]
+            for call in adapter._serverapi.delete_message_reaction.await_args_list
+        ]
+        assert deleted_before_parent == ["G2"]
+
+        parent_event = MessageEvent(
+            text="[Message: message_id:'G1']\nparent",
+            message_type=MessageType.TEXT,
+            source=adapter.build_source(
+                chat_id="group:4507088",
+                chat_name="group:4507088",
+                chat_type="group",
+                user_id="bob",
+                user_name="bob",
+                message_id="G1",
+            ),
+            raw_message={"infoflow_standard_message": True},
+            message_id="G1",
+        )
+        await adapter.on_processing_complete(
+            parent_event,
+            SimpleNamespace(value="success"),
+        )
+        await _settle_adapter_reaction_tasks(adapter)
+
+        deleted_after_parent = [
+            call.kwargs["base_msg_id"]
+            for call in adapter._serverapi.delete_message_reaction.await_args_list
+        ]
+        assert deleted_after_parent == ["G2", "G3"]
+
+    asyncio.run(_go())
+
+
+def test_busy_steer_parent_complete_does_not_delete_newer_group_marker(
+    configured_env,
+) -> None:
+    adapter = InfoflowAdapter(_make_config())
+    adapter._serverapi.add_message_reaction = AsyncMock(
+        return_value=RecallResult(success=True)
+    )
+    adapter._serverapi.delete_message_reaction = AsyncMock(
+        return_value=RecallResult(success=True)
+    )
+
+    async def _go() -> None:
+        token_a = await adapter._bot._start_reaction_run(
+            {
+                "chat_type": "group",
+                "group_id": "4507088",
+                "from_uid": "alice",
+                "base_msg_id": "GA2",
+                "msgid2": "seq-GA2",
+                "emoji_code": "d135",
+                "emoji_desc": "(qjp)",
+            }
+        )
+        assert token_a is not None
+        await _settle_adapter_reaction_tasks(adapter)
+
+        source_a = adapter.build_source(
+            chat_id="group:4507088",
+            chat_name="group:4507088",
+            chat_type="group",
+            user_id="alice",
+            user_name="alice",
+            message_id="GA2",
+        )
+        event_a = MessageEvent(
+            text="[Message: message_id:'GA2']\nsteer A",
+            message_type=MessageType.TEXT,
+            source=source_a,
+            raw_message={"infoflow_standard_message": True},
+            message_id="GA2",
+        )
+        agent = MagicMock()
+        agent.steer = MagicMock(return_value=True)
+        _gateway, session_key_a = _attach_busy_gateway(adapter, event_a, agent)
+        original_handler = AsyncMock(return_value=True)
+        adapter.set_busy_session_handler(original_handler)
+        assert await adapter._busy_session_handler(event_a, session_key_a) is True
+        assert adapter._busy_steer_reaction_by_session[session_key_a] is token_a
+
+        token_b = await adapter._bot._start_reaction_run(
+            {
+                "chat_type": "group",
+                "group_id": "4507088",
+                "from_uid": "bob",
+                "base_msg_id": "GB1",
+                "msgid2": "seq-GB1",
+                "emoji_code": "d135",
+                "emoji_desc": "(qjp)",
+            }
+        )
+        assert token_b is not None
+        await _settle_adapter_reaction_tasks(adapter)
+        assert token_a.stale is True
+        active = adapter._bot._reactions.active_state("group:4507088")
+        assert active is not None
+        assert active.anchor_message_id == "GB1"
+
+        parent_event_a = MessageEvent(
+            text="[Message: message_id:'GA1']\nparent A",
+            message_type=MessageType.TEXT,
+            source=adapter.build_source(
+                chat_id="group:4507088",
+                chat_name="group:4507088",
+                chat_type="group",
+                user_id="alice",
+                user_name="alice",
+                message_id="GA1",
+            ),
+            raw_message={"infoflow_standard_message": True},
+            message_id="GA1",
+        )
+        await adapter.on_processing_complete(
+            parent_event_a,
+            SimpleNamespace(value="success"),
+        )
+        await _settle_adapter_reaction_tasks(adapter)
+
+        deleted = [
+            call.kwargs["base_msg_id"]
+            for call in adapter._serverapi.delete_message_reaction.await_args_list
+        ]
+        assert deleted == ["GA2"]
+        active = adapter._bot._reactions.active_state("group:4507088")
+        assert active is not None
+        assert active.anchor_message_id == "GB1"
+
+    asyncio.run(_go())
 
 
 def test_busy_steer_group_missing_user_id_falls_back(configured_env) -> None:

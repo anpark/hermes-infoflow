@@ -1250,6 +1250,15 @@ class Bot:
             reason=reason,
         )
 
+    async def finish_processing_reaction_token(
+        self,
+        token: ReactionRunToken | None,
+        *,
+        reason: str,
+    ) -> None:
+        """Finish a known processing-reaction token without anchor lookup."""
+        await self._finish_reaction_token(token, reason=reason)
+
     # -- dispatch orchestration ---------------------------------------------
 
     async def dispatch_inbound(

@@ -167,7 +167,6 @@ try:
         MessageEvent,
         MessageType,
         Platform,
-        ProcessingOutcome,
         SendResult,
         cache_image_from_bytes,
     )
@@ -178,10 +177,6 @@ except ImportError:
     MessageEvent = dict  # type: ignore[assignment,misc]
     MessageType = Any  # type: ignore[assignment,misc]
     Platform = Any  # type: ignore[assignment,misc]
-    class _ProcessingOutcomeFallback:
-        SUCCESS = "success"
-
-    ProcessingOutcome = _ProcessingOutcomeFallback  # type: ignore[assignment,misc]
     SendResult = dict  # type: ignore[assignment,misc]
 
     def cache_image_from_bytes(*a, **kw):  # type: ignore[misc]
@@ -428,6 +423,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
 
         self._http_session: aiohttp.ClientSession | None = None
         self._infoflow_original_busy_session_handler = None
+        self._busy_steer_reaction_by_session: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -472,6 +468,36 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         if handler is None:
             return False
         return bool(await handler(event, session_key))
+
+    @staticmethod
+    def _current_processing_reaction_token() -> Any | None:
+        from .bot import _reaction_promise_cv
+
+        return _reaction_promise_cv.get(None)
+
+    def _remember_busy_steer_reaction(self, session_key: str) -> Any | None:
+        token = self._current_processing_reaction_token()
+        if token is not None and session_key:
+            self._busy_steer_reaction_by_session[session_key] = token
+        return token
+
+    async def _finish_busy_steer_reaction_for_event(
+        self,
+        event: Any,
+        outcome_label: str,
+    ) -> None:
+        session_key = self._llm_context_key_for_event(event)
+        if not session_key:
+            return
+        token = self._busy_steer_reaction_by_session.pop(session_key, None)
+        if token is None:
+            return
+        finish_token = getattr(self._bot, "finish_processing_reaction_token", None)
+        if callable(finish_token):
+            await finish_token(
+                token,
+                reason=f"busy_steer_parent_{outcome_label}",
+            )
 
     @staticmethod
     def _config_bool(raw: Any, *, default: bool) -> bool:
@@ -615,16 +641,25 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 accepted = False
 
             if accepted:
+                reaction_token = self._remember_busy_steer_reaction(session_key)
+                try:
+                    self._mark_event_llm_visible(event)
+                except Exception as exc:
+                    gw_log().warning(
+                        "[infoflow:busy-steer] failed to mark LLM-visible "
+                        "session_key=%s mid=%s: %s",
+                        session_key,
+                        self._event_message_id(event) or "-",
+                        exc,
+                        exc_info=True,
+                    )
                 gw_log().info(
-                    "[infoflow:busy-steer] session_key=%s mid=%s chat_type=%s accepted=true",
+                    "[infoflow:busy-steer] session_key=%s mid=%s chat_type=%s "
+                    "accepted=true reaction_token=%s",
                     session_key,
                     self._event_message_id(event) or "-",
                     str(getattr(getattr(event, "source", None), "chat_type", "") or ""),
-                )
-                await self._run_processing_hook(
-                    "on_processing_complete",
-                    event,
-                    ProcessingOutcome.SUCCESS,
+                    bool(reaction_token),
                 )
                 return True
         finally:
@@ -1061,6 +1096,15 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         context_key = self._llm_context_key_for_event(event)
         if not chat_key or not context_key:
             return
+        state = self._message_store.get_llm_context_state(context_key)
+        if state is not None and state.chat_key == chat_key:
+            current_pos = (int(current.created_time or 0), str(current.message_id or ""))
+            visible_pos = (
+                int(state.last_llm_visible_created_time or 0),
+                str(state.last_llm_visible_message_id or ""),
+            )
+            if current_pos <= visible_pos:
+                return
         self._message_store.update_llm_context_state(
             llm_context_key=context_key,
             chat_key=chat_key,
@@ -1492,13 +1536,19 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 reason=f"processing_{outcome_label}",
             )
         finally:
-            raw_message = getattr(event, "raw_message", None)
-            if (
-                outcome_label == "success"
-                and isinstance(raw_message, dict)
-                and raw_message.get("infoflow_standard_message")
-            ):
-                self._mark_event_llm_visible(event)
+            try:
+                raw_message = getattr(event, "raw_message", None)
+                if (
+                    outcome_label == "success"
+                    and isinstance(raw_message, dict)
+                    and raw_message.get("infoflow_standard_message")
+                ):
+                    self._mark_event_llm_visible(event)
+            finally:
+                await self._finish_busy_steer_reaction_for_event(
+                    event,
+                    outcome_label,
+                )
 
     # ------------------------------------------------------------------
     # Infoflow idle session reset
