@@ -921,12 +921,16 @@ def test_send_group_message_intent_whitespace_is_empty_message() -> None:
     assert result.error_code == "empty_message"
 
 
-def test_send_group_message_intent_reply_and_link_use_text_payload(monkeypatch) -> None:
+def test_send_group_message_intent_reply_and_markdown_link_double_sends(monkeypatch) -> None:
     captured: list[dict[str, object]] = []
 
     async def fake_send_group_payload(account, **kwargs):
         captured.append(kwargs)
-        return {"ok": True, "messageid": "G-1", "msgseqid": "S-1"}
+        return {
+            "ok": True,
+            "messageid": f"G-{len(captured)}",
+            "msgseqid": f"S-{len(captured)}",
+        }
 
     monkeypatch.setattr(
         serverapi_mod._api,
@@ -945,13 +949,108 @@ def test_send_group_message_intent_reply_and_link_use_text_payload(monkeypatch) 
 
     assert result.success is True
     assert captured[0]["msgtype"] == "TEXT"
-    assert captured[0]["body"] == [
-        {"type": "TEXT", "content": "**reply body**"},
-        {"type": "LINK", "href": "https://example.com", "label": "示例"},
-    ]
+    assert captured[0]["body"] == [{"type": "TEXT", "content": ""}]
     reply_ctx = captured[0]["reply_to"]
     assert reply_ctx.messageid == "MID"
     assert reply_ctx.preview == ""
+    assert captured[1]["msgtype"] == "MD"
+    assert captured[1]["body"] == [{
+        "type": "MD",
+        "content": "**reply body**\n\n[示例](https://example.com)",
+    }]
+    assert captured[1]["reply_to"] is None
+    assert result.message_id == "G-2"
+    assert result.continuation_message_ids == ("G-1",)
+
+
+def test_send_group_message_intent_plain_link_stays_text_link(monkeypatch) -> None:
+    captured: list[dict[str, object]] = []
+
+    async def fake_send_group_payload(account, **kwargs):
+        captured.append(kwargs)
+        return {"ok": True, "messageid": "G-1", "msgseqid": "S-1"}
+
+    monkeypatch.setattr(
+        serverapi_mod._api,
+        "send_group_payload",
+        fake_send_group_payload,
+    )
+    api = ServerAPI(settings=_settings())
+
+    result = asyncio.run(api.send_group_message_intent(
+        "4507088",
+        message="请看链接：",
+        links=[{"href": "https://example.com", "label": "示例"}],
+        session=object(),
+    ))
+
+    assert result.success is True
+    assert captured[0]["msgtype"] == "TEXT"
+    assert captured[0]["body"] == [
+        {"type": "TEXT", "content": "请看链接："},
+        {"type": "LINK", "href": "https://example.com", "label": "示例"},
+    ]
+
+
+def test_send_group_message_intent_markdown_links_fold_into_md(monkeypatch) -> None:
+    captured: list[dict[str, object]] = []
+
+    async def fake_send_group_payload(account, **kwargs):
+        captured.append(kwargs)
+        return {"ok": True, "messageid": "G-1", "msgseqid": "S-1"}
+
+    monkeypatch.setattr(
+        serverapi_mod._api,
+        "send_group_payload",
+        fake_send_group_payload,
+    )
+    api = ServerAPI(settings=_settings())
+
+    result = asyncio.run(api.send_group_message_intent(
+        "4507088",
+        message="**请看链接**",
+        links=[{"href": "https://example.com", "label": "示例"}],
+        session=object(),
+    ))
+
+    assert result.success is True
+    assert captured[0]["msgtype"] == "MD"
+    assert captured[0]["body"] == [{
+        "type": "MD",
+        "content": "**请看链接**\n\n[示例](https://example.com)",
+    }]
+
+
+def test_send_group_message_intent_format_text_keeps_markdown_literal(monkeypatch) -> None:
+    captured: list[dict[str, object]] = []
+
+    async def fake_send_group_payload(account, **kwargs):
+        captured.append(kwargs)
+        return {"ok": True, "messageid": "G-1", "msgseqid": "S-1"}
+
+    monkeypatch.setattr(
+        serverapi_mod._api,
+        "send_group_payload",
+        fake_send_group_payload,
+    )
+    api = ServerAPI(settings=_settings())
+
+    result = asyncio.run(api.send_group_message_intent(
+        "4507088",
+        message="**literal**",
+        format="text",
+        links=[{"href": "https://example.com", "label": "示例"}],
+        reply_to=[{"message_id": "MID"}],
+        session=object(),
+    ))
+
+    assert result.success is True
+    assert len(captured) == 1
+    assert captured[0]["msgtype"] == "TEXT"
+    assert captured[0]["body"] == [
+        {"type": "TEXT", "content": "**literal**"},
+        {"type": "LINK", "href": "https://example.com", "label": "示例"},
+    ]
 
 
 def test_send_group_message_intent_rejects_non_array_reply_to() -> None:
@@ -1237,14 +1336,14 @@ def test_send_private_message_intent_whitespace_is_empty_message() -> None:
     assert result.error_code == "empty_message"
 
 
-def test_send_private_message_intent_reply_uses_text_without_content(
+def test_send_private_message_intent_reply_and_markdown_double_sends(
     monkeypatch,
 ) -> None:
     captured: list[dict[str, object]] = []
 
     async def fake_send_private_payload(account, payload, session=None):
         captured.append(payload)
-        return {"ok": True, "msgkey": "P-1"}
+        return {"ok": True, "msgkey": f"P-{len(captured)}"}
 
     monkeypatch.setattr(
         serverapi_mod._api,
@@ -1262,7 +1361,40 @@ def test_send_private_message_intent_reply_uses_text_without_content(
 
     assert result.success is True
     assert captured[0]["msgtype"] == "text"
-    assert captured[0]["text"] == {"content": "**reply body**"}
+    assert captured[0]["text"] == {"content": ""}
+    assert captured[0]["reply"] == [{"uid": "1744775667", "msgid": "MID"}]
+    assert captured[1]["msgtype"] == "md"
+    assert captured[1]["md"] == {"content": "**reply body**"}
+    assert "reply" not in captured[1]
+    assert result.message_id == "P-2"
+    assert result.continuation_message_ids == ("P-1",)
+
+
+def test_send_private_message_intent_plain_reply_stays_text(monkeypatch) -> None:
+    captured: list[dict[str, object]] = []
+
+    async def fake_send_private_payload(account, payload, session=None):
+        captured.append(payload)
+        return {"ok": True, "msgkey": "P-1"}
+
+    monkeypatch.setattr(
+        serverapi_mod._api,
+        "send_private_payload",
+        fake_send_private_payload,
+    )
+    api = ServerAPI(settings=_settings())
+
+    result = asyncio.run(api.send_private_message_intent(
+        "alice",
+        message="plain reply body",
+        reply_to=[{"message_id": "MID", "sender_imid": "1744775667"}],
+        session=object(),
+    ))
+
+    assert result.success is True
+    assert len(captured) == 1
+    assert captured[0]["msgtype"] == "text"
+    assert captured[0]["text"] == {"content": "plain reply body"}
     assert captured[0]["reply"] == [{"uid": "1744775667", "msgid": "MID"}]
 
 
@@ -1303,6 +1435,65 @@ def test_send_private_message_intent_links_use_richtext(monkeypatch) -> None:
     assert captured[0]["reply"] == [
         {"content": "引用", "uid": "1744775667", "msgid": "MID"}
     ]
+
+
+def test_send_private_message_intent_markdown_links_fold_into_md(monkeypatch) -> None:
+    captured: list[dict[str, object]] = []
+
+    async def fake_send_private_payload(account, payload, session=None):
+        captured.append(payload)
+        return {"ok": True, "msgkey": "P-1"}
+
+    monkeypatch.setattr(
+        serverapi_mod._api,
+        "send_private_payload",
+        fake_send_private_payload,
+    )
+    api = ServerAPI(settings=_settings())
+
+    result = asyncio.run(api.send_private_message_intent(
+        "alice",
+        message="**请看链接**",
+        links=["[示例](https://example.com)"],
+        session=object(),
+    ))
+
+    assert result.success is True
+    assert captured[0]["msgtype"] == "md"
+    assert captured[0]["md"] == {
+        "content": "**请看链接**\n\n[示例](https://example.com)"
+    }
+
+
+def test_send_private_message_intent_format_text_keeps_markdown_literal(
+    monkeypatch,
+) -> None:
+    captured: list[dict[str, object]] = []
+
+    async def fake_send_private_payload(account, payload, session=None):
+        captured.append(payload)
+        return {"ok": True, "msgkey": "P-1"}
+
+    monkeypatch.setattr(
+        serverapi_mod._api,
+        "send_private_payload",
+        fake_send_private_payload,
+    )
+    api = ServerAPI(settings=_settings())
+
+    result = asyncio.run(api.send_private_message_intent(
+        "alice",
+        message="**literal**",
+        format="text",
+        reply_to=[{"message_id": "MID"}],
+        session=object(),
+    ))
+
+    assert result.success is True
+    assert len(captured) == 1
+    assert captured[0]["msgtype"] == "text"
+    assert captured[0]["text"] == {"content": "**literal**"}
+    assert captured[0]["reply"] == [{"msgid": "MID"}]
 
 
 def test_send_private_message_intent_links_and_images_split(

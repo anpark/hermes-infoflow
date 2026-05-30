@@ -1517,6 +1517,7 @@ class Bot:
         caption: str | None = None,
         reply_to: list[dict[str, str]] | None = None,
         reply_to_sender_id: str = "",
+        options: SendOptions | None = None,
         session: Any = None,
         reaction_message_id: str | None = None,
     ) -> SentResult:
@@ -1529,6 +1530,13 @@ class Bot:
                 message=caption or "",
                 image_bytes=image_bytes,
                 reply_to=reply_to,
+                at_all=options.at_all if options is not None else False,
+                mention_user_ids=self._send_option_values(
+                    options.mention_user_ids if options is not None else ""
+                ),
+                mention_agent_ids=self._send_option_values(
+                    options.mention_agent_ids if options is not None else ""
+                ),
                 session=session,
             )
         elif dm_user_id is not None:

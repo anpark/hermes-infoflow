@@ -228,7 +228,9 @@ SEND_MESSAGE_TOOL_SCHEMA = {
         "目标：群聊用 `group:<群组ID>` 或纯数字群 ID；私聊用 "
         "`user:<uuapName>` 或 `<uuapName>`，可加 `infoflow:` 前缀。"
         "`bot:<agentId>` 不能作为私聊 target。\n\n"
-        "`format` 默认 `auto`，通常不用传。`message` 是正文，可包含 "
+        "`format` 默认 `auto`，通常不用传。`auto` 优先以 Markdown 发送；"
+        "`markdown` 表示希望以 Markdown 发送；`text` 表示必须以纯文本发送。"
+        "`message` 是正文，可包含 "
         "`MEDIA:<本地图片绝对路径>` 控制图文顺序；只发送链接、图片、"
         "群聊 @ 或引用时，`message` 可为空字符串。\n\n"
         "`message` 支持 Markdown 语法；普通正文保持 `format=auto` 即可。\n\n"
@@ -236,7 +238,8 @@ SEND_MESSAGE_TOOL_SCHEMA = {
         "可单独发送或与正文/图片/@/引用组合。\n\n"
         "图片：`MEDIA:<本地图片绝对路径>` 写在 `message` 中可控制图文顺序；"
         "`image_paths` 会追加到 `message` 之后。重复路径会去重，"
-        "不会把本地路径作为正文发出。\n\n"
+        "不会把本地路径作为正文发出。HTTP/HTTPS 图片 URL（包括内网 URL）"
+        "不是本地路径；需要 Markdown 展示时直接写 `![alt](url)`。\n\n"
         "引用消息：`reply_to` 传 message_id、`{message_id, preview}`，"
         "或这些值的数组。引用整条消息时只传 message_id；"
         "只想展示原文中的某一句或某一段时，传 `{message_id, preview}`，"
@@ -261,16 +264,17 @@ SEND_MESSAGE_TOOL_SCHEMA = {
                 "description": (
                     "消息正文。支持 Markdown 语法，可包含 "
                     "`MEDIA:<本地图片绝对路径>` 控制图文顺序；只发送"
-                    "链接、图片、群聊 @ 或引用时可为空字符串。"
+                    "链接、图片、群聊 @ 或引用时可为空字符串。HTTP/HTTPS "
+                    "图片 URL（包括内网 URL）可用 Markdown 图片语法 "
+                    "`![alt](url)` 写在正文中。"
                 ),
             },
             "format": {
                 "type": "string",
                 "enum": ["auto", "text", "markdown"],
                 "description": (
-                    "默认 `auto`，通常不用传。`auto` 会让普通正文优先 "
-                    "Markdown 展示，并在引用、链接、图片、群聊 @ 等组合下"
-                    "自动选择可正常展示的发送格式。"
+                    "默认 `auto`，通常不用传。`auto` 优先以 Markdown 发送；"
+                    "`markdown` 表示希望以 Markdown 发送；`text` 表示必须以纯文本发送。"
                 ),
                 "default": "auto",
             },

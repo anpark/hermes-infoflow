@@ -20,6 +20,7 @@ import pytest
 
 from hermes_infoflow import recall as ad
 from hermes_infoflow.adapter import (
+    _apply_automatic_reply_policy,
     _format_group_status_ops_notice,
     _group_status_redirect_kind,
 )
@@ -133,6 +134,126 @@ def test_register_evicts_when_over_max() -> None:
     assert "NEW" in ad._inbound_ctx_store
     assert "M0" not in ad._inbound_ctx_store
     assert len(ad._inbound_ctx_store) == cap
+
+
+def test_auto_reply_policy_drops_dm_current_inbound_reply() -> None:
+    ad._inbound_ctx_store.clear()
+    _register_inbound_context(_InboundContext(
+        account_id="acct",
+        target="chengbo05",
+        inbound_message_id="MID",
+        reply_to_bot_message_id=None,
+        reply_targets=[],
+        inbound_body="hello",
+        sender_id="chengbo05",
+        registered_at=time.time(),
+    ))
+
+    reply_to, metadata, sender_id = _apply_automatic_reply_policy(
+        kind="dm",
+        inbound_mid="MID",
+        original_reply_to="MID",
+        outbound_reply_to="MID",
+        metadata=None,
+    )
+
+    assert reply_to is None
+    assert metadata is None
+    assert sender_id == "chengbo05"
+
+
+def test_auto_reply_policy_converts_group_current_inbound_reply_to_sender_at() -> None:
+    ad._inbound_ctx_store.clear()
+    _register_inbound_context(_InboundContext(
+        account_id="acct",
+        target="group:1",
+        inbound_message_id="MID",
+        reply_to_bot_message_id=None,
+        reply_targets=[],
+        inbound_body="hello",
+        sender_id="chengbo05",
+        registered_at=time.time(),
+    ))
+
+    reply_to, metadata, sender_id = _apply_automatic_reply_policy(
+        kind="group",
+        inbound_mid="MID",
+        original_reply_to="MID",
+        outbound_reply_to="MID",
+        metadata={"mention_user_ids": ["alice"]},
+    )
+
+    assert reply_to is None
+    assert metadata == {"mention_user_ids": ["alice", "chengbo05"]}
+    assert sender_id == "chengbo05"
+
+
+def test_auto_reply_policy_converts_group_bot_sender_to_agent_at() -> None:
+    ad._inbound_ctx_store.clear()
+    _register_inbound_context(_InboundContext(
+        account_id="acct",
+        target="group:1",
+        inbound_message_id="MID",
+        reply_to_bot_message_id=None,
+        reply_targets=[],
+        inbound_body="hello",
+        sender_agent_id="17212",
+        registered_at=time.time(),
+    ))
+
+    reply_to, metadata, sender_id = _apply_automatic_reply_policy(
+        kind="group",
+        inbound_mid="MID",
+        original_reply_to="MID",
+        outbound_reply_to="MID",
+        metadata=None,
+    )
+
+    assert reply_to is None
+    assert metadata == {"mention_agent_ids": ["17212"]}
+    assert sender_id == "17212"
+
+
+def test_auto_reply_policy_can_be_overridden_for_explicit_reply() -> None:
+    ad._inbound_ctx_store.clear()
+
+    reply_to, metadata, sender_id = _apply_automatic_reply_policy(
+        kind="group",
+        inbound_mid="MID",
+        original_reply_to="MID",
+        outbound_reply_to="MID",
+        metadata={"infoflow_explicit_reply": True},
+    )
+
+    assert reply_to == "MID"
+    assert metadata == {"infoflow_explicit_reply": True}
+    assert sender_id == ""
+
+
+def test_auto_reply_policy_drops_stream_continuation_anchor_without_extra_at() -> None:
+    ad._inbound_ctx_store.clear()
+    _register_inbound_context(_InboundContext(
+        account_id="acct",
+        target="group:1",
+        inbound_message_id="MID",
+        reply_to_bot_message_id=None,
+        reply_targets=[],
+        inbound_body="hello",
+        sender_id="chengbo05",
+        registered_at=time.time(),
+    ))
+
+    reply_to, metadata, sender_id = _apply_automatic_reply_policy(
+        kind="group",
+        inbound_mid="MID",
+        original_reply_to="BOT-SENT-1",
+        outbound_reply_to="BOT-SENT-1",
+        metadata=None,
+    )
+
+    assert reply_to is None
+    assert metadata is None
+    assert sender_id == ""
 
 
 # ---------------------------------------------------------------------------

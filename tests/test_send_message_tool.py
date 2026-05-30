@@ -172,11 +172,20 @@ def test_infoflow_send_message_schema_exposes_expected_inputs() -> None:
     assert "底层" not in schema_json
     assert "旧字段" not in schema_json
     assert "兼容" not in schema_json
+    assert "发送层" not in schema_json
+    assert "降级" not in schema_json
+    assert "双发" not in schema_json
+    assert "自动选择可正常展示" not in schema_json
+    assert "Markdown 链接" not in schema_json
     assert "新增" not in schema_json
     assert "LINK body" not in schema_json
     assert "richtext" not in schema_json
+    assert "TEXT" not in schema_json
     assert "metadata.mention" not in schema_json
     assert "省略时仍可只发送" not in schema_json
+    assert "auto` 优先以 Markdown 发送" in schema_json
+    assert "`markdown` 表示希望以 Markdown 发送" in schema_json
+    assert "`text` 表示必须以纯文本发送" in schema_json
     assert "引用整条消息时只传 message_id" in schema_json
     assert "指定原文片段时用 preview" in schema_json
     assert "私聊可引用多条" in schema_json

@@ -162,6 +162,99 @@ def _reply_to_from_inbound(message_id: str | None) -> tuple[list[dict[str, str]]
     return [{"message_id": mid}], get_inbound_sender_id(mid)
 
 
+def _truthy_metadata_flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _metadata_list_values(value: Any) -> list[str]:
+    if value in (None, "", []):
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item or "").strip()]
+    return [
+        item.strip()
+        for item in str(value or "").split(",")
+        if item.strip()
+    ]
+
+
+def _metadata_with_group_mention(
+    metadata: dict[str, Any] | None,
+    *,
+    mention_kind: str,
+    mention_id: str,
+) -> dict[str, Any] | None:
+    mention_id = str(mention_id or "").strip()
+    if not mention_id:
+        return metadata
+    key = (
+        "mention_agent_ids"
+        if mention_kind == "agent"
+        else "mention_user_ids"
+        if mention_kind == "user"
+        else ""
+    )
+    if not key:
+        return metadata
+    updated = dict(metadata or {})
+    values = _metadata_list_values(updated.get(key))
+    if mention_id not in values:
+        values.append(mention_id)
+    updated[key] = values
+    return updated
+
+
+def _apply_automatic_reply_policy(
+    *,
+    kind: str,
+    inbound_mid: str,
+    original_reply_to: str | None,
+    outbound_reply_to: str | None,
+    metadata: dict[str, Any] | None,
+) -> tuple[str | None, dict[str, Any] | None, str]:
+    """Drop Hermes' automatic reply anchor, preserving sender intent.
+
+    Hermes final-response paths pass reply anchors into adapter.send().
+    The first anchor is usually the current inbound message id; streaming
+    continuations may use a previously sent bot message id. Infoflow's native
+    reply support conflicts with Markdown, so the plugin treats these adapter
+    anchors as platform strategy unless metadata explicitly opts back in.
+    Explicit replies from Infoflow tools remain explicit because they do not
+    enter this path.
+    """
+    inbound = str(inbound_mid or "").strip()
+    original = str(original_reply_to or "").strip()
+    if (
+        not inbound
+        or not original
+        or _truthy_metadata_flag((metadata or {}).get("infoflow_explicit_reply"))
+    ):
+        return outbound_reply_to, metadata, ""
+
+    is_current_inbound_anchor = original == inbound
+    reply_to_sender_id = (
+        get_inbound_sender_id(inbound) if is_current_inbound_anchor else ""
+    )
+    if kind != "group":
+        return None, metadata, reply_to_sender_id
+
+    if not is_current_inbound_anchor:
+        return None, metadata, ""
+
+    mention_kind, mention_id = get_inbound_sender_mention(inbound)
+    return (
+        None,
+        _metadata_with_group_mention(
+            metadata,
+            mention_kind=mention_kind,
+            mention_id=mention_id,
+        ),
+        reply_to_sender_id,
+    )
+
+
 # ── Context var: propagate inbound mid → send() for tracing ────
 _inbound_mid: contextvars.ContextVar[str] = contextvars.ContextVar("inbound_mid", default="")
 
@@ -234,7 +327,12 @@ from .policy import (
     normalize_reply_mode,
 )
 from .prompt_rules import INFOFLOW_DELIVERY_TOOL_RULES
-from .recall import get_inbound_body, get_inbound_sender_id, get_inbound_sender_imid
+from .recall import (
+    get_inbound_body,
+    get_inbound_sender_id,
+    get_inbound_sender_imid,
+    get_inbound_sender_mention,
+)
 from .recall_silence import RecallSilenceTracker
 from .send_service import InfoflowSendService
 from .sent_store import SentMessageStore
@@ -2145,12 +2243,21 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             chat_id,
             reply_to,
         )
+        outbound_reply_to, metadata, auto_reply_sender_id = _apply_automatic_reply_policy(
+            kind=kind,
+            inbound_mid=inbound_mid,
+            original_reply_to=original_reply_to,
+            outbound_reply_to=outbound_reply_to,
+            metadata=metadata,
+        )
 
         # Build normalized reply_to from inbound context. Preview enrichment
         # happens in InfoflowSendService before ServerAPI sees the intent.
         normalized_reply_to, reply_to_sender_id = _reply_to_from_inbound(
             outbound_reply_to
         )
+        if auto_reply_sender_id:
+            reply_to_sender_id = auto_reply_sender_id
 
         content, options = await prepare_outbound_message(
             content,
@@ -2275,6 +2382,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         """Send an image (Hermes interface → bot layer)."""
         session = self._effective_session(self._http_session)
         kind, group_id, dm_user = self._parse_target(chat_id)
+        inbound_mid = self._current_inbound_mid()
         try:
             raw_image_bytes = await self._load_image_bytes(image_url)
             prepared_image = prepare_infoflow_image_bytes(raw_image_bytes)
@@ -2286,17 +2394,36 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             chat_id,
             reply_to,
         )
+        outbound_reply_to, metadata, auto_reply_sender_id = _apply_automatic_reply_policy(
+            kind=kind,
+            inbound_mid=inbound_mid,
+            original_reply_to=original_reply_to,
+            outbound_reply_to=outbound_reply_to,
+            metadata=metadata,
+        )
         normalized_reply_to, reply_to_sender_id = _reply_to_from_inbound(
             outbound_reply_to
+        )
+        if auto_reply_sender_id:
+            reply_to_sender_id = auto_reply_sender_id
+
+        caption_text, options = await prepare_outbound_message(
+            caption or "",
+            group_id=str(group_id) if group_id is not None else None,
+            metadata=metadata,
+            get_group_members=self._serverapi.get_group_members,
+            session=session,
+            bot_agent_id=self._settings.get("app_agent_id"),
         )
 
         bot_result = await self._bot.send_image(
             group_id=str(group_id) if group_id is not None else None,
             dm_user_id=dm_user or None,
             image_bytes=prepared_image.data,
-            caption=caption,
+            caption=caption_text,
             reply_to=normalized_reply_to or None,
             reply_to_sender_id=reply_to_sender_id,
+            options=options,
             session=session,
             reaction_message_id=original_reply_to,
         )
@@ -2600,8 +2727,12 @@ def register(ctx: Any) -> None:
             "`image_paths` 用于追加图片。只发送链接、图片、群聊 @ 或引用时，"
             "`message` 可为空字符串。\n"
             "`message` 支持 Markdown 语法；普通正文保持 `format=auto` 即可。\n"
+            "HTTP/HTTPS 图片 URL（包括内网 URL）不是本地路径；需要图片以内联 "
+            "Markdown 展示时，直接在正文写 `![alt](url)`。\n"
             "`links` 支持 URL、`[展示文本](URL)`、`{href, label}`，"
             "可单独发送或与正文、图片、群聊 @、引用组合。\n"
+            "`format` 默认 `auto`，优先以 Markdown 发送；`markdown` 表示希望"
+            "以 Markdown 发送；`text` 表示必须以纯文本发送。\n"
             "群聊 @ 可写 `@uuapName`、`@agentId`、`@all`，"
             "也可用 `at_all`、`mention_user_ids`、`mention_agent_ids`；"
             "私聊 `@xxx` 按普通文本展示。\n"

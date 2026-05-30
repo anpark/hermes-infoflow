@@ -362,6 +362,94 @@ def _normalize_links(value: Any) -> tuple[list[dict[str, str]], str | None, bool
     return out, None, deduped
 
 
+_MARKDOWN_SIGNAL_RES = (
+    re.compile(r"```"),
+    re.compile(r"`[^`\n]+`"),
+    re.compile(r"!\[[^\]\n]*\]\([^) \n]+(?:\s+\"[^\"]*\")?\)"),
+    re.compile(r"\[[^\]\n]+\]\([^) \n]+(?:\s+\"[^\"]*\")?\)"),
+    re.compile(r"(^|\n)\s{0,3}#{1,6}\s+\S"),
+    re.compile(r"(^|\n)\s{0,3}>\s+\S"),
+    re.compile(r"(^|\n)\s{0,3}[-*+]\s+\S"),
+    re.compile(r"(^|\n)\s{0,3}\d+[.)]\s+\S"),
+    re.compile(r"(^|\n)\s*\|.+\|\s*(\n|$)"),
+    re.compile(r"(\*\*|__)[^\n]+?\1"),
+    re.compile(r"~~[^\n]+?~~"),
+)
+
+
+def _segments_text(segments: list[dict[str, Any]]) -> str:
+    return "".join(
+        str(seg.get("text") or "")
+        for seg in segments
+        if seg.get("kind") == "text"
+    )
+
+
+def _has_native_image_segment(segments: list[dict[str, Any]]) -> bool:
+    return any(seg.get("kind") in ("image", "image_bytes") for seg in segments)
+
+
+def _looks_like_markdown(text: str) -> bool:
+    body = str(text or "")
+    if not body.strip():
+        return False
+    return any(pattern.search(body) for pattern in _MARKDOWN_SIGNAL_RES)
+
+
+def _should_preserve_markdown(
+    *,
+    format_mode: str,
+    text: str,
+    has_links: bool = False,
+) -> bool:
+    if format_mode == "text":
+        return False
+    if format_mode == "markdown":
+        return bool(str(text or "").strip() or has_links)
+    return _looks_like_markdown(text)
+
+
+def _markdown_link_label(value: str) -> str:
+    label = " ".join(str(value or "").strip().split())
+    return (
+        label.replace("\\", "\\\\")
+        .replace("[", "\\[")
+        .replace("]", "\\]")
+        or "link"
+    )
+
+
+def _markdown_link_href(value: str) -> str:
+    href = str(value or "").strip()
+    href = href.replace("\r", "").replace("\n", "")
+    href = href.replace("\t", "%09").replace(" ", "%20")
+    return href.replace(")", "%29")
+
+
+def _links_as_markdown(links: list[dict[str, str]]) -> str:
+    lines: list[str] = []
+    for link in links:
+        href = _markdown_link_href(link.get("href") or "")
+        if not href:
+            continue
+        label = _markdown_link_label(link.get("label") or href)
+        lines.append(f"[{label}]({href})")
+    return "\n".join(lines)
+
+
+def _fold_links_into_markdown_text(
+    text: str,
+    links: list[dict[str, str]],
+) -> str:
+    link_text = _links_as_markdown(links)
+    if not link_text:
+        return str(text or "")
+    body = str(text or "").rstrip()
+    if not body:
+        return link_text
+    return f"{body}\n\n{link_text}"
+
+
 def _validate_serverapi_reply_to(
     value: Any,
 ) -> tuple[list[dict[str, str]], str | None]:
@@ -1377,11 +1465,30 @@ class ServerAPI:
                 error="message, image_paths, image_bytes, links, reply_to, or group @ mention is required",
             )
 
-        force_text_payload = bool(reply_targets or link_items)
+        has_native_image = _has_native_image_segment(segments)
+        message_text = _segments_text(segments)
+        preserve_markdown = (
+            not has_native_image
+            and _should_preserve_markdown(
+                format_mode=fmt,
+                text=message_text,
+                has_links=bool(link_items),
+            )
+        )
+        packet_segments = segments
+        packet_links = link_items
+        if preserve_markdown and link_items:
+            packet_segments = [{
+                "kind": "text",
+                "text": _fold_links_into_markdown_text(message_text, link_items),
+            }]
+            packet_links = []
+
+        force_text_payload = bool(reply_targets or packet_links) and not preserve_markdown
         packets, err = await self._build_group_packets(
             group_id=group_id,
-            segments=segments,
-            links=link_items,
+            segments=packet_segments,
+            links=packet_links,
             explicit_at_items=at_items,
             force_text_payload=force_text_payload,
             format_mode=fmt,
@@ -1403,6 +1510,13 @@ class ServerAPI:
                 error="no valid content for group message",
                 warnings=tuple(warnings),
             )
+        if reply_targets and preserve_markdown:
+            packets = [{
+                "body": [{"type": "TEXT", "content": ""}],
+                "msgtype": "TEXT",
+                "kind": "text",
+                "preview": "",
+            }, *packets]
 
         receipts: list[SentMessageReceipt] = []
         raw_responses: list[dict[str, Any]] = []
@@ -1482,10 +1596,29 @@ class ServerAPI:
                 error="message, image_paths, image_bytes, links, or reply_to is required",
             )
 
+        has_native_image = _has_native_image_segment(segments)
+        message_text = _segments_text(segments)
+        preserve_markdown = (
+            not has_native_image
+            and _should_preserve_markdown(
+                format_mode=fmt,
+                text=message_text,
+                has_links=bool(link_items),
+            )
+        )
+        packet_segments = segments
+        packet_links = link_items
+        if preserve_markdown and link_items:
+            packet_segments = [{
+                "kind": "text",
+                "text": _fold_links_into_markdown_text(message_text, link_items),
+            }]
+            packet_links = []
+
         packets, err = await self._build_private_packets(
-            segments=segments,
-            links=link_items,
-            has_reply=bool(reply_targets),
+            segments=packet_segments,
+            links=packet_links,
+            has_reply=bool(reply_targets) and not preserve_markdown,
             format_mode=fmt,
         )
         if err:
@@ -1499,6 +1632,8 @@ class ServerAPI:
                 error="no valid content for private message",
                 warnings=tuple(warnings),
             )
+        if reply_targets and preserve_markdown:
+            packets = [{"kind": "text", "text": "", "preview": ""}, *packets]
 
         receipts: list[SentMessageReceipt] = []
         raw_responses: list[dict[str, Any]] = []

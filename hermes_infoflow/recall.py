@@ -242,6 +242,25 @@ def get_inbound_sender_id(message_id: str) -> str:
     return ctx.sender_imid or ""
 
 
+def get_inbound_sender_mention(message_id: str) -> tuple[str, str]:
+    """Return the sender identity as a structured group mention target.
+
+    The generic ``get_inbound_sender_id`` helper intentionally falls back to
+    imid for recall/follow-up bookkeeping. Group @ mentions must not use that
+    fallback: humans need uuapName and bots need numeric agentId.
+    """
+    ctx = _lookup_inbound_context(message_id)
+    if ctx is None:
+        return "", ""
+    agent_id = str(ctx.sender_agent_id or "").strip()
+    if agent_id and agent_id.isdigit():
+        return "agent", agent_id
+    user_id = str(ctx.sender_id or "").strip()
+    if user_id:
+        return "user", user_id
+    return "", ""
+
+
 def get_inbound_msgseqid(message_id: str) -> str | None:
     """Return the msgseqid for an inbound message, or None.
 

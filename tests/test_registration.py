@@ -91,8 +91,19 @@ def test_register_registers_platform_and_tool() -> None:
         "旧格式",
         "底层",
         "兼容",
+        "发送层",
+        "降级",
+        "双发",
+        "自动选择可正常展示",
+        "Markdown 链接",
+        "LINK body",
+        "richtext",
+        "TEXT",
     ):
         assert forbidden not in platform["platform_hint"]
+    assert "auto`，优先以 Markdown 发送" in platform["platform_hint"]
+    assert "`markdown` 表示希望以 Markdown 发送" in platform["platform_hint"]
+    assert "`text` 表示必须以纯文本发送" in platform["platform_hint"]
 
     assert any(t["name"] == "infoflow_send_message" for t in ctx.tools)
     send_tool = next(t for t in ctx.tools if t["name"] == "infoflow_send_message")
@@ -110,6 +121,14 @@ def test_register_registers_platform_and_tool() -> None:
         "旧格式",
         "底层",
         "兼容",
+        "发送层",
+        "降级",
+        "双发",
+        "自动选择可正常展示",
+        "Markdown 链接",
+        "LINK body",
+        "richtext",
+        "TEXT",
     ):
         assert forbidden not in schemas_text
     send_props = send_tool["schema"]["parameters"]["properties"]
