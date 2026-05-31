@@ -37,7 +37,7 @@ def test_register_registers_platform_and_tool() -> None:
     assert platform["max_message_length"] == 2048
     assert "infoflow" in (platform.get("install_hint") or "").lower() or platform.get("install_hint")
     assert "外发工具规则" in platform["platform_hint"]
-    assert "MEDIA:" in platform["platform_hint"]
+    assert "file_delivery" in platform["platform_hint"]
     assert "NO_REPLY" in platform["platform_hint"]
     # Required env names align with the plugin.yaml manifest.
     required = set(platform["required_env"])
@@ -81,6 +81,10 @@ def test_register_registers_platform_and_tool() -> None:
     )
     assert "infoflow_create_group" in platform["platform_hint"]
     assert "infoflow_send_message" in platform["platform_hint"]
+    assert "file_delivery" in platform["platform_hint"]
+    assert "<HERMES_HOME>" not in platform["platform_hint"]
+    assert "MEDIA:" not in platform["platform_hint"]
+    assert "base64" not in platform["platform_hint"].lower()
     assert "infoflow_reply" not in platform["platform_hint"]
     for forbidden in (
         "richtext_links",
@@ -103,7 +107,8 @@ def test_register_registers_platform_and_tool() -> None:
         assert forbidden not in platform["platform_hint"]
     assert "auto`，优先以 Markdown 发送" in platform["platform_hint"]
     assert "`markdown` 表示希望以 Markdown 发送" in platform["platform_hint"]
-    assert "`text` 表示必须以纯文本发送" in platform["platform_hint"]
+    assert "`text` 表示正文必须以纯文本发送" in platform["platform_hint"]
+    assert "使用 `text` 时" in platform["platform_hint"]
 
     assert any(t["name"] == "infoflow_send_message" for t in ctx.tools)
     send_tool = next(t for t in ctx.tools if t["name"] == "infoflow_send_message")
@@ -132,12 +137,19 @@ def test_register_registers_platform_and_tool() -> None:
     ):
         assert forbidden not in schemas_text
     send_props = send_tool["schema"]["parameters"]["properties"]
+    assert "base64" not in schemas_text.lower()
     assert "image_paths" in send_props
     assert "links" in send_props
     assert "richtext_links" not in send_props
     assert "reply_to" in send_props
     assert "mention_user_ids" in send_props
     assert not any(t["name"] == "infoflow_reply" for t in ctx.tools)
+
+    assert any(t["name"] == "file_delivery" for t in ctx.tools)
+    file_delivery_tool = next(t for t in ctx.tools if t["name"] == "file_delivery")
+    assert file_delivery_tool["toolset"] == "infoflow"
+    assert file_delivery_tool["is_async"] is True
+    assert file_delivery_tool["schema"]["parameters"]["required"] == ["source_path"]
 
     assert any(t["name"] == "infoflow_get_message_history" for t in ctx.tools)
     history_tool = next(

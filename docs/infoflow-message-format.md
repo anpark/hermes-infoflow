@@ -90,6 +90,14 @@
 | 图片、图文、图片 + reply/AT/LINK | `IMAGE` | `IMAGE`，可加 `TEXT`、`AT`、`LINK` | 可以 | 图片 packet 内文字只能用 `TEXT`，不能用 `MD`。 |
 | reply-only 群消息 | `TEXT` | `TEXT(content="")` | 必须 | 未验证省略 body；已验证空 `TEXT` 可承载 reply。 |
 
+Markdown URL 渲染规则：
+
+- HTTP/HTTPS URL 作为链接发送时，原生 links、Markdown 链接 `[name](url)`、纯文本 URL 均已通过群聊和私聊客户端验收。
+- Markdown 图片 `![alt](url)` 仅对 `jpg/jpeg/png/gif/webp` 作为可靠契约；`gif` 动图已确认可渲染。
+- 不要把视频、音频、PDF、压缩包、Office 或任意非图片 URL 写成 `![alt](url)`。实测 `mov/mp4/webm/pdf/zip/mp3` 会出现标题外内容为空，属于内容丢失风险。
+- 不要依赖 HTML 多媒体标签：`<iframe>` 对 `pdf/mp4` 实测为空；`<img>/<video>/<audio>/<object>` 未形成多媒体渲染契约，可能按标签文本展示。发送层应改写为 Markdown 链接，图片仅在安全格式下改写为 Markdown 图片。
+- 详细 BOS 文件 URL 与渲染矩阵见 `docs/infoflow-bos.md`。
+
 群 `message.reply` 只能是单个 object，不能是数组。`msgtype="TEXT"` + body `TEXT` 下传 2 条或 3 条 reply 数组均已验证失败为 `请求参数错误`。
 
 私聊最小文本请求：

@@ -1496,6 +1496,172 @@ def test_send_private_message_intent_format_text_keeps_markdown_literal(
     assert captured[0]["reply"] == [{"msgid": "MID"}]
 
 
+def test_send_group_message_intent_rewrites_nonimage_markdown_image(
+    monkeypatch,
+) -> None:
+    captured: list[dict[str, object]] = []
+
+    async def fake_send_group_payload(account, **kwargs):
+        captured.append(kwargs)
+        return {"ok": True, "messageid": "G-1"}
+
+    monkeypatch.setattr(
+        serverapi_mod._api,
+        "send_group_payload",
+        fake_send_group_payload,
+    )
+    api = ServerAPI(settings=_settings())
+
+    result = asyncio.run(api.send_group_message_intent(
+        "4507088",
+        message="![video](https://example.com/movie.mp4?token=abc)",
+        session=object(),
+    ))
+
+    assert result.success is True
+    assert captured[0]["msgtype"] == "MD"
+    assert captured[0]["body"] == [
+        {"type": "MD", "content": "[video](https://example.com/movie.mp4?token=abc)"}
+    ]
+    assert result.warnings == (
+        {
+            "code": "markdown_media_rewritten",
+            "message": "unsupported Markdown/HTML media tags were rewritten as links",
+        },
+    )
+
+
+def test_send_group_message_intent_keeps_verified_markdown_image(
+    monkeypatch,
+) -> None:
+    captured: list[dict[str, object]] = []
+
+    async def fake_send_group_payload(account, **kwargs):
+        captured.append(kwargs)
+        return {"ok": True, "messageid": "G-1"}
+
+    monkeypatch.setattr(
+        serverapi_mod._api,
+        "send_group_payload",
+        fake_send_group_payload,
+    )
+    api = ServerAPI(settings=_settings())
+
+    result = asyncio.run(api.send_group_message_intent(
+        "4507088",
+        message="![pic](https://example.com/pic.webp?token=abc)",
+        session=object(),
+    ))
+
+    assert result.success is True
+    assert captured[0]["msgtype"] == "MD"
+    assert captured[0]["body"] == [
+        {"type": "MD", "content": "![pic](https://example.com/pic.webp?token=abc)"}
+    ]
+    assert result.warnings == ()
+
+
+def test_send_private_message_intent_rewrites_html_media_tags(
+    monkeypatch,
+) -> None:
+    captured: list[dict[str, object]] = []
+
+    async def fake_send_private_payload(account, payload, session=None):
+        captured.append(payload)
+        return {"ok": True, "msgkey": "P-1"}
+
+    monkeypatch.setattr(
+        serverapi_mod._api,
+        "send_private_payload",
+        fake_send_private_payload,
+    )
+    api = ServerAPI(settings=_settings())
+
+    result = asyncio.run(api.send_private_message_intent(
+        "alice",
+        message='<video controls src="https://example.com/movie.mp4"></video>',
+        session=object(),
+    ))
+
+    assert result.success is True
+    assert captured[0]["msgtype"] == "md"
+    assert captured[0]["md"] == {
+        "content": "[video](https://example.com/movie.mp4)"
+    }
+    assert result.warnings == (
+        {
+            "code": "markdown_media_rewritten",
+            "message": "unsupported Markdown/HTML media tags were rewritten as links",
+        },
+    )
+
+
+def test_send_group_message_intent_rewrites_html_source_media_tag(
+    monkeypatch,
+) -> None:
+    captured: list[dict[str, object]] = []
+
+    async def fake_send_group_payload(account, **kwargs):
+        captured.append(kwargs)
+        return {"ok": True, "messageid": "G-1"}
+
+    monkeypatch.setattr(
+        serverapi_mod._api,
+        "send_group_payload",
+        fake_send_group_payload,
+    )
+    api = ServerAPI(settings=_settings())
+
+    result = asyncio.run(api.send_group_message_intent(
+        "4507088",
+        message='<video controls><source src="https://example.com/movie.mp4">fallback</video>',
+        session=object(),
+    ))
+
+    assert result.success is True
+    assert captured[0]["msgtype"] == "MD"
+    assert captured[0]["body"] == [
+        {"type": "MD", "content": "[video](https://example.com/movie.mp4)"}
+    ]
+    assert result.warnings == (
+        {
+            "code": "markdown_media_rewritten",
+            "message": "unsupported Markdown/HTML media tags were rewritten as links",
+        },
+    )
+
+
+def test_send_private_message_intent_text_keeps_html_media_literal(
+    monkeypatch,
+) -> None:
+    captured: list[dict[str, object]] = []
+
+    async def fake_send_private_payload(account, payload, session=None):
+        captured.append(payload)
+        return {"ok": True, "msgkey": "P-1"}
+
+    monkeypatch.setattr(
+        serverapi_mod._api,
+        "send_private_payload",
+        fake_send_private_payload,
+    )
+    api = ServerAPI(settings=_settings())
+
+    result = asyncio.run(api.send_private_message_intent(
+        "alice",
+        message='<video controls src="https://example.com/movie.mp4"></video>',
+        format="text",
+        session=object(),
+    ))
+
+    assert result.success is True
+    assert captured[0]["msgtype"] == "text"
+    assert captured[0]["text"] == {
+        "content": '<video controls src="https://example.com/movie.mp4"></video>'
+    }
+    assert result.warnings == ()
+
+
 def test_send_private_message_intent_links_and_images_split(
     monkeypatch,
     tmp_path,

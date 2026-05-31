@@ -289,11 +289,13 @@ from .dashboard import get_tracker, normalize_chat_id
 from .identity import raw_id_from_key, sender_key
 from .iftools import (
     CREATE_GROUP_TOOL_SCHEMA,
+    FILE_DELIVERY_TOOL_SCHEMA,
     GROUP_MEMBERS_TOOL_SCHEMA,
     HISTORY_TOOL_SCHEMA,
     RECALL_TOOL_SCHEMA,
     SEND_MESSAGE_TOOL_SCHEMA,
     make_create_group_handler,
+    make_file_delivery_handler,
     make_group_members_handler,
     make_history_handler,
     make_recall_handler,
@@ -326,7 +328,7 @@ from .policy import (
     PolicyDecision,
     normalize_reply_mode,
 )
-from .prompt_rules import INFOFLOW_DELIVERY_TOOL_RULES
+from .prompt_rules import INFOFLOW_DELIVERY_TOOL_RULES, infoflow_file_delivery_prompt
 from .recall import (
     get_inbound_body,
     get_inbound_sender_id,
@@ -2714,8 +2716,10 @@ def register(ctx: Any) -> None:
             "\n"
             "【发送消息】\n"
             "当前会话普通文字回复优先直接输出最终回复。"
-            "需要指定 target、跨会话发送、发送链接/图片、"
-            "控制图文顺序、群聊 @ 或引用消息时，使用 `infoflow_send_message`。\n"
+            "需要指定 target、跨会话发送、发送链接、"
+            "群聊 @ 或引用消息时，使用 `infoflow_send_message`。"
+            "以链接或 Markdown 形式分享本地图片或文件前，先调用 `file_delivery` 获取 URL；"
+            "直接发送如流原生图片消息时使用 `image_paths`。\n"
             "`infoflow_send_message.target` 必填：\n"
             "- 私信：`infoflow:<uuapName>` 或 `user:<uuapName>`（如 `infoflow:chengbo05`）\n"
             "- 群聊：`infoflow:group:<群组ID>`（如 `infoflow:group:4507088`）\n"
@@ -2723,16 +2727,21 @@ def register(ctx: Any) -> None:
             "- 不要用裸 `infoflow` 作为当前会话目标；裸平台名会路由到 home channel\n"
             "\n"
             "【发送参数】\n"
-            "`message` 是正文，可包含 `MEDIA:<本地图片绝对路径>` 控制图文顺序；"
-            "`image_paths` 用于追加图片。只发送链接、图片、群聊 @ 或引用时，"
+            "`message` 是正文。只发送链接、群聊 @ 或引用时，"
             "`message` 可为空字符串。\n"
             "`message` 支持 Markdown 语法；普通正文保持 `format=auto` 即可。\n"
-            "HTTP/HTTPS 图片 URL（包括内网 URL）不是本地路径；需要图片以内联 "
-            "Markdown 展示时，直接在正文写 `![alt](url)`。\n"
+            "以 URL 或 Markdown 形式分享本地图片或文件时，先交给 `file_delivery` 获取 URL；"
+            "不要把本地路径直接写入正文。\n"
+            "如果用户明确要直接发送本地图片、截图或贴图为如流原生图片消息，"
+            "使用 `infoflow_send_message.image_paths`。\n"
+            "HTTP/HTTPS 图片 URL（包括内网 URL）不是本地路径；jpg/png/gif/webp "
+            "需要以内联 Markdown 展示时，直接在正文写 `![alt](url)`；"
+            "其它文件 URL 使用普通链接。\n"
             "`links` 支持 URL、`[展示文本](URL)`、`{href, label}`，"
-            "可单独发送或与正文、图片、群聊 @、引用组合。\n"
+            "可单独发送或与正文、群聊 @、引用组合。\n"
             "`format` 默认 `auto`，优先以 Markdown 发送；`markdown` 表示希望"
-            "以 Markdown 发送；`text` 表示必须以纯文本发送。\n"
+            "以 Markdown 发送；`text` 表示正文必须以纯文本发送。"
+            "使用 `text` 时，需要分享文件就发送 URL 或 links，需要直接发图片就使用 image_paths。\n"
             "群聊 @ 可写 `@uuapName`、`@agentId`、`@all`，"
             "也可用 `at_all`、`mention_user_ids`、`mention_agent_ids`；"
             "私聊 `@xxx` 按普通文本展示。\n"
@@ -2740,6 +2749,8 @@ def register(ctx: Any) -> None:
             "引用整条消息时只传 message_id；只想展示原文中的某一句或某一段时，"
             "传 `{message_id, preview}`，preview 填该片段。"
             "群聊最终只引用一条，私聊可传数组引用多条。\n"
+            "\n"
+            f"{infoflow_file_delivery_prompt()}\n"
             "\n"
             f"{INFOFLOW_DELIVERY_TOOL_RULES}\n"
             "【消息格式】每条消息使用结构化 envelope："
@@ -2815,6 +2826,18 @@ def register(ctx: Any) -> None:
             )
         except Exception as exc:
             gw_log().warning("[infoflow] failed to register send_message tool: %s", exc)
+        try:
+            register_tool(
+                name="file_delivery",
+                toolset="infoflow",
+                schema=FILE_DELIVERY_TOOL_SCHEMA,
+                handler=make_file_delivery_handler(),
+                is_async=True,
+                description="Publish a local file as an Infoflow-shareable URL.",
+                emoji="🔗",
+            )
+        except Exception as exc:
+            gw_log().warning("[infoflow] failed to register file_delivery tool: %s", exc)
         try:
             register_tool(
                 name="infoflow_get_group_members",

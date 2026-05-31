@@ -122,10 +122,11 @@ def test_recall_tool_rules_keep_silent_success_contract() -> None:
 def test_infoflow_tool_rules_include_shared_delivery_contract() -> None:
     assert INFOFLOW_DELIVERY_TOOL_RULES in _INFOFLOW_TOOL_RULES_DOC
     assert "外发工具规则" in INFOFLOW_DELIVERY_TOOL_RULES
-    assert "MEDIA:" in INFOFLOW_DELIVERY_TOOL_RULES
+    assert "file_delivery" in INFOFLOW_DELIVERY_TOOL_RULES
     assert "本地路径" in INFOFLOW_DELIVERY_TOOL_RULES
     assert "NO_REPLY" in INFOFLOW_DELIVERY_TOOL_RULES
     assert "只发送 caption" in INFOFLOW_DELIVERY_TOOL_RULES
+    assert "MEDIA:" not in INFOFLOW_DELIVERY_TOOL_RULES
 
 
 def test_permission_doc_allows_visible_skill_read_capabilities() -> None:

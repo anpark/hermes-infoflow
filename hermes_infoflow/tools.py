@@ -221,25 +221,30 @@ SEND_MESSAGE_TOOL_SCHEMA = {
     "name": "infoflow_send_message",
     "description": (
         "向如流私聊或群聊发送消息。`target` 必填。"
-        "支持正文、Markdown 倾向、链接、图片、群聊 @、引用消息，"
+        "支持正文、Markdown 倾向、链接、原生图片 image_paths、群聊 @、引用消息，"
         "以及这些能力的组合。\n\n"
         "当前会话普通文字回复通常直接输出最终回复；需要指定 target、"
-        "跨会话发送、发送图片/链接、群聊 @、引用消息，或控制图文顺序时使用本工具。\n\n"
+        "跨会话发送、发送链接、群聊 @ 或引用消息时使用本工具。"
+        "以链接或 Markdown 形式分享本地图片或文件前，先调用 `file_delivery` 获取 URL；"
+        "直接发送如流原生图片消息时使用 `image_paths`。\n\n"
         "目标：群聊用 `group:<群组ID>` 或纯数字群 ID；私聊用 "
         "`user:<uuapName>` 或 `<uuapName>`，可加 `infoflow:` 前缀。"
         "`bot:<agentId>` 不能作为私聊 target。\n\n"
         "`format` 默认 `auto`，通常不用传。`auto` 优先以 Markdown 发送；"
-        "`markdown` 表示希望以 Markdown 发送；`text` 表示必须以纯文本发送。"
-        "`message` 是正文，可包含 "
-        "`MEDIA:<本地图片绝对路径>` 控制图文顺序；只发送链接、图片、"
-        "群聊 @ 或引用时，`message` 可为空字符串。\n\n"
+        "`markdown` 表示希望以 Markdown 发送；`text` 表示正文必须以纯文本发送。"
+        "使用 `text` 时，需要分享文件就发送 URL 或 `links`，需要直接发图片就使用 `image_paths`。"
+        "`message` 是正文；只发送链接、群聊 @ 或引用时，"
+        "`message` 可为空字符串。\n\n"
         "`message` 支持 Markdown 语法；普通正文保持 `format=auto` 即可。\n\n"
         "链接：`links` 支持 URL、`[展示文本](URL)`、`{href, label}`，"
-        "可单独发送或与正文/图片/@/引用组合。\n\n"
-        "图片：`MEDIA:<本地图片绝对路径>` 写在 `message` 中可控制图文顺序；"
-        "`image_paths` 会追加到 `message` 之后。重复路径会去重，"
-        "不会把本地路径作为正文发出。HTTP/HTTPS 图片 URL（包括内网 URL）"
-        "不是本地路径；需要 Markdown 展示时直接写 `![alt](url)`。\n\n"
+        "可单独发送或与正文/@/引用组合。\n\n"
+        "URL 分享：本地文件、非图片内容、以及需要 Markdown 图片展示的本地图片，"
+        "先交给 `file_delivery` 获取 URL，再把 URL 写入正文或 `links`。"
+        "HTTP/HTTPS 图片 URL（包括内网 URL）"
+        "不是本地路径；jpg/png/gif/webp 需要 Markdown 展示时直接写 "
+        "`![alt](url)`；其它文件 URL 使用 `links` 或普通链接。\n\n"
+        "原生图片消息：如果用户明确要直接发送本地图片、截图或贴图，"
+        "使用 `image_paths` 传本地图片路径。\n\n"
         "引用消息：`reply_to` 传 message_id、`{message_id, preview}`，"
         "或这些值的数组。引用整条消息时只传 message_id；"
         "只想展示原文中的某一句或某一段时，传 `{message_id, preview}`，"
@@ -262,11 +267,11 @@ SEND_MESSAGE_TOOL_SCHEMA = {
             "message": {
                 "type": "string",
                 "description": (
-                    "消息正文。支持 Markdown 语法，可包含 "
-                    "`MEDIA:<本地图片绝对路径>` 控制图文顺序；只发送"
-                    "链接、图片、群聊 @ 或引用时可为空字符串。HTTP/HTTPS "
-                    "图片 URL（包括内网 URL）可用 Markdown 图片语法 "
-                    "`![alt](url)` 写在正文中。"
+                    "消息正文。支持 Markdown 语法；只发送链接、群聊 @ "
+                    "或引用时可为空字符串。以 URL 或 Markdown 形式分享本地图片或文件时，"
+                    "先调用 `file_delivery` 获取 URL，不要直接写入本地路径。HTTP/HTTPS "
+                    "jpg/png/gif/webp 图片 URL（包括内网 URL）可用 Markdown "
+                    "图片语法 `![alt](url)` 写在正文中；其它文件 URL 用普通链接。"
                 ),
             },
             "format": {
@@ -274,7 +279,8 @@ SEND_MESSAGE_TOOL_SCHEMA = {
                 "enum": ["auto", "text", "markdown"],
                 "description": (
                     "默认 `auto`，通常不用传。`auto` 优先以 Markdown 发送；"
-                    "`markdown` 表示希望以 Markdown 发送；`text` 表示必须以纯文本发送。"
+                    "`markdown` 表示希望以 Markdown 发送；`text` 表示正文必须以纯文本发送。"
+                    "使用 `text` 时，需要分享文件就发送 URL 或 links，需要直接发图片就使用 image_paths。"
                 ),
                 "default": "auto",
             },
@@ -282,8 +288,9 @@ SEND_MESSAGE_TOOL_SCHEMA = {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": (
-                    "可选。本地图片绝对路径列表；按列表顺序追加到 message "
-                    "中的文本/inline MEDIA 之后发送。"
+                    "可选。本地图片路径列表，用于发送如流原生图片消息。"
+                    "仅用于图片，不用于普通文件分享；一般文件或 Markdown 图片展示"
+                    "请先调用 `file_delivery` 获取 URL。"
                 ),
                 "default": [],
             },
@@ -304,7 +311,7 @@ SEND_MESSAGE_TOOL_SCHEMA = {
                 },
                 "description": (
                     "可点击链接列表。支持 URL、`[展示文本](URL)`、"
-                    "`{href, label}`；可单独发送或与正文、图片、群聊 @、引用组合。"
+                    "`{href, label}`；可单独发送或与正文、群聊 @、引用组合。"
                 ),
                 "default": [],
             },
@@ -364,6 +371,32 @@ SEND_MESSAGE_TOOL_SCHEMA = {
             },
         },
         "required": ["target"],
+    },
+}
+
+
+FILE_DELIVERY_TOOL_SCHEMA = {
+    "name": "file_delivery",
+    "description": (
+        "将本地文件发布为可通过如流对外分享的 URL。"
+        "以链接或 Markdown 形式分享本地图片、文件、音频、视频、"
+        "压缩包或生成内容前，先调用本工具获取 URL，再发送 URL、"
+        "Markdown 链接或 Markdown 图片。"
+        "只接受本地真实文件路径；单文件当前不能超过 69MiB。"
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "source_path": {
+                "type": "string",
+                "description": (
+                    "本地文件真实路径，支持绝对路径或 ~ 路径。"
+                    "如果文件已在 Infoflow 可分享目录下会直接发布；"
+                    "其它目录文件会由工具导入到临时分享目录后发布。"
+                ),
+            },
+        },
+        "required": ["source_path"],
     },
 }
 
@@ -1366,6 +1399,60 @@ def make_send_message_handler():
         if warnings:
             payload["warnings"] = warnings
         return tool_result_json(payload)
+
+    return _handler
+
+
+def make_file_delivery_handler():
+    """Build the ``file_delivery`` tool handler."""
+
+    async def _handler(args: dict, **_kwargs) -> str:
+        source_path = str(args.get("source_path") or "").strip()
+        if not source_path:
+            return tool_result_json({
+                "success": False,
+                "error": "source_path is required",
+            })
+
+        adapter = _get_live_adapter()
+        if adapter is None:
+            return tool_result_json({
+                "success": False,
+                "error": "Infoflow adapter not running — cannot publish file.",
+            })
+
+        serverapi = getattr(adapter, "_serverapi", None)
+        if serverapi is None:
+            return tool_result_json({
+                "success": False,
+                "error": "Infoflow server API is unavailable.",
+            })
+
+        from .file_delivery import FileDeliveryError, publish_file
+
+        session = getattr(adapter, "_effective_session", lambda s: None)(
+            getattr(adapter, "_http_session", None)
+        )
+        try:
+            published = await publish_file(serverapi, source_path, session=session)
+        except FileDeliveryError as exc:
+            return tool_result_json({
+                "success": False,
+                "error": str(exc) or "file cannot be published",
+            })
+        except Exception:
+            logger.exception("[infoflow:file_delivery] failed to publish file")
+            return tool_result_json({
+                "success": False,
+                "error": "file_delivery failed",
+            })
+
+        return tool_result_json({
+            "success": True,
+            "url": published.url,
+            "shared_path": published.shared_path,
+            "size_bytes": published.size_bytes,
+        })
 
     return _handler
 

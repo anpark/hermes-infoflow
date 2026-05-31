@@ -375,6 +375,22 @@ _MARKDOWN_SIGNAL_RES = (
     re.compile(r"(\*\*|__)[^\n]+?\1"),
     re.compile(r"~~[^\n]+?~~"),
 )
+_MARKDOWN_IMAGE_RE = re.compile(
+    r"!\[(?P<label>[^\]\n]*)\]\((?P<href>[^)\s]+)(?:\s+\"[^\"]*\")?\)"
+)
+_HTML_MEDIA_TAG_RE = re.compile(
+    r"<(?P<img_tag>img)\b(?P<img_attrs>[^>]*)/?>"
+    r"|<(?P<paired_tag>video|audio|object|iframe)\b(?P<paired_attrs>[^>]*)>"
+    r".*?</(?P=paired_tag)>"
+    r"|<(?P<single_tag>video|audio|object|iframe)\b(?P<single_attrs>[^>]*)/?>",
+    re.IGNORECASE | re.DOTALL,
+)
+_HTML_SOURCE_TAG_RE = re.compile(r"<source\b(?P<attrs>[^>]*)/?>", re.IGNORECASE)
+_HTML_ATTR_RE = re.compile(
+    r"\b(?P<name>src|data|alt)\s*=\s*(?:\"(?P<dq>[^\"]*)\"|'(?P<sq>[^']*)'|(?P<bare>[^\s>]+))",
+    re.IGNORECASE,
+)
+_MARKDOWN_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 
 
 def _segments_text(segments: list[dict[str, Any]]) -> str:
@@ -424,6 +440,106 @@ def _markdown_link_href(value: str) -> str:
     href = href.replace("\r", "").replace("\n", "")
     href = href.replace("\t", "%09").replace(" ", "%20")
     return href.replace(")", "%29")
+
+
+def _url_path_extension(href: str) -> str:
+    from urllib.parse import urlparse
+
+    try:
+        path = urlparse(str(href or "").strip()).path
+    except Exception:
+        path = str(href or "").strip().split("?", 1)[0].split("#", 1)[0]
+    basename = path.rsplit("/", 1)[-1]
+    if "." not in basename:
+        return ""
+    return "." + basename.rsplit(".", 1)[-1].lower()
+
+
+def _is_safe_markdown_image_href(href: str) -> bool:
+    raw = str(href or "").strip()
+    if not raw.lower().startswith(("http://", "https://")):
+        return False
+    return _url_path_extension(raw) in _MARKDOWN_IMAGE_EXTENSIONS
+
+
+def _html_attrs(attrs: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for match in _HTML_ATTR_RE.finditer(str(attrs or "")):
+        value = match.group("dq")
+        if value is None:
+            value = match.group("sq")
+        if value is None:
+            value = match.group("bare")
+        out[match.group("name").lower()] = str(value or "")
+    return out
+
+
+def _normalize_markdown_media_tags(text: str) -> tuple[str, bool]:
+    """Avoid Markdown/HTML media forms that Infoflow drops or shows as raw text.
+
+    Verified safe inline image Markdown is limited to HTTP(S) jpg/png/gif/webp.
+    Other media/file URLs are rewritten to normal Markdown links so content is
+    still visible and clickable instead of rendering as blank content.
+    """
+    changed = False
+
+    def replace_md_image(match: re.Match[str]) -> str:
+        nonlocal changed
+        label = match.group("label") or "image"
+        href = match.group("href") or ""
+        if _is_safe_markdown_image_href(href):
+            return match.group(0)
+        changed = True
+        return f"[{_markdown_link_label(label)}]({_markdown_link_href(href)})"
+
+    body = _MARKDOWN_IMAGE_RE.sub(replace_md_image, str(text or ""))
+
+    def replace_html_media(match: re.Match[str]) -> str:
+        nonlocal changed
+        tag = (
+            match.group("img_tag")
+            or match.group("paired_tag")
+            or match.group("single_tag")
+            or ""
+        ).lower()
+        attrs = _html_attrs(
+            match.group("img_attrs")
+            or match.group("paired_attrs")
+            or match.group("single_attrs")
+            or ""
+        )
+        href = attrs.get("src") or attrs.get("data") or ""
+        if not href and tag in {"video", "audio"}:
+            source_match = _HTML_SOURCE_TAG_RE.search(match.group(0))
+            if source_match:
+                href = _html_attrs(source_match.group("attrs") or "").get("src") or ""
+        if not href:
+            return match.group(0)
+        label = attrs.get("alt") or tag
+        changed = True
+        if tag == "img" and _is_safe_markdown_image_href(href):
+            return f"![{_markdown_link_label(label)}]({_markdown_link_href(href)})"
+        return f"[{_markdown_link_label(label)}]({_markdown_link_href(href)})"
+
+    return _HTML_MEDIA_TAG_RE.sub(replace_html_media, body), changed
+
+
+def _normalize_markdown_media_segments(
+    segments: list[dict[str, Any]],
+    *,
+    format_mode: str,
+) -> bool:
+    if format_mode == "text":
+        return False
+    changed = False
+    for seg in segments:
+        if seg.get("kind") != "text":
+            continue
+        normalized, seg_changed = _normalize_markdown_media_tags(str(seg.get("text") or ""))
+        if seg_changed:
+            seg["text"] = normalized
+            changed = True
+    return changed
 
 
 def _links_as_markdown(links: list[dict[str, str]]) -> str:
@@ -1444,6 +1560,11 @@ class ServerAPI:
         err, _appended_image_bytes = _append_image_byte_segments(segments, image_bytes)
         if err:
             return SentResult(success=False, error=err)
+        if _normalize_markdown_media_segments(segments, format_mode=fmt):
+            warnings.append(_warning(
+                "markdown_media_rewritten",
+                "unsupported Markdown/HTML media tags were rewritten as links",
+            ))
         at_items, mention_warnings, err = self._normalize_group_mentions(
             at_all=at_all,
             mention_user_ids=mention_user_ids,
@@ -1584,6 +1705,11 @@ class ServerAPI:
         err, _appended_image_bytes = _append_image_byte_segments(segments, image_bytes)
         if err:
             return SentResult(success=False, error=err)
+        if _normalize_markdown_media_segments(segments, format_mode=fmt):
+            warnings.append(_warning(
+                "markdown_media_rewritten",
+                "unsupported Markdown/HTML media tags were rewritten as links",
+            ))
 
         if deduped_links or deduped_images:
             warnings.append(_warning("deduplicated", "duplicate links or images were removed"))

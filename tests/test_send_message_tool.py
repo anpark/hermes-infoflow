@@ -185,7 +185,10 @@ def test_infoflow_send_message_schema_exposes_expected_inputs() -> None:
     assert "省略时仍可只发送" not in schema_json
     assert "auto` 优先以 Markdown 发送" in schema_json
     assert "`markdown` 表示希望以 Markdown 发送" in schema_json
-    assert "`text` 表示必须以纯文本发送" in schema_json
+    assert "`text` 表示正文必须以纯文本发送" in schema_json
+    assert "使用 `text` 时" in schema_json
+    assert "image_paths" in schema_json
+    assert "base64" not in schema_json.lower()
     assert "引用整条消息时只传 message_id" in schema_json
     assert "指定原文片段时用 preview" in schema_json
     assert "私聊可引用多条" in schema_json

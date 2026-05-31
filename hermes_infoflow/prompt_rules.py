@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 SUGGESTED_FINAL_RESPONSE_NO_REPLY = "NO_REPLY"
@@ -11,12 +12,39 @@ INFOFLOW_DELIVERY_TOOL_RULES = """\
 
 `send_message`、`infoflow_send_message` 等会实际向如流发送内容的工具属于外发工具。工具调用结果以工具返回为准。
 
-- `MEDIA:<本地图片绝对路径>` 是传输指令，不是消息正文；绝不能把 `MEDIA:`、`file://` 或本地路径发成普通文本。
-- 生成图片/媒体时先保存到 `~/.hermes/cache/images/` 或 `~/.hermes/image_cache/`，再把 `MEDIA:<...>` 交给工具上传字节。
+- 本地文件路径不是消息正文；绝不能把本地路径或本地文件 URL 发成普通文本。
+- 通过 Infoflow 以链接或 Markdown 形式分享本地文件、图片、音频、视频、压缩包或其它生成内容时，先调用 `file_delivery` 获取 URL，再发送 URL、Markdown 链接或 Markdown 图片。
+- 如果用户明确要求直接发送本地图片、截图或贴图为如流原生图片消息，使用 `infoflow_send_message.image_paths`。
 - 外发工具成功并已完成用户要求的对外发送动作时，最终输出单独一行 `NO_REPLY`，不要再补“已发送/来了”等确认文案。
 - 如果用户明确还要求你在当前会话报告发送结果，可以简短报告状态，但不要重复发送目标内容或本地路径。
-- 外发工具失败时，修正输入后重试；无法修正时只说明失败原因，错误说明中不得包含本地文件路径。不要退化为只发送 caption、`MEDIA:` 文本或路径文本。
+- 外发工具失败时，修正输入后重试；无法修正时只说明失败原因，错误说明中不得包含本地文件路径。不要退化为只发送 caption 或路径文本。
 """
+
+
+def infoflow_file_delivery_prompt(shared_root: str | Path | None = None) -> str:
+    """Return runtime prompt text with the real shared_files path rendered."""
+    if shared_root is None:
+        from .paths import get_infoflow_shared_files_root
+
+        shared_root = get_infoflow_shared_files_root()
+    root = str(Path(shared_root).expanduser())
+    return (
+        "【文件/图片 URL 分享】通过 Infoflow 以链接或 Markdown 形式分享本地文件、图片、音频、视频、"
+        "压缩包或其它生成内容时，必须先调用 `file_delivery(source_path)` 获取 URL，再发送 URL、"
+        "Markdown 链接或 Markdown 图片。\n"
+        "如果用户明确要求直接发送本地图片、截图或贴图为如流原生图片消息，"
+        "使用 `infoflow_send_message.image_paths`。\n"
+        f"Infoflow 可分享文件目录：`{root}`\n"
+        f"临时文件建议放在：`{root}/temp/<YYYYMMDD>/`。"
+        "适合一次性分享、临时报告、截图、导出结果、调试产物、定时任务产物；"
+        "推荐子目录：`media/`、`report/`、`screenshots/`、`cron/`、`probe/`。\n"
+        f"长期复用文件建议放在：`{root}/permanent/`。"
+        "适合固定素材、长期报告、稳定导出、用户资料；"
+        "推荐子目录：`assets/`、`reports/`、`exports/`、`profiles/`。\n"
+        "如果文件已在可分享目录下，直接把该真实路径传给 `file_delivery`；"
+        "如果在其它目录，也可以传给 `file_delivery`，工具会导入到当天临时目录后发布。"
+        "单文件当前不能超过 69MiB。"
+    )
 
 
 def delivery_success_hint() -> dict[str, Any]:
