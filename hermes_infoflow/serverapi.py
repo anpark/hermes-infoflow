@@ -2378,6 +2378,54 @@ class ServerAPI:
                 return {"ok": False, "error": str(exc)}
 
     # ------------------------------------------------------------------
+    # BOS upload / download URL
+    # ------------------------------------------------------------------
+
+    async def bos_upload(
+        self,
+        *,
+        file_content: bytes,
+        file_name: str,
+        object_key: str | None = None,
+        session: aiohttp.ClientSession | None = None,
+        timeout: float = _api.BOS_UPLOAD_TIMEOUT_SECONDS,
+    ) -> _api.BosUploadResult:
+        """Upload bytes to Infoflow BOS without making send-format decisions."""
+        async with self._ensure_session(session) as sess:
+            try:
+                return await _api.im_bos_upload(
+                    self._api_account,
+                    file_content=file_content,
+                    file_name=file_name,
+                    object_key=object_key,
+                    session=sess,
+                    timeout=timeout,
+                )
+            except Exception as exc:
+                return _api.BosUploadResult(False, error=str(exc))
+
+    async def bos_get_url(
+        self,
+        *,
+        object_key: str,
+        expiration_seconds: int = _api.BOS_GET_URL_DEFAULT_EXPIRATION_SECONDS,
+        session: aiohttp.ClientSession | None = None,
+        timeout: float = _api.BOS_GET_URL_TIMEOUT_SECONDS,
+    ) -> _api.BosGetUrlResult:
+        """Fetch a temporary download URL for an Infoflow BOS object key."""
+        async with self._ensure_session(session) as sess:
+            try:
+                return await _api.im_bos_get_url(
+                    self._api_account,
+                    object_key=object_key,
+                    expiration_seconds=expiration_seconds,
+                    session=sess,
+                    timeout=timeout,
+                )
+            except Exception as exc:
+                return _api.BosGetUrlResult(False, error=str(exc))
+
+    # ------------------------------------------------------------------
     # Image download
     # ------------------------------------------------------------------
 

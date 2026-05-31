@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
@@ -22,6 +23,16 @@ def test_ensure_https_upgrades_remote_http() -> None:
 @pytest.mark.parametrize("host", ["http://localhost:8080", "http://127.0.0.1:9000"])
 def test_ensure_https_keeps_localhost(host: str) -> None:
     assert api.ensure_https(host) == host
+
+
+def test_build_bos_public_url_quotes_object_key() -> None:
+    assert api.build_bos_public_url("a/b c/中文.txt") == (
+        "https://bj.bcebos.com/v1/common-archive/a/b%20c/%E4%B8%AD%E6%96%87.txt"
+    )
+    assert api.build_bos_public_url("/leading/slash.txt") == (
+        "https://bj.bcebos.com/v1/common-archive/leading/slash.txt"
+    )
+    assert api.build_bos_public_url("") == ""
 
 
 def test_build_private_payload_text_default() -> None:
@@ -256,6 +267,333 @@ def test_create_group_posts_expected_payload(monkeypatch) -> None:
     assert result["ok"] is True
     assert result["groupid"] == "123456"
     assert result["failRobotIds"] == [999]
+
+
+def test_im_bos_upload_posts_multipart_to_fixed_host(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    class _Resp:
+        status = 200
+
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): return None
+        async def text(self):
+            return json.dumps({
+                "code": 200,
+                "data": {"object_key": "hermes/uploads/a.txt", "e_tag": "ETAG"},
+            })
+
+    class _Sess:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): return None
+        def post(self, url, *, data, headers, timeout):
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["timeout"] = timeout
+            captured["fields"] = [
+                (headers["name"], headers.get("filename"), value)
+                for headers, _payload_headers, value in data._fields
+            ]
+            return _Resp()
+        async def close(self): return None
+
+    async def fake_token(*a, **k):
+        return "TOK"
+
+    monkeypatch.setattr(api, "get_app_access_token", fake_token)
+    account = api.InfoflowAccountAPI(
+        api_host="https://api.example.com",
+        app_key="k",
+        app_secret="s",
+    )
+
+    result = asyncio.run(api.im_bos_upload(
+        account,
+        file_content=b"hello",
+        file_name="a.txt",
+        object_key="hermes/uploads/a.txt",
+        session=_Sess(),
+        timeout=12.5,
+    ))
+
+    assert result == api.BosUploadResult(
+        ok=True,
+        object_key="hermes/uploads/a.txt",
+        e_tag="ETAG",
+    )
+    assert captured["url"] == "https://infoflow-open-gateway.baidu.com/im/bos/upload"
+    assert captured["headers"]["Authorization"] == "Bearer-TOK"
+    assert "Content-Type" not in captured["headers"]
+    assert captured["timeout"].total == 12.5
+    assert captured["fields"] == [
+        ("file", "a.txt", b"hello"),
+        ("objectKey", None, "hermes/uploads/a.txt"),
+    ]
+
+
+def test_im_bos_upload_maps_lowercase_etag(monkeypatch) -> None:
+    class _Resp:
+        status = 200
+
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): return None
+        async def text(self):
+            return json.dumps({
+                "code": 200,
+                "data": {"object_key": "obj", "etag": "LOWER"},
+            })
+
+    class _Sess:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): return None
+        def post(self, *a, **k): return _Resp()
+        async def close(self): return None
+
+    async def fake_token(*a, **k):
+        return "TOK"
+
+    monkeypatch.setattr(api, "get_app_access_token", fake_token)
+    account = api.InfoflowAccountAPI(
+        api_host="https://api.example.com",
+        app_key="k",
+        app_secret="s",
+    )
+
+    result = asyncio.run(api.im_bos_upload(
+        account,
+        file_content=b"hello",
+        file_name="a.txt",
+        session=_Sess(),
+    ))
+
+    assert result == api.BosUploadResult(True, object_key="obj", e_tag="LOWER")
+
+
+def test_im_bos_get_url_uses_query_and_maps_response(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    class _Resp:
+        status = 200
+
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): return None
+        async def text(self):
+            return json.dumps({
+                "code": "200",
+                "data": {
+                    "url": "https://download.example.com/a.txt",
+                    "expiration_seconds": 7200,
+                },
+            })
+
+    class _Sess:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): return None
+        def get(self, url, *, headers, timeout):
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["timeout"] = timeout
+            return _Resp()
+        async def close(self): return None
+
+    async def fake_token(*a, **k):
+        return "TOK"
+
+    monkeypatch.setattr(api, "get_app_access_token", fake_token)
+    account = api.InfoflowAccountAPI(
+        api_host="https://api.example.com",
+        app_key="k",
+        app_secret="s",
+    )
+
+    result = asyncio.run(api.im_bos_get_url(
+        account,
+        object_key="hermes/uploads/a.txt",
+        expiration_seconds=7200,
+        session=_Sess(),
+        timeout=9,
+    ))
+
+    parsed = urlparse(captured["url"])
+    query = parse_qs(parsed.query)
+    assert result == api.BosGetUrlResult(
+        ok=True,
+        url="https://download.example.com/a.txt",
+        expiration_seconds=7200,
+    )
+    assert parsed.scheme == "https"
+    assert parsed.netloc == "infoflow-open-gateway.baidu.com"
+    assert parsed.path == "/im/bos/getUrl"
+    assert query == {
+        "objectKey": ["hermes/uploads/a.txt"],
+        "expirationSeconds": ["7200"],
+    }
+    assert captured["headers"]["Authorization"] == "Bearer-TOK"
+    assert "Content-Type" not in captured["headers"]
+    assert captured["timeout"].total == 9
+
+
+def test_im_bos_head_url_maps_headers() -> None:
+    captured: dict[str, Any] = {}
+
+    class _Resp:
+        status = 200
+        headers = {
+            "Content-Type": "text/plain",
+            "Content-Length": "49",
+            "Accept-Ranges": "bytes",
+            "ETag": '"abc"',
+        }
+
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): return None
+
+    class _Sess:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): return None
+        def head(self, url, *, allow_redirects, timeout):
+            captured["url"] = url
+            captured["allow_redirects"] = allow_redirects
+            captured["timeout"] = timeout
+            return _Resp()
+        async def close(self): return None
+
+    result = asyncio.run(api.im_bos_head_url(
+        "https://bj.bcebos.com/v1/common-archive/a.txt",
+        session=_Sess(),
+        timeout=3,
+    ))
+
+    assert result == api.BosUrlProbeResult(
+        ok=True,
+        status=200,
+        content_type="text/plain",
+        content_length="49",
+        accept_ranges="bytes",
+        e_tag='"abc"',
+    )
+    assert captured["allow_redirects"] is False
+    assert captured["timeout"].total == 3
+
+
+def test_im_bos_range_probe_url_maps_partial_response() -> None:
+    captured: dict[str, Any] = {}
+
+    class _Resp:
+        status = 206
+        headers = {
+            "Content-Type": "text/plain",
+            "Content-Length": "1",
+            "Accept-Ranges": "bytes",
+            "Content-Range": "bytes 0-0/49",
+        }
+
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): return None
+        async def read(self): return b"I"
+
+    class _Sess:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): return None
+        def get(self, url, *, headers, timeout):
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["timeout"] = timeout
+            return _Resp()
+        async def close(self): return None
+
+    result = asyncio.run(api.im_bos_range_probe_url(
+        "https://bj.bcebos.com/v1/common-archive/a.txt",
+        byte_start=0,
+        byte_end=0,
+        session=_Sess(),
+        timeout=4,
+    ))
+
+    assert result == api.BosUrlProbeResult(
+        ok=True,
+        status=206,
+        content_type="text/plain",
+        content_length="1",
+        accept_ranges="bytes",
+        content_range="bytes 0-0/49",
+        body_prefix="I",
+    )
+    assert captured["headers"] == {"Range": "bytes=0-0"}
+    assert captured["timeout"].total == 4
+
+
+def test_im_bos_upload_reports_http_error(monkeypatch) -> None:
+    class _Resp:
+        status = 503
+
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): return None
+        async def text(self): return "backend unavailable"
+
+    class _Sess:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): return None
+        def post(self, url, *, data, headers, timeout):
+            del url, data, headers, timeout
+            return _Resp()
+        async def close(self): return None
+
+    async def fake_token(*a, **k):
+        return "TOK"
+
+    monkeypatch.setattr(api, "get_app_access_token", fake_token)
+    account = api.InfoflowAccountAPI(
+        api_host="https://api.example.com",
+        app_key="k",
+        app_secret="s",
+    )
+
+    result = asyncio.run(api.im_bos_upload(
+        account,
+        file_content=b"hello",
+        file_name="a.txt",
+        session=_Sess(),
+    ))
+
+    assert result.ok is False
+    assert result.error == "HTTP 503: backend unavailable"
+
+
+def test_im_bos_get_url_reports_business_error(monkeypatch) -> None:
+    class _Resp:
+        status = 200
+
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): return None
+        async def text(self): return '{"code":500,"message":"bad object"}'
+
+    class _Sess:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): return None
+        def get(self, url, *, headers, timeout):
+            del url, headers, timeout
+            return _Resp()
+        async def close(self): return None
+
+    async def fake_token(*a, **k):
+        return "TOK"
+
+    monkeypatch.setattr(api, "get_app_access_token", fake_token)
+    account = api.InfoflowAccountAPI(
+        api_host="https://api.example.com",
+        app_key="k",
+        app_secret="s",
+    )
+
+    result = asyncio.run(api.im_bos_get_url(
+        account,
+        object_key="missing",
+        session=_Sess(),
+    ))
+
+    assert result.ok is False
+    assert result.error == "bad object"
 
 
 def test_parse_create_group_response_reports_errcode() -> None:

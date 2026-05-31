@@ -7,6 +7,7 @@ Port of openclaw-infoflow/src/send.ts. Covers:
 * Group raw payload send: TEXT / MD / AT / LINK / IMAGE body items.
 * Group message recall.
 * Private message recall.
+* Infoflow BOS upload + presigned download URL helpers.
 
 Non-obvious wire contract bits (do NOT change without an upstream notice):
 
@@ -34,6 +35,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote, urlencode
 
 import aiohttp
 
@@ -127,6 +129,14 @@ INFOFLOW_PRIVATE_RECALL_PATH = "/api/v1/app/message/revoke"
 INFOFLOW_EMOJI_ADD_PATH = "/api/v1/im/message/emoji/add"
 INFOFLOW_EMOJI_DEL_PATH = "/api/v1/im/message/emoji/del"
 INFOFLOW_GETUSERINFO_PATH = "/api/v1/app/user/getuserinfo"
+INFOFLOW_BOS_FIXED_API_HOST = "http://infoflow-open-gateway.baidu.com"
+INFOFLOW_BOS_UPLOAD_PATH = "/im/bos/upload"
+INFOFLOW_BOS_GET_URL_PATH = "/im/bos/getUrl"
+INFOFLOW_BOS_PUBLIC_URL_BASE = "https://bj.bcebos.com/v1/common-archive"
+BOS_UPLOAD_TIMEOUT_SECONDS = 60.0
+BOS_GET_URL_TIMEOUT_SECONDS = 15.0
+BOS_URL_PROBE_TIMEOUT_SECONDS = 15.0
+BOS_GET_URL_DEFAULT_EXPIRATION_SECONDS = 3600
 
 # In-memory token cache, keyed by appKey. Survives across InfoflowClient
 # instances within the same process — matches OpenClaw's module-level
@@ -199,6 +209,41 @@ class GroupMember:
     is_bot: bool          # True for agent-type members
     agent_id: int | None  # agentId for bots, None for humans
     imid: str = ""        # Infoflow numeric imId / robotId
+
+
+@dataclass
+class BosUploadResult:
+    """Result returned by the Infoflow BOS upload endpoint."""
+
+    ok: bool
+    object_key: str = ""
+    e_tag: str = ""
+    error: str = ""
+
+
+@dataclass
+class BosGetUrlResult:
+    """Result returned by the Infoflow BOS getUrl endpoint."""
+
+    ok: bool
+    url: str = ""
+    expiration_seconds: int = 0
+    error: str = ""
+
+
+@dataclass
+class BosUrlProbeResult:
+    """Result returned by a lightweight HEAD/Range probe against a BOS URL."""
+
+    ok: bool
+    status: int = 0
+    content_type: str = ""
+    content_length: str = ""
+    accept_ranges: str = ""
+    content_range: str = ""
+    e_tag: str = ""
+    body_prefix: str = ""
+    error: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -400,17 +445,309 @@ def _ensure_session(session: aiohttp.ClientSession | None):
     return _Wrap(session)
 
 
-def _auth_headers(token: str, *, content_type: str = "application/json; charset=utf-8") -> dict[str, str]:
+def _auth_headers(
+    token: str,
+    *,
+    content_type: str | None = "application/json; charset=utf-8",
+) -> dict[str, str]:
     """Build the Infoflow auth headers.
 
     Note: ``Bearer-<token>`` (hyphen, no space). This is the Infoflow
     service's non-standard wire format and matches OpenClaw send.ts:487.
     """
-    return {
+    headers = {
         "Authorization": f"Bearer-{token}",
-        "Content-Type": content_type,
         "LOGID": str(uuid.uuid4()),
     }
+    if content_type:
+        headers["Content-Type"] = content_type
+    return headers
+
+
+# ---------------------------------------------------------------------------
+# Infoflow BOS upload / download URL
+# ---------------------------------------------------------------------------
+
+
+def _exception_text(exc: BaseException) -> str:
+    return str(exc) or exc.__class__.__name__
+
+
+def _bos_success_code(code: Any) -> bool:
+    return code in (200, "200")
+
+
+def _bos_error(data: dict[str, Any], *, fallback: str = "BOS request failed") -> str:
+    for key in ("message", "errmsg", "error", "err_msg"):
+        value = data.get(key)
+        if value:
+            return str(value)
+    inner = data.get("data")
+    if isinstance(inner, dict):
+        for key in ("message", "errmsg", "error", "err_msg"):
+            value = inner.get(key)
+            if value:
+                return str(value)
+    if "code" in data:
+        return f"code={data.get('code')}"
+    return fallback
+
+
+def build_bos_public_url(
+    object_key: str,
+    *,
+    public_url_base: str = INFOFLOW_BOS_PUBLIC_URL_BASE,
+) -> str:
+    """Return the observed public BOS URL for an object key.
+
+    Live probes showed uploaded objects are reachable at
+    ``https://bj.bcebos.com/v1/common-archive/<object_key>`` without first
+    calling ``/im/bos/getUrl``. Keep this as a helper instead of inlining the
+    string in higher layers; ``getUrl`` remains the conservative canonical
+    path if BOS access policy changes later.
+    """
+    key = str(object_key or "").strip().lstrip("/")
+    if not key:
+        return ""
+    return f"{str(public_url_base).rstrip('/')}/{quote(key, safe='/')}"
+
+
+def _bos_url_probe_result_from_response(
+    resp: aiohttp.ClientResponse,
+    *,
+    ok_statuses: set[int],
+    body_prefix: str = "",
+) -> BosUrlProbeResult:
+    return BosUrlProbeResult(
+        ok=resp.status in ok_statuses,
+        status=int(resp.status),
+        content_type=str(resp.headers.get("Content-Type", "")),
+        content_length=str(resp.headers.get("Content-Length", "")),
+        accept_ranges=str(resp.headers.get("Accept-Ranges", "")),
+        content_range=str(resp.headers.get("Content-Range", "")),
+        e_tag=str(resp.headers.get("ETag", "")),
+        body_prefix=body_prefix,
+    )
+
+
+async def im_bos_head_url(
+    url: str,
+    *,
+    session: aiohttp.ClientSession | None = None,
+    timeout: float = BOS_URL_PROBE_TIMEOUT_SECONDS,
+) -> BosUrlProbeResult:
+    """Probe a BOS URL with HEAD without downloading the object body."""
+    url = str(url or "").strip()
+    if not url:
+        return BosUrlProbeResult(False, error="url is required")
+    try:
+        async with _ensure_session(session) as sess:
+            async with sess.head(
+                url,
+                allow_redirects=False,
+                timeout=aiohttp.ClientTimeout(total=timeout),
+            ) as resp:
+                return _bos_url_probe_result_from_response(resp, ok_statuses={200})
+    except (asyncio.TimeoutError, TimeoutError):
+        return BosUrlProbeResult(
+            False,
+            error=f"HEAD timed out after {int(timeout * 1000)}ms",
+        )
+    except Exception as exc:
+        return BosUrlProbeResult(False, error=_exception_text(exc))
+
+
+async def im_bos_range_probe_url(
+    url: str,
+    *,
+    byte_start: int = 0,
+    byte_end: int = 0,
+    session: aiohttp.ClientSession | None = None,
+    timeout: float = BOS_URL_PROBE_TIMEOUT_SECONDS,
+) -> BosUrlProbeResult:
+    """Probe a BOS URL with ``Range`` and read only the requested bytes."""
+    url = str(url or "").strip()
+    if not url:
+        return BosUrlProbeResult(False, error="url is required")
+    try:
+        start = int(byte_start)
+        end = int(byte_end)
+    except (TypeError, ValueError):
+        return BosUrlProbeResult(False, error="byte_start and byte_end must be integers")
+    if start < 0 or end < start:
+        return BosUrlProbeResult(False, error="invalid byte range")
+
+    try:
+        async with _ensure_session(session) as sess:
+            async with sess.get(
+                url,
+                headers={"Range": f"bytes={start}-{end}"},
+                timeout=aiohttp.ClientTimeout(total=timeout),
+            ) as resp:
+                body = await resp.read()
+                return _bos_url_probe_result_from_response(
+                    resp,
+                    ok_statuses={206},
+                    body_prefix=body[:200].decode("utf-8", "replace"),
+                )
+    except (asyncio.TimeoutError, TimeoutError):
+        return BosUrlProbeResult(
+            False,
+            error=f"Range probe timed out after {int(timeout * 1000)}ms",
+        )
+    except Exception as exc:
+        return BosUrlProbeResult(False, error=_exception_text(exc))
+
+
+async def im_bos_upload(
+    account: InfoflowAccountAPI,
+    *,
+    file_content: bytes,
+    file_name: str,
+    object_key: str | None = None,
+    session: aiohttp.ClientSession | None = None,
+    timeout: float = BOS_UPLOAD_TIMEOUT_SECONDS,
+    bos_api_host: str = INFOFLOW_BOS_FIXED_API_HOST,
+) -> BosUploadResult:
+    """Upload bytes to Infoflow BOS.
+
+    This wraps ``POST /im/bos/upload``. The BOS host is intentionally fixed to
+    the open gateway by default, while ``account.api_host`` is still used for
+    app-token acquisition.
+    """
+    if not account.app_key or not account.app_secret:
+        return BosUploadResult(False, error="Infoflow appKey/appSecret not configured")
+    if not file_name or not str(file_name).strip():
+        return BosUploadResult(False, error="file_name is required")
+    if not isinstance(file_content, (bytes, bytearray, memoryview)):
+        return BosUploadResult(False, error="file_content must be bytes")
+
+    try:
+        async with _ensure_session(session) as sess:
+            token = await get_app_access_token(account, session=sess, timeout=timeout)
+            form = aiohttp.FormData()
+            form.add_field(
+                "file",
+                bytes(file_content),
+                filename=str(file_name),
+                content_type="application/octet-stream",
+            )
+            if object_key:
+                form.add_field("objectKey", str(object_key))
+
+            url = _join(bos_api_host, INFOFLOW_BOS_UPLOAD_PATH)
+            async with sess.post(
+                url,
+                data=form,
+                headers=_auth_headers(token, content_type=None),
+                timeout=aiohttp.ClientTimeout(total=timeout),
+            ) as resp:
+                text = await resp.text()
+                if resp.status >= 400:
+                    return BosUploadResult(
+                        False,
+                        error=f"HTTP {resp.status}: {text[:200]}",
+                    )
+    except (asyncio.TimeoutError, TimeoutError):
+        return BosUploadResult(
+            False,
+            error=f"upload timed out after {int(timeout * 1000)}ms",
+        )
+    except InfoflowAPIError as exc:
+        return BosUploadResult(False, error=str(exc))
+    except Exception as exc:
+        return BosUploadResult(False, error=_exception_text(exc))
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        return BosUploadResult(False, error=f"upload response is not JSON: {exc}")
+
+    if not isinstance(data, dict):
+        return BosUploadResult(False, error=f"unexpected upload response: {text[:200]}")
+    if not _bos_success_code(data.get("code")):
+        return BosUploadResult(False, error=_bos_error(data, fallback="upload failed"))
+
+    inner = data.get("data") if isinstance(data.get("data"), dict) else {}
+    return BosUploadResult(
+        True,
+        object_key=str(inner.get("object_key") or inner.get("objectKey") or ""),
+        e_tag=str(inner.get("etag") or inner.get("e_tag") or inner.get("eTag") or ""),
+    )
+
+
+async def im_bos_get_url(
+    account: InfoflowAccountAPI,
+    *,
+    object_key: str,
+    expiration_seconds: int = BOS_GET_URL_DEFAULT_EXPIRATION_SECONDS,
+    session: aiohttp.ClientSession | None = None,
+    timeout: float = BOS_GET_URL_TIMEOUT_SECONDS,
+    bos_api_host: str = INFOFLOW_BOS_FIXED_API_HOST,
+) -> BosGetUrlResult:
+    """Return a presigned download URL for an Infoflow BOS object key."""
+    if not account.app_key or not account.app_secret:
+        return BosGetUrlResult(False, error="Infoflow appKey/appSecret not configured")
+    object_key = str(object_key or "").strip()
+    if not object_key:
+        return BosGetUrlResult(False, error="object_key is required")
+    try:
+        expiration = int(expiration_seconds)
+    except (TypeError, ValueError):
+        return BosGetUrlResult(False, error="expiration_seconds must be an integer")
+    if expiration <= 0:
+        return BosGetUrlResult(False, error="expiration_seconds must be positive")
+
+    try:
+        async with _ensure_session(session) as sess:
+            token = await get_app_access_token(account, session=sess, timeout=timeout)
+            query = urlencode({
+                "objectKey": object_key,
+                "expirationSeconds": str(expiration),
+            })
+            url = f"{_join(bos_api_host, INFOFLOW_BOS_GET_URL_PATH)}?{query}"
+            async with sess.get(
+                url,
+                headers=_auth_headers(token, content_type=None),
+                timeout=aiohttp.ClientTimeout(total=timeout),
+            ) as resp:
+                text = await resp.text()
+                if resp.status >= 400:
+                    return BosGetUrlResult(
+                        False,
+                        error=f"HTTP {resp.status}: {text[:200]}",
+                    )
+    except (asyncio.TimeoutError, TimeoutError):
+        return BosGetUrlResult(
+            False,
+            error=f"getUrl timed out after {int(timeout * 1000)}ms",
+        )
+    except InfoflowAPIError as exc:
+        return BosGetUrlResult(False, error=str(exc))
+    except Exception as exc:
+        return BosGetUrlResult(False, error=_exception_text(exc))
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        return BosGetUrlResult(False, error=f"getUrl response is not JSON: {exc}")
+
+    if not isinstance(data, dict):
+        return BosGetUrlResult(False, error=f"unexpected getUrl response: {text[:200]}")
+    if not _bos_success_code(data.get("code")):
+        return BosGetUrlResult(False, error=_bos_error(data, fallback="getUrl failed"))
+
+    inner = data.get("data") if isinstance(data.get("data"), dict) else {}
+    raw_expiration = inner.get("expiration_seconds", inner.get("expirationSeconds", expiration))
+    try:
+        result_expiration = int(raw_expiration)
+    except (TypeError, ValueError):
+        result_expiration = expiration
+    return BosGetUrlResult(
+        True,
+        url=str(inner.get("url") or ""),
+        expiration_seconds=result_expiration,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1130,18 +1467,32 @@ def _parse_recall_response(response_text: str, *, kind: str) -> dict[str, Any]:
 
 
 __all__ = [
+    "BOS_GET_URL_DEFAULT_EXPIRATION_SECONDS",
+    "BOS_GET_URL_TIMEOUT_SECONDS",
+    "BOS_UPLOAD_TIMEOUT_SECONDS",
+    "BOS_URL_PROBE_TIMEOUT_SECONDS",
+    "BosGetUrlResult",
+    "BosUploadResult",
+    "BosUrlProbeResult",
     "ContentItem",
     "InfoflowAPIError",
     "GroupMember",
+    "INFOFLOW_BOS_FIXED_API_HOST",
+    "INFOFLOW_BOS_PUBLIC_URL_BASE",
     "InfoflowAccountAPI",
     "ReplyContext",
     "add_message_reaction",
+    "build_bos_public_url",
     "clear_token_cache",
     "create_group",
     "delete_message_reaction",
     "ensure_https",
     "get_app_access_token",
     "get_group_members",
+    "im_bos_get_url",
+    "im_bos_head_url",
+    "im_bos_range_probe_url",
+    "im_bos_upload",
     "recall_group_message",
     "recall_private_message",
 ]
