@@ -405,6 +405,16 @@ def _has_native_image_segment(segments: list[dict[str, Any]]) -> bool:
     return any(seg.get("kind") in ("image", "image_bytes") for seg in segments)
 
 
+def _image_segment_label(segment: dict[str, Any], index: int) -> str:
+    if segment.get("kind") == "image":
+        path = str(segment.get("path") or "").strip()
+        name = os.path.basename(path.split("?", 1)[0].split("#", 1)[0])
+        stem = os.path.splitext(name)[0].strip()
+        if stem:
+            return stem
+    return "image" if index <= 1 else f"image-{index}"
+
+
 def _looks_like_markdown(text: str) -> bool:
     body = str(text or "")
     if not body.strip():
@@ -564,6 +574,14 @@ def _fold_links_into_markdown_text(
     if not body:
         return link_text
     return f"{body}\n\n{link_text}"
+
+
+def _markdown_image_or_link(label: str, href: str) -> str:
+    safe_label = _markdown_link_label(label or "image")
+    safe_href = _markdown_link_href(href)
+    if _is_safe_markdown_image_href(safe_href):
+        return f"![{safe_label}]({safe_href})"
+    return f"[{safe_label}]({safe_href})"
 
 
 def _validate_serverapi_reply_to(
@@ -1163,6 +1181,33 @@ class ServerAPI:
         except Exception as exc:
             return None, str(exc)
 
+    async def _publish_images_as_markdown_segments(
+        self,
+        segments: list[dict[str, Any]],
+        *,
+        session: aiohttp.ClientSession | None,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        """Convert native image segments to Markdown image/link text segments."""
+        from .file_to_url import FileDeliveryError, publish_image_segment_to_url
+
+        out: list[dict[str, Any]] = []
+        image_index = 0
+        for seg in segments:
+            if seg.get("kind") not in ("image", "image_bytes"):
+                out.append(seg)
+                continue
+            image_index += 1
+            try:
+                url = await publish_image_segment_to_url(self, seg, session=session)
+            except FileDeliveryError as exc:
+                return [], str(exc) or "image cannot be published"
+            except Exception as exc:
+                logger.exception("[infoflow:send] failed to publish image for Markdown")
+                return [], str(exc) or "image cannot be published"
+            rendered = _markdown_image_or_link(_image_segment_label(seg, image_index), url)
+            out.append({"kind": "text", "text": f"\n\n{rendered}\n\n"})
+        return out, None
+
     async def _group_member_maps(
         self,
         group_id: str,
@@ -1586,8 +1631,24 @@ class ServerAPI:
                 error="message, image_paths, image_bytes, links, reply_to, or group @ mention is required",
             )
 
-        has_native_image = _has_native_image_segment(segments)
-        message_text = _segments_text(segments)
+        packet_segments = segments
+        packet_links = link_items
+        has_native_image = _has_native_image_segment(packet_segments)
+        message_text = _segments_text(packet_segments)
+        wants_markdown = _should_preserve_markdown(
+            format_mode=fmt,
+            text=message_text,
+            has_links=bool(link_items),
+        ) or (fmt == "markdown" and has_native_image)
+        if has_native_image and wants_markdown:
+            packet_segments, err = await self._publish_images_as_markdown_segments(
+                packet_segments,
+                session=session,
+            )
+            if err:
+                return SentResult(success=False, error=err, warnings=tuple(warnings))
+            has_native_image = _has_native_image_segment(packet_segments)
+            message_text = _segments_text(packet_segments)
         preserve_markdown = (
             not has_native_image
             and _should_preserve_markdown(
@@ -1596,14 +1657,14 @@ class ServerAPI:
                 has_links=bool(link_items),
             )
         )
-        packet_segments = segments
-        packet_links = link_items
         if preserve_markdown and link_items:
             packet_segments = [{
                 "kind": "text",
                 "text": _fold_links_into_markdown_text(message_text, link_items),
             }]
             packet_links = []
+        elif preserve_markdown:
+            packet_segments = [{"kind": "text", "text": message_text}]
 
         force_text_payload = bool(reply_targets or packet_links) and not preserve_markdown
         packets, err = await self._build_group_packets(
@@ -1722,8 +1783,24 @@ class ServerAPI:
                 error="message, image_paths, image_bytes, links, or reply_to is required",
             )
 
-        has_native_image = _has_native_image_segment(segments)
-        message_text = _segments_text(segments)
+        packet_segments = segments
+        packet_links = link_items
+        has_native_image = _has_native_image_segment(packet_segments)
+        message_text = _segments_text(packet_segments)
+        wants_markdown = _should_preserve_markdown(
+            format_mode=fmt,
+            text=message_text,
+            has_links=bool(link_items),
+        ) or (fmt == "markdown" and has_native_image)
+        if has_native_image and wants_markdown:
+            packet_segments, err = await self._publish_images_as_markdown_segments(
+                packet_segments,
+                session=session,
+            )
+            if err:
+                return SentResult(success=False, error=err, warnings=tuple(warnings))
+            has_native_image = _has_native_image_segment(packet_segments)
+            message_text = _segments_text(packet_segments)
         preserve_markdown = (
             not has_native_image
             and _should_preserve_markdown(
@@ -1732,14 +1809,14 @@ class ServerAPI:
                 has_links=bool(link_items),
             )
         )
-        packet_segments = segments
-        packet_links = link_items
         if preserve_markdown and link_items:
             packet_segments = [{
                 "kind": "text",
                 "text": _fold_links_into_markdown_text(message_text, link_items),
             }]
             packet_links = []
+        elif preserve_markdown:
+            packet_segments = [{"kind": "text", "text": message_text}]
 
         packets, err = await self._build_private_packets(
             segments=packet_segments,

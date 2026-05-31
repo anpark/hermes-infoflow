@@ -5,6 +5,7 @@ import base64
 import struct
 import zlib
 
+from hermes_infoflow import file_to_url as file_to_url_mod
 from hermes_infoflow import serverapi as serverapi_mod
 from hermes_infoflow.parser import BodyItem as ParserBodyItem
 from hermes_infoflow.parser import InboundMessage
@@ -1021,6 +1022,135 @@ def test_send_group_message_intent_markdown_links_fold_into_md(monkeypatch) -> N
     }]
 
 
+def test_send_group_message_intent_markdown_image_paths_publish_url(
+    monkeypatch,
+) -> None:
+    captured: list[dict[str, object]] = []
+    published: list[dict[str, object]] = []
+
+    async def fake_send_group_payload(account, **kwargs):
+        captured.append(kwargs)
+        return {"ok": True, "messageid": "G-1", "msgseqid": "S-1"}
+
+    async def fake_publish_image_segment_to_url(serverapi, segment, session=None):
+        published.append(segment)
+        return "https://img.example.com/chart.png?token=1"
+
+    monkeypatch.setattr(
+        serverapi_mod._api,
+        "send_group_payload",
+        fake_send_group_payload,
+    )
+    monkeypatch.setattr(
+        file_to_url_mod,
+        "publish_image_segment_to_url",
+        fake_publish_image_segment_to_url,
+    )
+    api = ServerAPI(settings=_settings())
+
+    result = asyncio.run(api.send_group_message_intent(
+        "4507088",
+        message="**看图**",
+        image_paths=["/tmp/chart.png"],
+        session=object(),
+    ))
+
+    assert result.success is True
+    assert published == [{"kind": "image", "path": "/tmp/chart.png"}]
+    assert captured[0]["msgtype"] == "MD"
+    assert captured[0]["body"] == [{
+        "type": "MD",
+        "content": "**看图**\n\n![chart](https://img.example.com/chart.png?token=1)\n\n",
+    }]
+
+
+def test_send_group_message_intent_format_markdown_image_only_publishes_url(
+    monkeypatch,
+) -> None:
+    captured: list[dict[str, object]] = []
+
+    async def fake_send_group_payload(account, **kwargs):
+        captured.append(kwargs)
+        return {"ok": True, "messageid": "G-1", "msgseqid": "S-1"}
+
+    async def fake_publish_image_segment_to_url(serverapi, segment, session=None):
+        return "https://img.example.com/only.png"
+
+    monkeypatch.setattr(
+        serverapi_mod._api,
+        "send_group_payload",
+        fake_send_group_payload,
+    )
+    monkeypatch.setattr(
+        file_to_url_mod,
+        "publish_image_segment_to_url",
+        fake_publish_image_segment_to_url,
+    )
+    api = ServerAPI(settings=_settings())
+
+    result = asyncio.run(api.send_group_message_intent(
+        "4507088",
+        format="markdown",
+        image_paths=["/tmp/only.png"],
+        session=object(),
+    ))
+
+    assert result.success is True
+    assert captured[0]["msgtype"] == "MD"
+    assert captured[0]["body"] == [{
+        "type": "MD",
+        "content": "\n\n![only](https://img.example.com/only.png)\n\n",
+    }]
+
+
+def test_send_group_message_intent_reply_image_markdown_publishes_then_splits(
+    monkeypatch,
+) -> None:
+    captured: list[dict[str, object]] = []
+
+    async def fake_send_group_payload(account, **kwargs):
+        captured.append(kwargs)
+        return {
+            "ok": True,
+            "messageid": f"G-{len(captured)}",
+            "msgseqid": f"S-{len(captured)}",
+        }
+
+    async def fake_publish_image_segment_to_url(serverapi, segment, session=None):
+        return "https://img.example.com/reply.png"
+
+    monkeypatch.setattr(
+        serverapi_mod._api,
+        "send_group_payload",
+        fake_send_group_payload,
+    )
+    monkeypatch.setattr(
+        file_to_url_mod,
+        "publish_image_segment_to_url",
+        fake_publish_image_segment_to_url,
+    )
+    api = ServerAPI(settings=_settings())
+
+    result = asyncio.run(api.send_group_message_intent(
+        "4507088",
+        message="**reply body**",
+        image_paths=["/tmp/reply.png"],
+        reply_to=[{"message_id": "MID"}],
+        session=object(),
+    ))
+
+    assert result.success is True
+    assert captured[0]["msgtype"] == "TEXT"
+    assert captured[0]["body"] == [{"type": "TEXT", "content": ""}]
+    assert captured[0]["reply_to"].messageid == "MID"
+    assert captured[1]["msgtype"] == "MD"
+    assert captured[1]["body"] == [{
+        "type": "MD",
+        "content": "**reply body**\n\n![reply](https://img.example.com/reply.png)\n\n",
+    }]
+    assert captured[1]["reply_to"] is None
+
+
 def test_send_group_message_intent_format_text_keeps_markdown_literal(monkeypatch) -> None:
     captured: list[dict[str, object]] = []
 
@@ -1051,6 +1181,47 @@ def test_send_group_message_intent_format_text_keeps_markdown_literal(monkeypatc
         {"type": "TEXT", "content": "**literal**"},
         {"type": "LINK", "href": "https://example.com", "label": "示例"},
     ]
+
+
+def test_send_group_message_intent_text_with_image_keeps_native_image(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    captured: list[dict[str, object]] = []
+    image = tmp_path / "blue.png"
+    image.write_bytes(_BLUE_200_PNG_BYTES)
+
+    async def fake_send_group_payload(account, **kwargs):
+        captured.append(kwargs)
+        return {"ok": True, "messageid": "G-1", "msgseqid": "S-1"}
+
+    async def fail_publish_image_segment_to_url(serverapi, segment, session=None):
+        raise AssertionError("format=text must not publish image_paths to URL")
+
+    monkeypatch.setattr(
+        serverapi_mod._api,
+        "send_group_payload",
+        fake_send_group_payload,
+    )
+    monkeypatch.setattr(
+        file_to_url_mod,
+        "publish_image_segment_to_url",
+        fail_publish_image_segment_to_url,
+    )
+    api = ServerAPI(settings=_settings(), image_loader=lambda path: image.read_bytes())
+
+    result = asyncio.run(api.send_group_message_intent(
+        "4507088",
+        message="**literal**",
+        format="text",
+        image_paths=[str(image)],
+        session=object(),
+    ))
+
+    assert result.success is True
+    assert captured[0]["msgtype"] == "IMAGE"
+    assert captured[0]["body"][0] == {"type": "TEXT", "content": "**literal**"}
+    assert captured[0]["body"][1]["type"] == "IMAGE"
 
 
 def test_send_group_message_intent_rejects_non_array_reply_to() -> None:
@@ -1462,6 +1633,90 @@ def test_send_private_message_intent_markdown_links_fold_into_md(monkeypatch) ->
     assert captured[0]["msgtype"] == "md"
     assert captured[0]["md"] == {
         "content": "**请看链接**\n\n[示例](https://example.com)"
+    }
+
+
+def test_send_private_message_intent_markdown_image_bytes_publish_url(
+    monkeypatch,
+) -> None:
+    captured: list[dict[str, object]] = []
+    published: list[dict[str, object]] = []
+
+    async def fake_send_private_payload(account, payload, session=None):
+        captured.append(payload)
+        return {"ok": True, "msgkey": "P-1"}
+
+    async def fake_publish_image_segment_to_url(serverapi, segment, session=None):
+        published.append(segment)
+        return "https://img.example.com/inline.png"
+
+    monkeypatch.setattr(
+        serverapi_mod._api,
+        "send_private_payload",
+        fake_send_private_payload,
+    )
+    monkeypatch.setattr(
+        file_to_url_mod,
+        "publish_image_segment_to_url",
+        fake_publish_image_segment_to_url,
+    )
+    api = ServerAPI(settings=_settings())
+
+    result = asyncio.run(api.send_private_message_intent(
+        "alice",
+        message="**图文**",
+        image_bytes=_TINY_PNG_BYTES,
+        session=object(),
+    ))
+
+    assert result.success is True
+    assert published == [{"kind": "image_bytes", "bytes": _TINY_PNG_BYTES}]
+    assert len(captured) == 1
+    assert captured[0]["msgtype"] == "md"
+    assert captured[0]["md"] == {
+        "content": "**图文**\n\n![image](https://img.example.com/inline.png)\n\n"
+    }
+
+
+def test_send_private_message_intent_reply_image_markdown_publishes_then_splits(
+    monkeypatch,
+) -> None:
+    captured: list[dict[str, object]] = []
+
+    async def fake_send_private_payload(account, payload, session=None):
+        captured.append(payload)
+        return {"ok": True, "msgkey": f"P-{len(captured)}"}
+
+    async def fake_publish_image_segment_to_url(serverapi, segment, session=None):
+        return "https://img.example.com/reply.png"
+
+    monkeypatch.setattr(
+        serverapi_mod._api,
+        "send_private_payload",
+        fake_send_private_payload,
+    )
+    monkeypatch.setattr(
+        file_to_url_mod,
+        "publish_image_segment_to_url",
+        fake_publish_image_segment_to_url,
+    )
+    api = ServerAPI(settings=_settings())
+
+    result = asyncio.run(api.send_private_message_intent(
+        "alice",
+        message="**reply body**",
+        image_paths=["/tmp/reply.png"],
+        reply_to=[{"message_id": "MID", "sender_imid": "1744775667"}],
+        session=object(),
+    ))
+
+    assert result.success is True
+    assert captured[0]["msgtype"] == "text"
+    assert captured[0]["text"] == {"content": ""}
+    assert captured[0]["reply"] == [{"uid": "1744775667", "msgid": "MID"}]
+    assert captured[1]["msgtype"] == "md"
+    assert captured[1]["md"] == {
+        "content": "**reply body**\n\n![reply](https://img.example.com/reply.png)\n\n"
     }
 
 

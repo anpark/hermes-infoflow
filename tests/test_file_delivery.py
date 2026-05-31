@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from pathlib import Path
 
@@ -16,9 +17,16 @@ from hermes_infoflow.file_delivery import (
     account_slug_from_serverapi,
     object_key_from_shared_path,
     publish_file,
+    publish_image_segment_to_url,
     sanitize_file_name,
+    stage_image_bytes_to_file,
 )
 from hermes_infoflow.paths import ensure_infoflow_dirs, get_infoflow_shared_files_root
+
+_TINY_PNG_BYTES = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1Pe"
+    "AAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+)
 
 
 class _FakeServerAPI:
@@ -300,6 +308,51 @@ def test_object_key_and_account_slug_are_stable(monkeypatch, tmp_path: Path) -> 
     assert object_key_from_shared_path(source, "agent-123") == (
         "hermes-infoflow/agent-123/shared_files/temp/20260531/media/a.txt"
     )
+
+
+def test_stage_image_bytes_to_file_uses_hash_name(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+
+    staged = stage_image_bytes_to_file(
+        _TINY_PNG_BYTES,
+        suggested_name="chart.png",
+        now=1_801_764_000,
+    )
+    staged_again = stage_image_bytes_to_file(
+        staged.read_bytes(),
+        suggested_name="chart.png",
+        now=1_801_764_000,
+    )
+
+    assert staged == staged_again
+    assert staged.name.startswith("chart-")
+    assert staged.suffix == ".png"
+    assert staged.is_file()
+    relative_parts = staged.relative_to(get_infoflow_shared_files_root()).parts
+    assert relative_parts[0] == "temp"
+    assert relative_parts[1].isdigit()
+    assert len(relative_parts[1]) == 8
+    assert relative_parts[2] == "media"
+
+
+def test_publish_image_segment_to_url_converts_unsafe_local_image_extension(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    source = tmp_path / "chart.bin"
+    source.write_bytes(_TINY_PNG_BYTES)
+    serverapi = _FakeServerAPI()
+    monkeypatch.setattr(api, "im_bos_head_url", _successful_head_probe)
+
+    url = _run(publish_image_segment_to_url(
+        serverapi,
+        {"kind": "image", "path": str(source)},
+    ))
+
+    assert url == "https://download.example.com/1"
+    assert serverapi.upload_calls[0]["file_name"].endswith(".png")
+    assert serverapi.upload_calls[0]["file_name"].startswith("chart-")
 
 
 def test_file_delivery_tool_returns_url_without_internal_fields(

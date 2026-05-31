@@ -221,18 +221,19 @@ SEND_MESSAGE_TOOL_SCHEMA = {
     "name": "infoflow_send_message",
     "description": (
         "向如流私聊或群聊发送消息。`target` 必填。"
-        "支持正文、Markdown 倾向、链接、原生图片 image_paths、群聊 @、引用消息，"
+        "支持正文、Markdown 倾向、链接、本地图片 image_paths、群聊 @、引用消息，"
         "以及这些能力的组合。\n\n"
         "当前会话普通文字回复通常直接输出最终回复；需要指定 target、"
         "跨会话发送、发送链接、群聊 @ 或引用消息时使用本工具。"
         "以链接或 Markdown 形式分享本地图片或文件前，先调用 `file_delivery` 获取 URL；"
-        "直接发送如流原生图片消息时使用 `image_paths`。\n\n"
+        "不需要 Markdown 排版、只发送本地图片时使用 `image_paths`。\n\n"
         "目标：群聊用 `group:<群组ID>` 或纯数字群 ID；私聊用 "
         "`user:<uuapName>` 或 `<uuapName>`，可加 `infoflow:` 前缀。"
         "`bot:<agentId>` 不能作为私聊 target。\n\n"
         "`format` 默认 `auto`，通常不用传。`auto` 优先以 Markdown 发送；"
         "`markdown` 表示希望以 Markdown 发送；`text` 表示正文必须以纯文本发送。"
-        "使用 `text` 时，需要分享文件就发送 URL 或 `links`，需要直接发图片就使用 `image_paths`。"
+        "使用 `text` 时，需要分享文件就发送 URL 或 `links`，"
+        "不需要 Markdown 排版的本地图片可用 `image_paths`。"
         "`message` 是正文；只发送链接、群聊 @ 或引用时，"
         "`message` 可为空字符串。\n\n"
         "`message` 支持 Markdown 语法；普通正文保持 `format=auto` 即可。\n\n"
@@ -243,7 +244,7 @@ SEND_MESSAGE_TOOL_SCHEMA = {
         "HTTP/HTTPS 图片 URL（包括内网 URL）"
         "不是本地路径；jpg/png/gif/webp 需要 Markdown 展示时直接写 "
         "`![alt](url)`；其它文件 URL 使用 `links` 或普通链接。\n\n"
-        "原生图片消息：如果用户明确要直接发送本地图片、截图或贴图，"
+        "本地图片：不需要 Markdown 排版、只发送图片时，"
         "使用 `image_paths` 传本地图片路径。\n\n"
         "引用消息：`reply_to` 传 message_id、`{message_id, preview}`，"
         "或这些值的数组。引用整条消息时只传 message_id；"
@@ -280,7 +281,8 @@ SEND_MESSAGE_TOOL_SCHEMA = {
                 "description": (
                     "默认 `auto`，通常不用传。`auto` 优先以 Markdown 发送；"
                     "`markdown` 表示希望以 Markdown 发送；`text` 表示正文必须以纯文本发送。"
-                    "使用 `text` 时，需要分享文件就发送 URL 或 links，需要直接发图片就使用 image_paths。"
+                    "使用 `text` 时，需要分享文件就发送 URL 或 links；"
+                    "不需要 Markdown 排版的本地图片可用 image_paths。"
                 ),
                 "default": "auto",
             },
@@ -288,8 +290,8 @@ SEND_MESSAGE_TOOL_SCHEMA = {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": (
-                    "可选。本地图片路径列表，用于发送如流原生图片消息。"
-                    "仅用于图片，不用于普通文件分享；一般文件或 Markdown 图片展示"
+                    "可选。本地图片路径列表。用于不需要 Markdown 排版、"
+                    "只发送本地图片的场景；一般文件或需要 Markdown 图片展示时"
                     "请先调用 `file_delivery` 获取 URL。"
                 ),
                 "default": [],

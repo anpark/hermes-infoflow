@@ -21,6 +21,18 @@
 - 处理 reply、links、群聊 @。
 - 处理发送格式兼容。
 
+## 模块结构
+
+当前分层：
+
+```text
+file_to_url.py    # 底层核心：本地文件 / image bytes -> shared_files -> BOS -> URL
+file_delivery.py  # tool 包装：给大模型调用 file_delivery(source_path)
+serverapi.py      # 发送层：需要 Markdown 图片 URL 时复用 file_to_url
+```
+
+`file_to_url.py` 不发送消息，也不生成 Markdown；它只返回 URL。`file_delivery.py` 只做 tool 参数和返回值包装。`serverapi.py` 在 `format=auto/markdown` 且需要保留 Markdown 图文时，可以内部调用 `file_to_url.py` 把 `image_paths` 或 `image_bytes` 发布成 URL，再合入 Markdown 正文。
+
 ## 给大模型的使用规则
 
 运行时 prompt 会注入真实目录路径，例如：
@@ -37,7 +49,7 @@
 - 拿到 URL 后，再用普通链接或 Markdown 内容发送。
 - 单文件当前不能超过 `69MiB`。
 
-直接发送本地图片、截图或贴图为如流原生图片消息不属于 `file_delivery`，应使用 `infoflow_send_message.image_paths`。
+不需要 Markdown 排版、只发送本地图片时，可使用 `infoflow_send_message.image_paths`。
 
 推荐目录：
 
@@ -288,13 +300,14 @@ CREATE TABLE IF NOT EXISTS shared_files (
 - `jpg/png/gif/webp` 可以作为 Markdown 图片。
 - `mp4/mov/webm/pdf/zip/mp3` 不应使用 `![...](url)`；应作为普通链接发送。
 - HTML iframe/video/audio/object/embed 不作为稳定发送格式。
+- `serverapi` 在 `format=auto/markdown` 且需要保留 Markdown 图文时，会优先把本地图片发布成 URL 并写入 Markdown 图片；`format=text` 保持纯文本和原生图片语义。
 
 ## 当前不支持
 
 - BOS 删除对象。
 - 目录上传。
 - 批量上传 tool。
-- 自动压缩。
+- 普通文件自动压缩。
 - 自动拆分。
 - 自动打包。
 - 永久公开 URL 语义保证。

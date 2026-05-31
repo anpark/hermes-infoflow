@@ -32,6 +32,8 @@ These are read from `~/.hermes/.env` (or your shell):
 | --- | --- |
 | `test_send_via_serverapi.py` | `prepare_outbound_message` + `ServerAPI.send_group_message_intent` direct smoke. Does **not** exercise `InfoflowSendService` preview enrichment. Does **not** need hermes-agent. |
 | `test_send_intent_matrix.py` | Direct `ServerAPI.send_group_message_intent` / `send_private_message_intent` smoke matrix for Markdown, reply, links, @, and 200x200 image bytes. It verifies protocol routing, not service-level reply preview enrichment. |
+| `test_file_to_url_send_matrix.py` | Direct `ServerAPI` matrix for file-to-URL image compatibility: Markdown + `image_paths` / `image_bytes`, reply + Markdown image, `format=text` native image, and plain auto native image. Prints selected payload families (`MD` / `IMAGE` / BOS upload/getUrl/HEAD). Use `--runtime-plugin` after deployment. |
+| `simulate_inbound_webhook.py` | Encrypts and posts fake Infoflow webhook messages to the local gateway. Exercises parser + adapter + Bot/LLM + tools + outbound send. Useful for prompt/tool-behavior checks after deployment. |
 | `test_send_via_standalone.py` | `standalone_send(...)` — the cron / out-of-process entry point. Does **not** need hermes-agent. |
 | `test_send_via_adapter.py`   | `InfoflowAdapter.send(...)` — the live gateway entry point. **Requires** `~/.hermes/hermes-agent` checkout. The script monkey-patches `gateway.config.Platform` to add an `INFOFLOW` member so an unpatched mainline hermes-agent still works. |
 | `probe_group_formats.py` | Real supported group format matrix for `MD`/`TEXT`, native `AT` including @all/specific mention combinations, `reply`, and `IMAGE`; attaches webhook echo summaries from local Hermes logs. |
@@ -104,6 +106,46 @@ python scripts/sim/probe_reply_counts.py --group 4507088
 python scripts/sim/probe_reply_preview_edges.py --group 4507088
 ```
 
+Validate file-to-URL send compatibility after changing `file_to_url.py`,
+`file_delivery.py`, `serverapi.py`, or send-format routing:
+
+```bash
+# Source tree behavior.
+python scripts/sim/test_file_to_url_send_matrix.py \
+    --group 4507088 --private-user chengbo05
+
+# Deployed runtime plugin behavior after scripts/deploy.sh.
+python scripts/sim/test_file_to_url_send_matrix.py \
+    --runtime-plugin --group 4507088 --private-user chengbo05
+```
+
+The expected routing is:
+
+- Markdown + `image_paths` -> BOS upload/getUrl/HEAD -> `MD` with `![alt](url)`.
+- `reply_to` + Markdown + `image_paths` -> `TEXT` reply packet, then `MD`.
+- `format=text` + `image_paths` -> native `IMAGE` packet with `TEXT`.
+- plain auto text + `image_paths` -> native `IMAGE` packet with `TEXT`.
+- private Markdown + `image_bytes` -> staged temp image, BOS URL, private `md`.
+
+Simulate inbound webhook messages when prompt/tool behavior needs full gateway
+coverage:
+
+```bash
+# Requires the Hermes gateway to be running locally.
+python scripts/sim/simulate_inbound_webhook.py \
+    --case all --group 4507088
+
+# Faster single-case examples.
+python scripts/sim/simulate_inbound_webhook.py --case dm-file --group 4507088
+python scripts/sim/simulate_inbound_webhook.py --case dm-group-md-image --group 4507088
+python scripts/sim/simulate_inbound_webhook.py --case group-native-image --group 4507088
+```
+
+`simulate_inbound_webhook.py` is intentionally different from direct
+`ServerAPI` probes: it depends on the live gateway, invokes the configured LLM,
+and can take several seconds per case. Use its marker (`PROMPTSIM|...`) to
+find outbound messages and logs.
+
 Override the group once without changing `~/.hermes/.env`:
 
 ```bash
@@ -149,6 +191,11 @@ invalid `msgid`.
 
 - These scripts hit the real Infoflow API and post real messages to the
   configured test group. Don't aim them at production-only groups.
+- `test_file_to_url_send_matrix.py --runtime-plugin` imports the deployed
+  plugin from `~/.hermes/plugins/infoflow`; without the flag it imports the
+  in-tree source.
+- `simulate_inbound_webhook.py` posts to `http://127.0.0.1:<INFOFLOW_PORT>/<INFOFLOW_WEBHOOK_PATH>`
+  and uses `INFOFLOW_ENCODING_AES_KEY` to encrypt fake inbound messages.
 - `probe_group_formats.py` intentionally includes expected API failures such
   as `MD` header + `TEXT` body and `IMAGE` packet + `MD` text item.
 - `probe_group_links.py` intentionally includes expected API failures such as
