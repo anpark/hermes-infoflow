@@ -1,7 +1,8 @@
-"""Smoke-test file_to_url and send-format routing against real Infoflow.
+"""Smoke-test file_delivery/file_to_url and send-format routing against real Infoflow.
 
 This script is for validating changes like:
 
+* Non-image local files are published to BOS and sent as clickable links.
 * ``auto/markdown + image_paths/image_bytes`` publishes the image to BOS and
   sends Markdown image syntax.
 * ``format=text + image_paths`` keeps the native IMAGE packet.
@@ -78,13 +79,14 @@ def _import_modules(*, runtime_plugin: bool):
         package = "hermes_infoflow"
     return (
         importlib.import_module(f"{package}.api"),
+        importlib.import_module(f"{package}.file_delivery"),
         importlib.import_module(f"{package}.serverapi"),
         importlib.import_module(f"{package}.settings"),
     )
 
 
 async def _run(args: argparse.Namespace) -> int:
-    info_api, serverapi_mod, settings_mod = _import_modules(
+    info_api, file_delivery_mod, serverapi_mod, settings_mod = _import_modules(
         runtime_plugin=args.runtime_plugin
     )
     settings = settings_mod._read_account_settings(None)
@@ -97,6 +99,12 @@ async def _run(args: argparse.Namespace) -> int:
     image_path = workdir / f"file-to-url-{marker}.png"
     image_bytes = solid_blue_png_200()
     image_path.write_bytes(image_bytes)
+    text_path = workdir / f"file-to-url-{marker}.txt"
+    text_path.write_text(
+        f"FILETOURL|{marker}|group-file-link\n"
+        "This text file should be published by file_delivery and sent as a link.\n",
+        encoding="utf-8",
+    )
 
     original_group_send = info_api.send_group_payload
     original_private_send = info_api.send_private_payload
@@ -207,6 +215,29 @@ async def _run(args: argparse.Namespace) -> int:
         return summary
 
     cases: list[dict[str, Any]] = []
+    if not args.skip_file_link:
+        published = await file_delivery_mod.publish_file(serverapi, text_path)
+        item = {
+            "payload": "file_delivery",
+            "source": str(text_path),
+            "object_key": published.object_key,
+            "size_bytes": published.size_bytes,
+            "url_prefix": published.url[:120],
+        }
+        observed.append(item)
+        print(json.dumps(item, ensure_ascii=False))
+        cases.append(await run_case(
+            "group-file-link",
+            serverapi.send_group_message_intent(
+                group_id,
+                message=(
+                    f"【FILETOURL|{marker}|group-file-link】 "
+                    "非图片文件应发布为 URL，并显示为可点击文件链接。"
+                ),
+                links=[{"href": published.url, "label": text_path.name}],
+            ),
+        ))
+
     first = await run_case(
         "group-auto-markdown-image-path",
         serverapi.send_group_message_intent(
@@ -279,6 +310,7 @@ async def _run(args: argparse.Namespace) -> int:
         "group": group_id,
         "private_user": private_user,
         "image_path": str(image_path),
+        "text_path": str(text_path),
         "cases": cases,
         "observed_count": len(observed),
     }, ensure_ascii=False, indent=2))
@@ -287,7 +319,15 @@ async def _run(args: argparse.Namespace) -> int:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--group", default="", help="Override INFOFLOW_OP_GROUP.")
+    parser.add_argument(
+        "--group",
+        default="",
+        help=(
+            "Override the configured test group. Defaults to "
+            "INFOFLOW_REAL_TEST_GROUP, INFOFLOW_OP_GROUP, or numeric/group "
+            "INFOFLOW_OP_CHANNEL."
+        ),
+    )
     parser.add_argument(
         "--private-user",
         default="",
@@ -303,6 +343,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--runtime-plugin",
         action="store_true",
         help="Import the deployed plugin from ~/.hermes/plugins/infoflow.",
+    )
+    parser.add_argument(
+        "--skip-file-link",
+        action="store_true",
+        help="Skip the non-image file_delivery + clickable link case.",
     )
     return parser
 

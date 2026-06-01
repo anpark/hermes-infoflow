@@ -187,6 +187,8 @@ def test_infoflow_send_message_schema_exposes_expected_inputs() -> None:
     assert "`markdown` 表示希望以 Markdown 发送" in schema_json
     assert "`text` 表示正文必须以纯文本发送" in schema_json
     assert "使用 `text` 时" in schema_json
+    assert "[可见文字](URL)" in schema_json
+    assert "![图片说明](URL)" in schema_json
     assert "image_paths" in schema_json
     assert "base64" not in schema_json.lower()
     assert "引用整条消息时只传 message_id" in schema_json

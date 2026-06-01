@@ -233,6 +233,10 @@ def _apply_automatic_reply_policy(
     ):
         return outbound_reply_to, metadata, ""
 
+    redirected = str(outbound_reply_to or "").strip()
+    if original == inbound and redirected and redirected != original:
+        return outbound_reply_to, metadata, ""
+
     is_current_inbound_anchor = original == inbound
     reply_to_sender_id = (
         get_inbound_sender_id(inbound) if is_current_inbound_anchor else ""
@@ -2718,7 +2722,7 @@ def register(ctx: Any) -> None:
             "当前会话普通文字回复优先直接输出最终回复。"
             "需要指定 target、跨会话发送、发送链接、"
             "群聊 @ 或引用消息时，使用 `infoflow_send_message`。"
-            "以链接或 Markdown 形式分享本地图片或文件前，先调用 `file_delivery` 获取 URL；"
+            "分享本地图片或文件前，先调用 `file_delivery` 获取 URL；"
             "不需要 Markdown 排版、只发送本地图片时使用 `image_paths`。\n"
             "`infoflow_send_message.target` 必填：\n"
             "- 私信：`infoflow:<uuapName>` 或 `user:<uuapName>`（如 `infoflow:chengbo05`）\n"
@@ -2730,17 +2734,19 @@ def register(ctx: Any) -> None:
             "`message` 是正文。只发送链接、群聊 @ 或引用时，"
             "`message` 可为空字符串。\n"
             "`message` 支持 Markdown 语法；普通正文保持 `format=auto` 即可。\n"
-            "以 URL 或 Markdown 形式分享本地图片或文件时，先交给 `file_delivery` 获取 URL；"
+            "分享本地图片或文件时，先交给 `file_delivery` 获取 URL；"
             "不要把本地路径直接写入正文。\n"
             "不需要 Markdown 排版、只发送本地图片时，使用 `infoflow_send_message.image_paths`。\n"
             "HTTP/HTTPS 图片 URL（包括内网 URL）不是本地路径；jpg/png/gif/webp "
-            "需要以内联 Markdown 展示时，直接在正文写 `![alt](url)`；"
+            "需要以内联方式显示时，保持 `format=auto` 或使用 `format=markdown`，"
+            "并在 `message` 中写 `![图片说明](URL)`；"
             "其它文件 URL 使用普通链接。\n"
-            "`links` 支持 URL、`[展示文本](URL)`、`{href, label}`，"
+            "`links` 支持 URL、`[可见文字](URL)`、`{href, label}`，"
             "可单独发送或与正文、群聊 @、引用组合。\n"
             "`format` 默认 `auto`，优先以 Markdown 发送；`markdown` 表示希望"
             "以 Markdown 发送；`text` 表示正文必须以纯文本发送。"
             "使用 `text` 时，需要分享文件就发送 URL 或 links；"
+            "不要写 `[可见文字](URL)` 或 `![图片说明](URL)` 这类语法；"
             "不需要 Markdown 排版的本地图片可用 image_paths。\n"
             "群聊 @ 可写 `@uuapName`、`@agentId`、`@all`，"
             "也可用 `at_all`、`mention_user_ids`、`mention_agent_ids`；"

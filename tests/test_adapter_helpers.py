@@ -256,6 +256,22 @@ def test_auto_reply_policy_drops_stream_continuation_anchor_without_extra_at() -
     assert sender_id == ""
 
 
+def test_auto_reply_policy_preserves_redirected_current_inbound_anchor() -> None:
+    ad._inbound_ctx_store.clear()
+
+    reply_to, metadata, sender_id = _apply_automatic_reply_policy(
+        kind="group",
+        inbound_mid="MID",
+        original_reply_to="MID",
+        outbound_reply_to="STEER-MID",
+        metadata={"mention_user_ids": ["alice"]},
+    )
+
+    assert reply_to == "STEER-MID"
+    assert metadata == {"mention_user_ids": ["alice"]}
+    assert sender_id == ""
+
+
 # ---------------------------------------------------------------------------
 # _read_account_settings — new fields
 # ---------------------------------------------------------------------------

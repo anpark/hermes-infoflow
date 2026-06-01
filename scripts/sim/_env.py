@@ -117,12 +117,33 @@ def required_env(*names: str) -> None:
         )
 
 
+def _group_id_from_target(value: str | None) -> str:
+    target = str(value or "").strip()
+    if target.startswith("infoflow:"):
+        target = target[len("infoflow:"):]
+    if target.startswith("group:"):
+        target = target[len("group:"):]
+    return target if target.isdigit() else ""
+
+
+def default_group_id() -> str:
+    """Return the configured real-test group id, if one is available."""
+    for name in ("INFOFLOW_REAL_TEST_GROUP", "INFOFLOW_OP_GROUP", "INFOFLOW_OP_CHANNEL"):
+        group_id = _group_id_from_target(os.environ.get(name))
+        if group_id:
+            return group_id
+    return ""
+
+
 def test_group_id() -> str:
-    """Return the single ``INFOFLOW_OP_GROUP`` used by sim scripts."""
-    required_env("INFOFLOW_OP_GROUP")
-    group_id = os.environ["INFOFLOW_OP_GROUP"].strip()
-    if not group_id.isdigit():
-        raise SystemExit("[sim] INFOFLOW_OP_GROUP must be a single numeric group id.")
+    """Return the single numeric group id used by sim scripts."""
+    group_id = default_group_id()
+    if not group_id:
+        raise SystemExit(
+            "[sim] group id is required; pass --group or set "
+            "INFOFLOW_REAL_TEST_GROUP, INFOFLOW_OP_GROUP, or a numeric/group "
+            "INFOFLOW_OP_CHANNEL."
+        )
     return group_id
 
 
@@ -132,6 +153,7 @@ __all__ = [
     "HERMES_HOME",
     "REPO_ROOT",
     "bootstrap",
+    "default_group_id",
     "ensure_hermes_agent_on_path",
     "ensure_repo_on_path",
     "load_hermes_env",

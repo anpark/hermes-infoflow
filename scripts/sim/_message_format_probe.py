@@ -23,17 +23,24 @@ def marker() -> str:
 
 
 def default_group_id() -> str:
-    return (
-        os.environ.get("INFOFLOW_REAL_TEST_GROUP", "").strip()
-        or os.environ.get("INFOFLOW_OP_GROUP", "").strip()
-    )
+    for name in ("INFOFLOW_REAL_TEST_GROUP", "INFOFLOW_OP_GROUP", "INFOFLOW_OP_CHANNEL"):
+        target = os.environ.get(name, "").strip()
+        if target.startswith("infoflow:"):
+            target = target[len("infoflow:"):]
+        if target.startswith("group:"):
+            target = target[len("group:"):]
+        if target.isdigit():
+            return target
+    return ""
 
 
 def require_group_id(value: str | None) -> str:
     group_id = str(value or default_group_id()).strip()
     if not group_id:
         raise SystemExit(
-            "[sim] group id is required; pass --group or set INFOFLOW_OP_GROUP."
+            "[sim] group id is required; pass --group or set "
+            "INFOFLOW_REAL_TEST_GROUP, INFOFLOW_OP_GROUP, or a numeric/group "
+            "INFOFLOW_OP_CHANNEL."
         )
     if not group_id.isdigit():
         raise SystemExit("[sim] group id must be numeric.")

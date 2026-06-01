@@ -176,6 +176,16 @@ class ParsedWebhook:
     status_code: int = 200
     body: str = "OK"
     inbound: InboundMessage | None = None
+    # Decrypted request payload as received on the wire, before JSON/XML
+    # normalization. Used by webhook logging so ignored/error paths still leave
+    # a full audit trail.
+    decoded_payload: str = ""
+    diagnostic_reason: str = ""
+
+
+def _record_ignore_reason(reason_out: list[str] | None, reason: str) -> None:
+    if reason_out is not None:
+        reason_out.append(reason)
 
 
 # ---------------------------------------------------------------------------
@@ -426,33 +436,47 @@ def _extract_body_parts(body_items: list[BodyItem]) -> tuple[str, bool, list[str
 # ---------------------------------------------------------------------------
 
 
-def _try_decrypt_and_parse(
+@dataclass(frozen=True)
+class _DecodedPayload:
+    plaintext: str = ""
+    parsed: dict[str, Any] | None = None
+    error: str = ""
+
+
+def _decrypt_and_parse_payload(
     ciphertext: str,
     encoding_aes_key: str,
     *,
     fallback_xml: bool = False,
-) -> dict[str, Any] | None:
-    """Decrypt + parse JSON (with XML fallback). Returns None on failure."""
-    if not ciphertext.strip() or not encoding_aes_key:
-        return None
+) -> _DecodedPayload:
+    """Decrypt + parse JSON (with XML fallback), preserving plaintext for logs."""
+    if not ciphertext.strip():
+        return _DecodedPayload(error="empty_ciphertext")
+    if not encoding_aes_key:
+        return _DecodedPayload(error="missing_encoding_aes_key")
     try:
         plain = decrypt_message(ciphertext, encoding_aes_key)
-    except InfoflowCryptoError:
-        return None
+    except InfoflowCryptoError as exc:
+        return _DecodedPayload(error=f"decrypt_failed:{exc}")
 
     try:
         parsed = json.loads(plain)
         if isinstance(parsed, dict):
             patch_precise_ids(plain, parsed)
-            return parsed
-    except json.JSONDecodeError:
-        pass
+            return _DecodedPayload(plaintext=plain, parsed=parsed)
+        return _DecodedPayload(
+            plaintext=plain,
+            error=f"decoded_json_not_object:{type(parsed).__name__}",
+        )
+    except json.JSONDecodeError as exc:
+        json_error = f"json_decode_error:{exc}"
 
     if fallback_xml:
         xml_parsed = parse_xml_message(plain)
         if xml_parsed:
-            return dict(xml_parsed)
-    return None
+            return _DecodedPayload(plaintext=plain, parsed=dict(xml_parsed))
+        return _DecodedPayload(plaintext=plain, error=f"{json_error};xml_decode_error")
+    return _DecodedPayload(plaintext=plain, error=json_error)
 
 
 # ---------------------------------------------------------------------------
@@ -465,6 +489,7 @@ def build_private_inbound(
     *,
     account: AccountConfig | None = None,
     sent_message_ids: set[str] | None = None,
+    ignore_reasons: list[str] | None = None,
 ) -> InboundMessage | None:
     """Translate a decrypted private-chat ``msgData`` to ``InboundMessage``."""
     fromid_str = _stringify(
@@ -489,6 +514,10 @@ def build_private_inbound(
     if is_bot_sender and not from_user:
         from_user = to_user
     if not from_user:
+        _record_ignore_reason(
+            ignore_reasons,
+            "private_missing_from_user:no FromUserId/fromuserid/from and not known bot echo",
+        )
         return None
 
     text = _stringify(
@@ -559,6 +588,10 @@ def build_private_inbound(
                 is_reply_to_bot = True
 
     if not text and not image_urls and not reply_targets:
+        _record_ignore_reason(
+            ignore_reasons,
+            "private_empty_content:no text/image/reply",
+        )
         return None
 
     if not text and image_urls:
@@ -591,6 +624,7 @@ def build_group_inbound(
     *,
     account: AccountConfig,
     sent_message_ids: set[str] | None = None,
+    ignore_reasons: list[str] | None = None,
 ) -> InboundMessage | None:
     """Translate a decrypted group-chat ``msgData`` to ``InboundMessage``."""
     message = msg_data.get("message") if isinstance(msg_data.get("message"), dict) else None
@@ -605,6 +639,10 @@ def build_group_inbound(
         or msg_data.get("fromid")
     )
     if not from_user:
+        _record_ignore_reason(
+            ignore_reasons,
+            "group_missing_from_user:no message.header.fromuserid/fromuserid/from/fromid",
+        )
         return None
 
     raw_msg_id = (
@@ -659,6 +697,10 @@ def build_group_inbound(
     )
 
     if not raw_text.strip() and not image_urls and not reply_targets and not has_structural_body:
+        _record_ignore_reason(
+            ignore_reasons,
+            "group_empty_content:no text/image/reply/structural body",
+        )
         return None
 
     _is_at_only = False  # will be set True if AT-only message
@@ -802,23 +844,37 @@ def parse_webhook(
                     status_code=400,
                     body="missing Encrypt field in messageJson",
                 )
-            decoded = _try_decrypt_and_parse(
+            decoded = _decrypt_and_parse_payload(
                 encrypt, account.encoding_aes_key, fallback_xml=True
             )
-            if not decoded:
+            if not decoded.parsed:
                 return ParsedWebhook(
                     kind="http_error",
                     status_code=500,
                     body="decryption failed",
+                    decoded_payload=decoded.plaintext,
+                    diagnostic_reason=decoded.error,
                 )
+            ignore_reasons: list[str] = []
             inbound = build_private_inbound(
-                decoded,
+                decoded.parsed,
                 account=account,
                 sent_message_ids=sent_message_ids,
+                ignore_reasons=ignore_reasons,
             )
             if not inbound:
-                return ParsedWebhook(kind="ignored")
-            return ParsedWebhook(kind="message", inbound=inbound)
+                return ParsedWebhook(
+                    kind="ignored",
+                    decoded_payload=decoded.plaintext,
+                    diagnostic_reason=ignore_reasons[0]
+                    if ignore_reasons
+                    else "build_private_inbound returned None",
+                )
+            return ParsedWebhook(
+                kind="message",
+                inbound=inbound,
+                decoded_payload=decoded.plaintext,
+            )
 
         return ParsedWebhook(
             kind="http_error", status_code=400, body="missing echostr or messageJson"
@@ -833,19 +889,35 @@ def parse_webhook(
             return ParsedWebhook(
                 kind="http_error", status_code=400, body="empty content"
             )
-        decoded = _try_decrypt_and_parse(raw_body, account.encoding_aes_key)
-        if not decoded:
+        decoded = _decrypt_and_parse_payload(raw_body, account.encoding_aes_key)
+        if not decoded.parsed:
             return ParsedWebhook(
-                kind="http_error", status_code=500, body="decryption failed"
+                kind="http_error",
+                status_code=500,
+                body="decryption failed",
+                decoded_payload=decoded.plaintext,
+                diagnostic_reason=decoded.error,
             )
+        ignore_reasons: list[str] = []
         inbound = build_group_inbound(
-            decoded,
+            decoded.parsed,
             account=account,
             sent_message_ids=sent_message_ids,
+            ignore_reasons=ignore_reasons,
         )
         if not inbound:
-            return ParsedWebhook(kind="ignored")
-        return ParsedWebhook(kind="message", inbound=inbound)
+            return ParsedWebhook(
+                kind="ignored",
+                decoded_payload=decoded.plaintext,
+                diagnostic_reason=ignore_reasons[0]
+                if ignore_reasons
+                else "build_group_inbound returned None",
+            )
+        return ParsedWebhook(
+            kind="message",
+            inbound=inbound,
+            decoded_payload=decoded.plaintext,
+        )
 
     return ParsedWebhook(kind="http_error", status_code=400, body="unsupported content type")
 

@@ -225,7 +225,7 @@ SEND_MESSAGE_TOOL_SCHEMA = {
         "以及这些能力的组合。\n\n"
         "当前会话普通文字回复通常直接输出最终回复；需要指定 target、"
         "跨会话发送、发送链接、群聊 @ 或引用消息时使用本工具。"
-        "以链接或 Markdown 形式分享本地图片或文件前，先调用 `file_delivery` 获取 URL；"
+        "分享本地图片或文件前，先调用 `file_delivery` 获取 URL；"
         "不需要 Markdown 排版、只发送本地图片时使用 `image_paths`。\n\n"
         "目标：群聊用 `group:<群组ID>` 或纯数字群 ID；私聊用 "
         "`user:<uuapName>` 或 `<uuapName>`，可加 `infoflow:` 前缀。"
@@ -233,17 +233,19 @@ SEND_MESSAGE_TOOL_SCHEMA = {
         "`format` 默认 `auto`，通常不用传。`auto` 优先以 Markdown 发送；"
         "`markdown` 表示希望以 Markdown 发送；`text` 表示正文必须以纯文本发送。"
         "使用 `text` 时，需要分享文件就发送 URL 或 `links`，"
+        "不要写 `[可见文字](URL)` 或 `![图片说明](URL)` 这类语法；"
         "不需要 Markdown 排版的本地图片可用 `image_paths`。"
         "`message` 是正文；只发送链接、群聊 @ 或引用时，"
         "`message` 可为空字符串。\n\n"
         "`message` 支持 Markdown 语法；普通正文保持 `format=auto` 即可。\n\n"
-        "链接：`links` 支持 URL、`[展示文本](URL)`、`{href, label}`，"
+        "链接：`links` 支持 URL、`[可见文字](URL)`、`{href, label}`，"
         "可单独发送或与正文/@/引用组合。\n\n"
-        "URL 分享：本地文件、非图片内容、以及需要 Markdown 图片展示的本地图片，"
+        "URL 分享：本地文件、非图片内容、以及需要以内联方式显示的本地图片，"
         "先交给 `file_delivery` 获取 URL，再把 URL 写入正文或 `links`。"
         "HTTP/HTTPS 图片 URL（包括内网 URL）"
-        "不是本地路径；jpg/png/gif/webp 需要 Markdown 展示时直接写 "
-        "`![alt](url)`；其它文件 URL 使用 `links` 或普通链接。\n\n"
+        "不是本地路径；jpg/png/gif/webp 需要以内联方式显示时，"
+        "保持 `format=auto` 或使用 `format=markdown`，并在 `message` 中写 "
+        "`![图片说明](URL)`；其它文件 URL 使用 `links` 或普通链接。\n\n"
         "本地图片：不需要 Markdown 排版、只发送图片时，"
         "使用 `image_paths` 传本地图片路径。\n\n"
         "引用消息：`reply_to` 传 message_id、`{message_id, preview}`，"
@@ -269,10 +271,11 @@ SEND_MESSAGE_TOOL_SCHEMA = {
                 "type": "string",
                 "description": (
                     "消息正文。支持 Markdown 语法；只发送链接、群聊 @ "
-                    "或引用时可为空字符串。以 URL 或 Markdown 形式分享本地图片或文件时，"
+                    "或引用时可为空字符串。分享本地图片或文件时，"
                     "先调用 `file_delivery` 获取 URL，不要直接写入本地路径。HTTP/HTTPS "
-                    "jpg/png/gif/webp 图片 URL（包括内网 URL）可用 Markdown "
-                    "图片语法 `![alt](url)` 写在正文中；其它文件 URL 用普通链接。"
+                    "jpg/png/gif/webp 图片 URL（包括内网 URL）需要以内联方式显示时，"
+                    "保持 `format=auto` 或使用 `format=markdown`，并在正文中写 "
+                    "`![图片说明](URL)`；其它文件 URL 用普通链接。"
                 ),
             },
             "format": {
@@ -282,6 +285,7 @@ SEND_MESSAGE_TOOL_SCHEMA = {
                     "默认 `auto`，通常不用传。`auto` 优先以 Markdown 发送；"
                     "`markdown` 表示希望以 Markdown 发送；`text` 表示正文必须以纯文本发送。"
                     "使用 `text` 时，需要分享文件就发送 URL 或 links；"
+                    "不要写 `[可见文字](URL)` 或 `![图片说明](URL)` 这类语法；"
                     "不需要 Markdown 排版的本地图片可用 image_paths。"
                 ),
                 "default": "auto",
@@ -291,7 +295,7 @@ SEND_MESSAGE_TOOL_SCHEMA = {
                 "items": {"type": "string"},
                 "description": (
                     "可选。本地图片路径列表。用于不需要 Markdown 排版、"
-                    "只发送本地图片的场景；一般文件或需要 Markdown 图片展示时"
+                    "只发送本地图片的场景；一般文件或需要以内联方式显示时"
                     "请先调用 `file_delivery` 获取 URL。"
                 ),
                 "default": [],
@@ -312,7 +316,7 @@ SEND_MESSAGE_TOOL_SCHEMA = {
                     ]
                 },
                 "description": (
-                    "可点击链接列表。支持 URL、`[展示文本](URL)`、"
+                    "可点击链接列表。支持 URL、`[可见文字](URL)`、"
                     "`{href, label}`；可单独发送或与正文、群聊 @、引用组合。"
                 ),
                 "default": [],
@@ -381,9 +385,10 @@ FILE_DELIVERY_TOOL_SCHEMA = {
     "name": "file_delivery",
     "description": (
         "将本地文件发布为可通过如流对外分享的 URL。"
-        "以链接或 Markdown 形式分享本地图片、文件、音频、视频、"
-        "压缩包或生成内容前，先调用本工具获取 URL，再发送 URL、"
-        "Markdown 链接或 Markdown 图片。"
+        "分享本地图片、文件、音频、视频、压缩包或生成内容前，先调用本工具获取 URL。"
+        "直接分享文件时发送 URL；需要把链接显示成可点击文字或把图片以内联方式显示时，"
+        "使用支持 Markdown 渲染的正文格式，并在 `message` 中写 `[可见文字](URL)` "
+        "或 `![图片说明](URL)`。"
         "只接受本地真实文件路径；单文件当前不能超过 69MiB。"
     ),
     "parameters": {

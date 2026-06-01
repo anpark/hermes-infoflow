@@ -178,6 +178,8 @@ def test_private_message_without_from_user_is_not_treated_as_bot_echo(account):
     )
 
     assert res.kind == "ignored"
+    assert res.diagnostic_reason.startswith("private_missing_from_user")
+    assert json.loads(res.decoded_payload)["Content"] == "ambiguous sender"
 
 
 def test_private_bot_echo_requires_known_robot_id_match(account):
@@ -202,6 +204,8 @@ def test_private_bot_echo_requires_known_robot_id_match(account):
     )
 
     assert res.kind == "ignored"
+    assert res.diagnostic_reason.startswith("private_missing_from_user")
+    assert json.loads(res.decoded_payload)["Content"] == "bot echo but robot unknown"
 
 
 def test_private_message_without_msgid2_defaults_empty(account):
@@ -601,12 +605,61 @@ def test_unsupported_content_type(account):
     assert res.status_code == 400
 
 
+def test_decoded_parse_failure_keeps_plaintext_for_logging(account):
+    acct, raw_key = account
+    plaintext = "not-json-but-decrypted"
+    ct = aes_ecb_encrypt_b64url(plaintext, raw_key)
+
+    res = parser.parse_webhook(content_type="text/plain", raw_body=ct, account=acct)
+
+    assert res.kind == "http_error"
+    assert res.status_code == 500
+    assert res.decoded_payload == plaintext
+    assert res.diagnostic_reason.startswith("json_decode_error:")
+
+
 def test_empty_text_plain_body_returns_400_not_500(account):
     """Mirrors OpenClaw: empty content is 400, decryption failure is 500."""
     acct, _ = account
     res = parser.parse_webhook(content_type="text/plain", raw_body="   ", account=acct)
     assert res.kind == "http_error"
     assert res.status_code == 400
+
+
+def test_group_ignored_missing_from_user_keeps_decoded_payload(account):
+    acct, raw_key = account
+    payload = {
+        "message": {
+            "header": {"groupid": 1, "messageid": "missing-sender"},
+            "body": [{"type": "TEXT", "content": "special body"}],
+        }
+    }
+    plaintext = json.dumps(payload, ensure_ascii=False)
+    ct = aes_ecb_encrypt_b64url(plaintext, raw_key)
+
+    res = parser.parse_webhook(content_type="text/plain", raw_body=ct, account=acct)
+
+    assert res.kind == "ignored"
+    assert res.decoded_payload == plaintext
+    assert res.diagnostic_reason.startswith("group_missing_from_user")
+
+
+def test_group_ignored_empty_content_keeps_decoded_payload(account):
+    acct, raw_key = account
+    payload = {
+        "message": {
+            "header": {"fromuserid": "bob", "groupid": 1, "messageid": "empty-content"},
+            "body": [{"type": "UNKNOWN", "content": ""}],
+        }
+    }
+    plaintext = json.dumps(payload, ensure_ascii=False)
+    ct = aes_ecb_encrypt_b64url(plaintext, raw_key)
+
+    res = parser.parse_webhook(content_type="text/plain", raw_body=ct, account=acct)
+
+    assert res.kind == "ignored"
+    assert res.decoded_payload == plaintext
+    assert res.diagnostic_reason.startswith("group_empty_content")
 
 
 # ---------------------------------------------------------------------------

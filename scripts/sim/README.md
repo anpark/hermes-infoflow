@@ -24,7 +24,9 @@ These are read from `~/.hermes/.env` (or your shell):
 | `INFOFLOW_APP_SECRET` | from the Infoflow open-platform console |
 | `INFOFLOW_APP_AGENT_ID` | optional but required for some calls |
 | `INFOFLOW_CHECK_TOKEN` / `INFOFLOW_ENCODING_AES_KEY` | only used for inbound |
-| `INFOFLOW_OP_GROUP` | **the single numeric group id used by these sim scripts** |
+| `INFOFLOW_REAL_TEST_GROUP` | optional preferred numeric test group override |
+| `INFOFLOW_OP_GROUP` | optional numeric test group used by older sim scripts |
+| `INFOFLOW_OP_CHANNEL` | fallback when it is numeric or `group:<id>` / `infoflow:group:<id>` |
 
 ## Entry points
 
@@ -32,7 +34,7 @@ These are read from `~/.hermes/.env` (or your shell):
 | --- | --- |
 | `test_send_via_serverapi.py` | `prepare_outbound_message` + `ServerAPI.send_group_message_intent` direct smoke. Does **not** exercise `InfoflowSendService` preview enrichment. Does **not** need hermes-agent. |
 | `test_send_intent_matrix.py` | Direct `ServerAPI.send_group_message_intent` / `send_private_message_intent` smoke matrix for Markdown, reply, links, @, and 200x200 image bytes. It verifies protocol routing, not service-level reply preview enrichment. |
-| `test_file_to_url_send_matrix.py` | Direct `ServerAPI` matrix for file-to-URL image compatibility: Markdown + `image_paths` / `image_bytes`, reply + Markdown image, `format=text` native image, and plain auto native image. Prints selected payload families (`MD` / `IMAGE` / BOS upload/getUrl/HEAD). Use `--runtime-plugin` after deployment. |
+| `test_file_to_url_send_matrix.py` | Direct `ServerAPI` matrix for file-delivery/file-to-URL compatibility: non-image file link, Markdown + `image_paths` / `image_bytes`, reply + Markdown image, `format=text` native image, and plain auto native image. Prints selected payload families (`MD` / `IMAGE` / `LINK` / BOS upload/getUrl/HEAD). Use `--runtime-plugin` after deployment. |
 | `simulate_inbound_webhook.py` | Encrypts and posts fake Infoflow webhook messages to the local gateway. Exercises parser + adapter + Bot/LLM + tools + outbound send. Useful for prompt/tool-behavior checks after deployment. |
 | `test_send_via_standalone.py` | `standalone_send(...)` — the cron / out-of-process entry point. Does **not** need hermes-agent. |
 | `test_send_via_adapter.py`   | `InfoflowAdapter.send(...)` — the live gateway entry point. **Requires** `~/.hermes/hermes-agent` checkout. The script monkey-patches `gateway.config.Platform` to add an `INFOFLOW` member so an unpatched mainline hermes-agent still works. |
@@ -55,7 +57,7 @@ The three send-path smoke scripts (`test_send_via_serverapi.py`,
 flags:
 
 ```text
---group <id>            override INFOFLOW_OP_GROUP once
+--group <id>            override configured test group once
 --text "..."            override the default timestamped marker
 --mention "@chengbo05"  prepend an @-mention to the text (repeatable)
 --mention-user <csv>    structured human mention user ids
@@ -119,8 +121,15 @@ python scripts/sim/test_file_to_url_send_matrix.py \
     --runtime-plugin --group 4507088 --private-user chengbo05
 ```
 
+When `--group` is omitted, the script uses the first configured group from
+`INFOFLOW_REAL_TEST_GROUP`, `INFOFLOW_OP_GROUP`, or a numeric/group
+`INFOFLOW_OP_CHANNEL`. Add `--skip-file-link` when you only want the image
+routing cases.
+
 The expected routing is:
 
+- Non-image local file -> `file_delivery` -> BOS upload/getUrl/HEAD -> group
+  message with a clickable file link.
 - Markdown + `image_paths` -> BOS upload/getUrl/HEAD -> `MD` with `![alt](url)`.
 - `reply_to` + Markdown + `image_paths` -> `TEXT` reply packet, then `MD`.
 - `format=text` + `image_paths` -> native `IMAGE` packet with `TEXT`.
@@ -191,6 +200,9 @@ invalid `msgid`.
 
 - These scripts hit the real Infoflow API and post real messages to the
   configured test group. Don't aim them at production-only groups.
+- Group-target resolution is shared by most sim scripts: explicit `--group`
+  wins, then `INFOFLOW_REAL_TEST_GROUP`, `INFOFLOW_OP_GROUP`, and finally a
+  numeric/group `INFOFLOW_OP_CHANNEL`.
 - `test_file_to_url_send_matrix.py --runtime-plugin` imports the deployed
   plugin from `~/.hermes/plugins/infoflow`; without the flag it imports the
   in-tree source.

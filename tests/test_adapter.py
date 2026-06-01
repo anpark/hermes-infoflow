@@ -11,6 +11,7 @@ import asyncio
 import base64
 import inspect
 import json
+import logging
 import os
 from datetime import datetime, timedelta
 from threading import Lock
@@ -907,7 +908,7 @@ def test_busy_steer_group_reply_scope_is_sender_scoped(
     first_call = adapter._bot.send_message.await_args_list[0].kwargs
     second_call = adapter._bot.send_message.await_args_list[1].kwargs
     assert first_call["reply_to"] == [{"message_id": "GA2"}]
-    assert second_call["reply_to"] == [{"message_id": "GB1"}]
+    assert second_call["reply_to"] is None
 
 
 def test_busy_steer_reply_scope_clears_on_parent_complete(
@@ -1823,6 +1824,159 @@ def test_handle_webhook_returns_200_before_dispatch_completes(configured_env, mo
     assert "ping" in event.text
     # Metadata round-trips: mention info, image_urls, raw_msgdata.
     assert event.raw_message["was_mentioned"] is True
+
+
+def test_handle_webhook_logs_ignored_decoded_payload(
+    configured_env, caplog,
+) -> None:
+    raw_key, _ = configured_env
+    adapter = InfoflowAdapter(_make_config())
+    payload = {
+        "message": {
+            "header": {"groupid": 123, "messageid": "missing-sender"},
+            "body": [{"type": "TEXT", "content": "special format"}],
+        }
+    }
+    plaintext = json.dumps(payload, ensure_ascii=False)
+    ct = aes_ecb_encrypt_b64url(plaintext, raw_key)
+    request = _make_request(content_type="text/plain", body=ct.encode("utf-8"))
+
+    caplog.set_level(logging.INFO, logger="gateway.run")
+
+    async def _go():
+        return await adapter._webhook_server._handle_request(request)
+
+    response = asyncio.run(_go())
+
+    assert response.status == 200
+    assert "[iflow:raw] kind=ignored" in caplog.text
+    assert "group_missing_from_user" in caplog.text
+    assert plaintext in caplog.text
+
+
+def test_handle_webhook_logs_full_message_decoded_payload(
+    configured_env, caplog,
+) -> None:
+    raw_key, _ = configured_env
+    adapter = InfoflowAdapter(_make_config())
+    long_text = "x" * 2500
+    payload = {
+        "message": {
+            "header": {"fromuserid": "bob", "groupid": 123, "messageid": "long-message"},
+            "body": [{"type": "TEXT", "content": long_text}],
+        }
+    }
+    plaintext = json.dumps(payload, ensure_ascii=False)
+    ct = aes_ecb_encrypt_b64url(plaintext, raw_key)
+    request = _make_request(content_type="text/plain", body=ct.encode("utf-8"))
+
+    caplog.set_level(logging.INFO, logger="gateway.run")
+
+    async def _go():
+        return await adapter._webhook_server.handle_request(request)
+
+    msg, response = asyncio.run(_go())
+
+    assert msg is not None
+    assert response.status == 200
+    assert "[iflow:raw] mid=long-message" in caplog.text
+    assert plaintext in caplog.text
+    assert long_text in caplog.text
+
+
+def test_handle_webhook_logs_message_payload_before_conversion_failure(
+    configured_env, caplog, monkeypatch,
+) -> None:
+    raw_key, _ = configured_env
+    adapter = InfoflowAdapter(_make_config())
+    payload = {
+        "message": {
+            "header": {"fromuserid": "bob", "groupid": 123, "messageid": "bad-convert"},
+            "body": [{"type": "TEXT", "content": "still log this"}],
+        }
+    }
+    plaintext = json.dumps(payload, ensure_ascii=False)
+    ct = aes_ecb_encrypt_b64url(plaintext, raw_key)
+    request = _make_request(content_type="text/plain", body=ct.encode("utf-8"))
+
+    def fail_to_incoming(_raw_inbound):
+        raise RuntimeError("conversion failed")
+
+    monkeypatch.setattr(adapter._serverapi, "to_incoming", fail_to_incoming)
+    caplog.set_level(logging.INFO, logger="gateway.run")
+
+    async def _go():
+        with pytest.raises(RuntimeError, match="conversion failed"):
+            await adapter._webhook_server.handle_request(request)
+
+    asyncio.run(_go())
+
+    assert "[iflow:raw] mid=bad-convert" in caplog.text
+    assert plaintext in caplog.text
+
+
+def test_handle_webhook_logs_decoded_payload_on_post_decrypt_parse_error(
+    configured_env, caplog,
+) -> None:
+    raw_key, _ = configured_env
+    adapter = InfoflowAdapter(_make_config())
+    plaintext = "not-json-but-decrypted"
+    ct = aes_ecb_encrypt_b64url(plaintext, raw_key)
+    request = _make_request(content_type="text/plain", body=ct.encode("utf-8"))
+
+    caplog.set_level(logging.INFO, logger="gateway.run")
+
+    async def _go():
+        return await adapter._webhook_server._handle_request(request)
+
+    response = asyncio.run(_go())
+
+    assert response.status == 500
+    assert "[iflow:raw] kind=http_error" in caplog.text
+    assert "json_decode_error" in caplog.text
+    assert plaintext in caplog.text
+
+
+def test_handle_webhook_logs_raw_request_body_when_decryption_fails(
+    configured_env, caplog,
+) -> None:
+    _raw_key, _ = configured_env
+    adapter = InfoflowAdapter(_make_config())
+    raw_body = "not-a-valid-ciphertext"
+    request = _make_request(content_type="text/plain", body=raw_body.encode("utf-8"))
+
+    caplog.set_level(logging.INFO, logger="gateway.run")
+
+    async def _go():
+        return await adapter._webhook_server._handle_request(request)
+
+    response = asyncio.run(_go())
+
+    assert response.status == 500
+    assert "[iflow:request_raw] kind=http_error" in caplog.text
+    assert "decrypt_failed" in caplog.text
+    assert raw_body in caplog.text
+
+
+def test_handle_webhook_logs_raw_request_body_for_unsupported_content_type(
+    configured_env, caplog,
+) -> None:
+    _raw_key, _ = configured_env
+    adapter = InfoflowAdapter(_make_config())
+    raw_body = '{"unexpected": true}'
+    request = _make_request(content_type="application/json", body=raw_body.encode("utf-8"))
+
+    caplog.set_level(logging.INFO, logger="gateway.run")
+
+    async def _go():
+        return await adapter._webhook_server._handle_request(request)
+
+    response = asyncio.run(_go())
+
+    assert response.status == 400
+    assert "[iflow:request_raw] kind=http_error" in caplog.text
+    assert "unsupported content type" in caplog.text
+    assert raw_body in caplog.text
 
 
 def test_outbound_send_records_dedup_id(configured_env, monkeypatch) -> None:

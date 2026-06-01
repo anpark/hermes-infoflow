@@ -13,7 +13,7 @@ INFOFLOW_DELIVERY_TOOL_RULES = """\
 `send_message`、`infoflow_send_message` 等会实际向如流发送内容的工具属于外发工具。工具调用结果以工具返回为准。
 
 - 本地文件路径不是消息正文；绝不能把本地路径或本地文件 URL 发成普通文本。
-- 通过 Infoflow 以链接或 Markdown 形式分享本地文件、图片、音频、视频、压缩包或其它生成内容时，先调用 `file_delivery` 获取 URL，再发送 URL、Markdown 链接或 Markdown 图片。
+- 通过 Infoflow 分享本地文件、图片、音频、视频、压缩包或其它生成内容时，先调用 `file_delivery` 获取 URL。直接分享文件时发送 URL；需要把链接显示成可点击文字或把图片以内联方式显示时，使用支持 Markdown 渲染的正文格式，保持 `format=auto` 或使用 `format=markdown`，并在 `message` 中写 `[可见文字](URL)` 或 `![图片说明](URL)`；使用 `format=text` 时不要写这些语法，改为发送 URL 或使用 `links`。
 - 不需要 Markdown 排版、只发送本地图片时，使用 `infoflow_send_message.image_paths`。
 - 外发工具成功并已完成用户要求的对外发送动作时，最终输出单独一行 `NO_REPLY`，不要再补“已发送/来了”等确认文案。
 - 如果用户明确还要求你在当前会话报告发送结果，可以简短报告状态，但不要重复发送目标内容或本地路径。
@@ -29,9 +29,12 @@ def infoflow_file_delivery_prompt(shared_root: str | Path | None = None) -> str:
         shared_root = get_infoflow_shared_files_root()
     root = str(Path(shared_root).expanduser())
     return (
-        "【文件/图片 URL 分享】通过 Infoflow 以链接或 Markdown 形式分享本地文件、图片、音频、视频、"
-        "压缩包或其它生成内容时，必须先调用 `file_delivery(source_path)` 获取 URL，再发送 URL、"
-        "Markdown 链接或 Markdown 图片。\n"
+        "【文件/图片 URL 分享】通过 Infoflow 分享本地文件、图片、音频、视频、"
+        "压缩包或其它生成内容时，必须先调用 `file_delivery(source_path)` 获取 URL。"
+        "直接分享文件时发送 URL；需要把链接显示成可点击文字或把图片以内联方式显示时，"
+        "使用支持 Markdown 渲染的正文格式，保持 `format=auto` 或使用 `format=markdown`，"
+        "并在 `message` 中写 `[可见文字](URL)` 或 `![图片说明](URL)`；"
+        "使用 `format=text` 时不要写这些语法，改为发送 URL 或使用 `links`。\n"
         "不需要 Markdown 排版、只发送本地图片时，使用 `infoflow_send_message.image_paths`。\n"
         f"Infoflow 可分享文件目录：`{root}`\n"
         f"临时文件建议放在：`{root}/temp/<YYYYMMDD>/`。"

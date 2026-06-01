@@ -109,6 +109,9 @@ def test_register_registers_platform_and_tool() -> None:
     assert "`markdown` 表示希望以 Markdown 发送" in platform["platform_hint"]
     assert "`text` 表示正文必须以纯文本发送" in platform["platform_hint"]
     assert "使用 `text` 时" in platform["platform_hint"]
+    assert "[可见文字](URL)" in platform["platform_hint"]
+    assert "![图片说明](URL)" in platform["platform_hint"]
+    assert "format=text" in platform["platform_hint"]
 
     assert any(t["name"] == "infoflow_send_message" for t in ctx.tools)
     send_tool = next(t for t in ctx.tools if t["name"] == "infoflow_send_message")

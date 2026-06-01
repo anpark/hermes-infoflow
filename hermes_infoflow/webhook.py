@@ -42,6 +42,8 @@ class WebhookResult:
     status: int = 200
     body: str = "OK"
     raw_inbound: Any = None  # parser.InboundMessage when kind == "message"
+    decoded_payload: str = ""
+    diagnostic_reason: str = ""
 
 
 def parse_webhook_request(
@@ -92,11 +94,75 @@ def parse_webhook_request(
             kind="http_error",
             status=parsed.status_code,
             body=parsed.body,
+            decoded_payload=parsed.decoded_payload,
+            diagnostic_reason=parsed.diagnostic_reason,
         )
     if parsed.kind == "ignored" or parsed.inbound is None:
-        return WebhookResult(kind="ignored")
+        return WebhookResult(
+            kind="ignored",
+            decoded_payload=parsed.decoded_payload,
+            diagnostic_reason=parsed.diagnostic_reason,
+        )
 
-    return WebhookResult(kind="message", raw_inbound=parsed.inbound)
+    return WebhookResult(
+        kind="message",
+        raw_inbound=parsed.inbound,
+        decoded_payload=parsed.decoded_payload,
+        diagnostic_reason=parsed.diagnostic_reason,
+    )
+
+
+def _log_decoded_payload(
+    *,
+    kind: str,
+    decoded_payload: str,
+    message_id: str = "",
+    status: int | None = None,
+    reason: str = "",
+) -> None:
+    """Write the full decrypted webhook payload for audit/debug paths."""
+    if not decoded_payload:
+        return
+    if kind == "message":
+        gw_log().info(
+            "[iflow:raw] mid=%s payload=%s",
+            message_id or "-",
+            decoded_payload,
+        )
+        return
+    if kind == "http_error":
+        gw_log().warning(
+            "[iflow:raw] kind=http_error status=%s reason=%s payload=%s",
+            status if status is not None else "-",
+            reason or "-",
+            decoded_payload,
+        )
+        return
+    gw_log().warning(
+        "[iflow:raw] kind=%s reason=%s payload=%s",
+        kind,
+        reason or "-",
+        decoded_payload,
+    )
+
+
+def _log_request_body(
+    *,
+    kind: str,
+    raw_body: str,
+    status: int | None = None,
+    reason: str = "",
+) -> None:
+    """Fallback audit log when no decrypted payload exists."""
+    if not raw_body:
+        return
+    gw_log().warning(
+        "[iflow:request_raw] kind=%s status=%s reason=%s body=%s",
+        kind,
+        status if status is not None else "-",
+        reason or "-",
+        raw_body,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -244,32 +310,55 @@ class WebhookServer:
             return None, web.Response(status=403, text=wh_result.body)
         if wh_result.kind == "http_error":
             gw_log().warning(
-                "[infoflow] webhook parse error (status=%s): %s",
-                wh_result.status, wh_result.body,
+                "[infoflow] webhook parse error (status=%s): %s reason=%s",
+                wh_result.status, wh_result.body, wh_result.diagnostic_reason or "-",
             )
+            _log_decoded_payload(
+                kind="http_error",
+                status=wh_result.status,
+                reason=wh_result.diagnostic_reason,
+                decoded_payload=wh_result.decoded_payload,
+            )
+            if not wh_result.decoded_payload:
+                _log_request_body(
+                    kind="http_error",
+                    status=wh_result.status,
+                    reason=wh_result.diagnostic_reason or wh_result.body,
+                    raw_body=raw_body,
+                )
             return None, web.Response(status=wh_result.status, text=wh_result.body)
         if wh_result.kind != "message":
+            _log_decoded_payload(
+                kind=wh_result.kind,
+                reason=wh_result.diagnostic_reason,
+                decoded_payload=wh_result.decoded_payload,
+            )
             return None, web.Response(status=200, text="OK")
 
-        # 5. Convert parser.InboundMessage → types.IncomingMessage
-        msg = self._serverapi.to_incoming(wh_result.raw_inbound)
-
-        # 6. [iflow:raw] — protocol-layer log
+        # 5. [iflow:raw] — protocol-layer log before conversion so malformed
+        # parsed structures still leave a full decrypted payload trail.
         try:
-            import json as _json
+            decoded_payload = wh_result.decoded_payload
+            if not decoded_payload:
+                import json as _json
 
-            _raw = (
-                wh_result.raw_inbound.raw_msgdata
-                if hasattr(wh_result.raw_inbound, "raw_msgdata")
-                else {}
-            )
-            gw_log().info(
-                "[iflow:raw] mid=%s payload=%s",
-                msg.message_id,
-                _json.dumps(_raw, ensure_ascii=False, default=str)[:2000],
+                _raw = (
+                    wh_result.raw_inbound.raw_msgdata
+                    if hasattr(wh_result.raw_inbound, "raw_msgdata")
+                    else {}
+                )
+                decoded_payload = _json.dumps(_raw, ensure_ascii=False, default=str)
+            raw_message_id = getattr(wh_result.raw_inbound, "message_id", "") or ""
+            _log_decoded_payload(
+                kind="message",
+                message_id=str(raw_message_id),
+                decoded_payload=decoded_payload,
             )
         except Exception:
             pass
+
+        # 6. Convert parser.InboundMessage → types.IncomingMessage
+        msg = self._serverapi.to_incoming(wh_result.raw_inbound)
 
         return msg, web.Response(status=200, text="OK")
 
