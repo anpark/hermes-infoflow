@@ -329,6 +329,7 @@ async def test_dispatch_keeps_reaction_open_until_background_send() -> None:
 
     async def _delayed_send():
         await release.wait()
+        bot.mark_silent_tool_success(msg.message_id)
         await bot.send_message(group_id="4507088", text="NO_REPLY")
 
     async def _handle_message(_event):
@@ -369,6 +370,7 @@ async def test_background_send_cancels_fallback_cleanup_task() -> None:
 
     async def _delayed_send():
         await release.wait()
+        bot.mark_silent_tool_success(msg.message_id)
         await bot.send_message(group_id="4507088", text="NO_REPLY")
 
     async def _handle_message(_event):

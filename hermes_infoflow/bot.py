@@ -251,6 +251,7 @@ class Bot:
         self._admin_users = parse_infoflow_admin_users(admin_uid)
         self._admin_uid = ",".join(self._admin_users)
         self._robot_id: str = str(settings.get("robot_id") or "")
+        self._silent_tool_success_by_inbound_mid: dict[str, float] = {}
         self._reaction_cleanup_tasks: set[asyncio.Task[Any]] = set()
         self._reaction_cleanup_tasks_by_run: dict[str, asyncio.Task[Any]] = {}
         self._reactions = ReactionController(
@@ -305,6 +306,42 @@ class Bot:
         ):
             self._send_service = self._make_send_service()
         return self._send_service
+
+    def mark_silent_tool_success(self, inbound_mid: str | None) -> None:
+        """Allow a final NO_REPLY after a tool already completed user-visible work."""
+        mid = str(inbound_mid or "").strip()
+        if not mid:
+            return
+        now = time.monotonic()
+        self._prune_silent_tool_success(now)
+        self._silent_tool_success_by_inbound_mid[mid] = now + 300.0
+
+    def _consume_silent_tool_success(self, inbound_mid: str | None) -> bool:
+        mid = str(inbound_mid or "").strip()
+        if not mid:
+            return False
+        now = time.monotonic()
+        expires_at = self._silent_tool_success_by_inbound_mid.get(mid)
+        if expires_at is None:
+            self._prune_silent_tool_success(now)
+            return False
+        self._silent_tool_success_by_inbound_mid.pop(mid, None)
+        return expires_at > now
+
+    def _prune_silent_tool_success(self, now: float) -> None:
+        expired = [
+            mid
+            for mid, expires_at in self._silent_tool_success_by_inbound_mid.items()
+            if expires_at <= now
+        ]
+        for mid in expired:
+            self._silent_tool_success_by_inbound_mid.pop(mid, None)
+
+    @staticmethod
+    def _no_reply_fallback_for_path(path: str) -> str:
+        if path == "bot-mentioned":
+            return "收到，我在。你想让我处理什么，直接说就行。"
+        return ""
 
     async def _broadcast_mixed_no_reply_to_ops(
         self,
@@ -1382,25 +1419,39 @@ class Bot:
 
         # NO_REPLY sentinel — see ``no_reply_sentinel_hits`` for acceptance rules.
         if no_reply_sentinel_hits(text):
-            await self._broadcast_mixed_no_reply_to_ops(
-                text=text or "",
-                group_id=group_id,
-                dm_user_id=dm_user_id,
-                path=_path,
-                inbound_mid=_mid_var.get(""),
-                session=session,
-            )
-            gw_log().info(
-                "[iflow:send] mid=%s path=%s NO_REPLY sentinel suppressed",
-                _mid_var.get(""), _path,
-            )
-            await self._finish_reaction_for_send_target(
-                group_id=group_id,
-                dm_user_id=dm_user_id,
-                reaction_message_id=reaction_message_id,
-                reason="no_reply",
-            )
-            return SentResult(success=True)
+            inbound_mid = _mid_var.get("")
+            silent_tool_success = self._consume_silent_tool_success(inbound_mid)
+            fallback_text = ""
+            if group_id is not None and _path == "bot-mentioned":
+                if not silent_tool_success:
+                    fallback_text = self._no_reply_fallback_for_path(_path)
+            if fallback_text:
+                gw_log().warning(
+                    "[iflow:send] mid=%s path=%s recovered unexpected NO_REPLY",
+                    inbound_mid,
+                    _path,
+                )
+                text = fallback_text
+            else:
+                await self._broadcast_mixed_no_reply_to_ops(
+                    text=text or "",
+                    group_id=group_id,
+                    dm_user_id=dm_user_id,
+                    path=_path,
+                    inbound_mid=inbound_mid,
+                    session=session,
+                )
+                gw_log().info(
+                    "[iflow:send] mid=%s path=%s NO_REPLY sentinel suppressed",
+                    inbound_mid, _path,
+                )
+                await self._finish_reaction_for_send_target(
+                    group_id=group_id,
+                    dm_user_id=dm_user_id,
+                    reaction_message_id=reaction_message_id,
+                    reason="no_reply",
+                )
+                return SentResult(success=True)
 
         # Static refusal-regex filter (zero-latency Layer-3 fallback).
         # Only applied on the followUp path so that @bot/watch responses

@@ -1614,6 +1614,24 @@ def make_send_message_handler():
             success=True,
             sent_messages=sent_messages,
         )
+        if sent_messages:
+            inbound_mid = ""
+            current_mid = getattr(adapter, "_current_inbound_mid", None)
+            if callable(current_mid):
+                with contextlib.suppress(Exception):
+                    inbound_mid = str(current_mid() or "")
+            if not inbound_mid:
+                with contextlib.suppress(Exception):
+                    from .bot import get_recall_inbound_message_id_hint
+
+                    inbound_mid = str(get_recall_inbound_message_id_hint() or "")
+            mark_silent = getattr(
+                getattr(adapter, "_bot", None),
+                "mark_silent_tool_success",
+                None,
+            )
+            if callable(mark_silent):
+                mark_silent(inbound_mid)
         payload: dict[str, Any] = {
             "success": True,
             "target": target["target"],

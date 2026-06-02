@@ -2619,6 +2619,9 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 inbound_mid=inbound_mid,
                 chat_id=chat_id,
             )
+            mark_silent = getattr(self._bot, "mark_silent_tool_success", None)
+            if callable(mark_silent):
+                mark_silent(inbound_mid)
             return SendResult(success=True)
         return SendResult(success=False, error=result.error, retryable=False)
 
