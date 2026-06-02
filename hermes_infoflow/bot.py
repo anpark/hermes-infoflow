@@ -451,10 +451,20 @@ class Bot:
         # Step 2: Persist normalized DB facts before dedup / own-echo / policy.
         dedupe_key = msg.dedupe_key
         already_seen = bool(dedupe_key and self._sent_store.is_duplicate(dedupe_key))
+        incoming_seen_kind = self._dedup_kind_for_message(msg)
+        previous_seen_kind = (
+            self._sent_store.seen_kind(dedupe_key) if dedupe_key and already_seen else ""
+        )
         sent_echo = bool(
             already_seen
             and dedupe_key
             and self._sent_store.find_any(dedupe_key) is not None
+        )
+        mention_upgrade = bool(
+            already_seen
+            and not sent_echo
+            and previous_seen_kind == "forward"
+            and incoming_seen_kind == "mention"
         )
         own_echo = self._is_own_echo(msg)
         self._register_context(
@@ -467,7 +477,7 @@ class Bot:
         # Step 3: Dedup check (plugin-sent echoes are already mark_seen).
         # The DB upsert above is idempotent and enriches provisional sent rows
         # with the canonical echo payload without dispatching it to the model.
-        if already_seen:
+        if already_seen and not mention_upgrade:
             reason = "own-echo:plugin-sent" if sent_echo else "duplicate"
             gw_log().info(
                 "[iflow:decision] mid=%s action=DROP reason=%s text=%r",
@@ -481,7 +491,7 @@ class Bot:
                 )
             )
         if dedupe_key:
-            self._sent_store.mark_seen(dedupe_key)
+            self._sent_store.mark_seen(dedupe_key, kind=incoming_seen_kind)
 
         # Step 4: Own-message echo filter (ALL_MESSAGE_FORWARD)
         # If dedup didn't catch it but sender_imid==robot_id, this echo came
@@ -554,6 +564,20 @@ class Bot:
             msg.sender_name or msg.sender_id, _text_preview,
         )
         return ProcessResult(should_dispatch=True, decision=decision)
+
+    @staticmethod
+    def _dedup_kind_for_message(msg: IncomingMessage) -> str:
+        """Classify inbound duplicates so group forward events can upgrade to mentions."""
+        if not msg.is_group:
+            return "plain"
+        event_type = str(getattr(msg, "event_type", "") or "")
+        if event_type == "MESSAGE_RECEIVE":
+            return "mention"
+        if bool(getattr(msg, "bot_was_mentioned", False)):
+            return "mention"
+        if event_type == "ALL_MESSAGE_FORWARD":
+            return "forward"
+        return "plain"
 
     # -- slash command auth -------------------------------------------------
 

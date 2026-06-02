@@ -137,6 +137,49 @@ async def test_duplicate_foreign_message_is_recorded_without_outgoing_flag(
 
 
 @pytest.mark.asyncio
+async def test_group_forward_can_upgrade_to_later_mention(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot, store, sent_store = _bot(tmp_path, monkeypatch)
+
+    first = await bot.process_inbound(
+        IncomingMessage(
+            message_id="same-id",
+            dedupe_key="same-id",
+            text="ambient",
+            body_for_agent="ambient",
+            group_id="1",
+            sender_id="alice",
+            bot_was_mentioned=False,
+            event_type="ALL_MESSAGE_FORWARD",
+            raw_data={"fromuserid": "alice"},
+        )
+    )
+    second = await bot.process_inbound(
+        IncomingMessage(
+            message_id="same-id",
+            dedupe_key="same-id",
+            text="direct",
+            body_for_agent="direct",
+            group_id="1",
+            sender_id="alice",
+            bot_was_mentioned=True,
+            event_type="MESSAGE_RECEIVE",
+            raw_data={"fromuserid": "alice"},
+        )
+    )
+
+    assert first.decision is not None
+    assert second.decision is not None
+    assert second.decision.reason != "duplicate"
+    assert sent_store.seen_kind("same-id") == "mention"
+    found = store.find_group("same-id")
+    assert found is not None
+    assert found.content == "direct"
+    assert found.mentions_you is True
+
+
+@pytest.mark.asyncio
 async def test_group_at_all_is_recorded_separately_from_direct_mention(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

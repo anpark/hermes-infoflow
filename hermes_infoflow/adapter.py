@@ -10,12 +10,12 @@
       ↕  ServerAPI / IncomingMessage / SentResult / RecallResult
     serverapi.py  (Infoflow API adaptation: unified fields ↔ messy wire format)
       ↕↕
-    webhook.py    websocket.py  (channel transport, only webhook implemented)
+    webhook.py    websocket.py  (receive transports)
 
 **Message lifecycle tracing** — every inbound message gets a unified ``mid``
 that flows through four stages, each logged with a ``[iflow:*]`` prefix:
 
-    [iflow:raw]      webhook 收到明文
+    [iflow:raw]      transport 收到明文
     [iflow:event]    enrichment 后的标准字段
     [iflow:decision] 策略判定（dispatch / drop / record）
     [iflow:send]     bot 回复（如果有）
@@ -376,6 +376,7 @@ from .utils import (
     gw_log,
 )
 from .webhook import WebhookServer
+from .websocket import WebSocketReceiver
 
 logger = logging.getLogger(__name__)
 _LOG_CLEANUP_INTERVAL_SECONDS = 24 * 60 * 60
@@ -396,7 +397,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
     * Translate between ``types.IncomingMessage`` and Hermes ``MessageEvent``
     * Translate Hermes ``send()``/``send_image()``/``delete_message()`` calls
       into ``bot.send_message()``/``bot.send_image()``/``bot.recall_message()``
-    * Run the HTTP webhook server
+    * Run the configured inbound receive transport
     """
 
     def __init__(self, config: Any, **kwargs):
@@ -512,7 +513,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         if self._serverapi.robot_id and not self._bot.robot_id:
             self._bot.robot_id = self._serverapi.robot_id
 
-        # ── HTTP server ───────────────────────────────────────────────
+        # ── Receive transport settings ───────────────────────────────
         self._port: int = int(self._settings["port"])
         self._host: str = str(self._settings["host"])
         self._webhook_path: str = str(self._settings["webhook_path"]) or DEFAULT_WEBHOOK_PATH
@@ -526,7 +527,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         self._tracker = get_tracker()
         self._recall_silence = RecallSilenceTracker()
 
-        # ── HTTP webhook server (delegated to webhook.py) ──────────
+        # ── Inbound receive transports ─────────────────────────────
         self._webhook_server = WebhookServer(
             serverapi=self._serverapi,
             sent_message_ids=self._sent_message_ids,
@@ -537,6 +538,13 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             on_message=self._on_inbound_message,
             task_set=self._background_tasks,
             tracker=self._tracker,
+        )
+        self._websocket_receiver = WebSocketReceiver(
+            serverapi=self._serverapi,
+            sent_message_ids=self._sent_message_ids,
+            settings=self._settings,
+            on_message=self._on_inbound_message,
+            task_set=self._background_tasks,
         )
 
         self._http_session: aiohttp.ClientSession | None = None
@@ -822,18 +830,36 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
 
     def _missing_required(self) -> list[str]:
         missing = []
-        for key, label in (
+        required = [
             ("app_key", "INFOFLOW_APP_KEY"),
             ("app_secret", "INFOFLOW_APP_SECRET"),
-            ("check_token", "INFOFLOW_CHECK_TOKEN"),
-            ("encoding_aes_key", "INFOFLOW_ENCODING_AES_KEY"),
-        ):
+        ]
+        if self._settings.get("connection_mode") == "webhook":
+            required.extend(
+                [
+                    ("check_token", "INFOFLOW_CHECK_TOKEN"),
+                    ("encoding_aes_key", "INFOFLOW_ENCODING_AES_KEY"),
+                ]
+            )
+        for key, label in required:
             if not self._settings.get(key):
                 missing.append(label)
         return missing
 
     async def connect(self) -> bool:
-        if not AIOHTTP_WEB_AVAILABLE:
+        mode = str(self._settings.get("connection_mode") or "webhook").strip().lower()
+        if mode not in {"webhook", "websocket"}:
+            self._set_fatal_error(
+                "UNSUPPORTED_CONNECTION_MODE",
+                (
+                    f"INFOFLOW_CONNECTION_MODE={mode!r} is not supported. "
+                    "Use 'webhook' or 'websocket'."
+                ),
+                retryable=False,
+            )
+            return False
+
+        if mode == "webhook" and not AIOHTTP_WEB_AVAILABLE:
             self._set_fatal_error(
                 "MISSING_AIOHTTP",
                 "aiohttp is required for the Infoflow webhook server",
@@ -850,53 +876,57 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             )
             return False
 
-        if self._settings["connection_mode"] != "webhook":
-            self._set_fatal_error(
-                "UNSUPPORTED_CONNECTION_MODE",
-                (
-                    f"INFOFLOW_CONNECTION_MODE={self._settings['connection_mode']!r} is "
-                    "not implemented in hermes-infoflow yet. Only 'webhook' is "
-                    "supported."
-                ),
-                retryable=False,
-            )
-            return False
-
-        try:
-            with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as sock:
-                sock.settimeout(1)
-                sock.connect(("127.0.0.1", self._port))
-            self._set_fatal_error(
-                "PORT_IN_USE",
-                f"Infoflow webhook port {self._port} is already in use",
-                retryable=True,
-            )
-            return False
-        except (ConnectionRefusedError, OSError):
-            pass
+        if mode == "webhook":
+            try:
+                with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as sock:
+                    sock.settimeout(1)
+                    sock.connect(("127.0.0.1", self._port))
+                self._set_fatal_error(
+                    "PORT_IN_USE",
+                    f"Infoflow webhook port {self._port} is already in use",
+                    retryable=True,
+                )
+                return False
+            except (ConnectionRefusedError, OSError):
+                pass
 
         self._run_log_cleanup_once()
 
         self._http_session = aiohttp.ClientSession()
         self._serverapi.http_session = self._http_session
-        try:
-            await self._webhook_server.start()
-        except Exception as exc:
-            await self._close_http_session()
-            self._set_fatal_error(
-                "BIND_FAILED",
-                f"Failed to start webhook server on {self._host}:{self._port}: {exc}",
-                retryable=True,
-            )
-            return False
+        if mode == "webhook":
+            try:
+                await self._webhook_server.start()
+            except Exception as exc:
+                await self._close_http_session()
+                self._set_fatal_error(
+                    "BIND_FAILED",
+                    f"Failed to start webhook server on {self._host}:{self._port}: {exc}",
+                    retryable=True,
+                )
+                return False
+        else:
+            try:
+                await self._websocket_receiver.start()
+            except Exception as exc:
+                await self._close_http_session()
+                self._set_fatal_error(
+                    "WEBSOCKET_CONNECT_FAILED",
+                    f"Failed to start Infoflow websocket receiver: {exc}",
+                    retryable=not bool(getattr(exc, "permanent", False)),
+                )
+                return False
 
         self._running = True
         self._start_log_cleanup_task()
         self._mark_connected()
-        logger.info(
-            "[infoflow] Webhook listening on %s:%d%s",
-            self._host, self._port, self._webhook_path,
-        )
+        if mode == "webhook":
+            logger.info(
+                "[infoflow] Webhook listening on %s:%d%s",
+                self._host, self._port, self._webhook_path,
+            )
+        else:
+            logger.info("[infoflow] Websocket receiver connected")
         return True
 
     async def disconnect(self) -> None:
@@ -904,6 +934,8 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         await self._stop_log_cleanup_task()
         with contextlib.suppress(Exception):
             await self._webhook_server.stop()
+        with contextlib.suppress(Exception):
+            await self._websocket_receiver.stop()
         await self._close_http_session()
         self._mark_disconnected()
         gw_log().info("[infoflow] Disconnected")
@@ -1020,7 +1052,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         return result_success
 
     # ------------------------------------------------------------------
-    # Inbound message callback (from webhook server)
+    # Inbound message callback (from receive transport)
     # ------------------------------------------------------------------
 
     def _infoflow_chat_id(self, msg: IncomingMessage) -> str:
@@ -1514,7 +1546,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         )
 
     async def _on_inbound_message(self, msg: IncomingMessage) -> None:
-        """Callback invoked by WebhookServer for each parsed message.
+        """Callback invoked by the active receive transport for each message.
 
         Thin orchestration: enrich → policy → dispatch.
         Business logic lives in bot.py.
@@ -2746,8 +2778,6 @@ def register(ctx: Any) -> None:
         validate_config=_validate_config,
         is_connected=_is_connected,
         required_env=[
-            "INFOFLOW_CHECK_TOKEN",
-            "INFOFLOW_ENCODING_AES_KEY",
             "INFOFLOW_APP_KEY",
             "INFOFLOW_APP_SECRET",
         ],

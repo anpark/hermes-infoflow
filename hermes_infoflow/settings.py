@@ -37,6 +37,8 @@ WATCH_REGEX_ENV_PREFIX = f"{WATCH_REGEX_ENV}_"
 OP_CHANNEL_ENV = "INFOFLOW_OP_CHANNEL"
 LEGACY_HOME_CHANNEL_ENV = "INFOFLOW_HOME_CHANNEL"
 ADMIN_USER_ENV = "INFOFLOW_ADMIN_USER"
+DEFAULT_CONNECTION_MODE = "webhook"
+SUPPORTED_CONNECTION_MODES = {"webhook", "websocket"}
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +166,20 @@ def infoflow_admin_users_from_env() -> tuple[str, ...]:
     return parse_infoflow_admin_users(os.getenv(ADMIN_USER_ENV, ""))
 
 
+def _normalize_connection_mode(raw: Any) -> str:
+    mode = str(raw or "").strip().lower()
+    return mode or DEFAULT_CONNECTION_MODE
+
+
+def _mode_required_settings(mode: str) -> tuple[str, ...]:
+    base = ("app_key", "app_secret")
+    if mode == "webhook":
+        return base + ("check_token", "encoding_aes_key")
+    if mode == "websocket":
+        return base
+    return ()
+
+
 def _read_account_settings(config: Any) -> dict[str, Any]:
     """Merge env vars and ``config.extra`` into a flat settings dict.
 
@@ -175,12 +191,13 @@ def _read_account_settings(config: Any) -> dict[str, Any]:
         extra = dict(getattr(config, "extra", None) or {})
     watch_regex_env = _watch_regex_env_values()
 
-    def pick(env_name: str, key: str, default: Any = None) -> Any:
+    def pick(env_name: str, key: str, default: Any = None, *aliases: str) -> Any:
         env_val = os.getenv(env_name)
         if env_val not in (None, ""):
             return env_val
-        if key in extra and extra[key] not in (None, ""):
-            return extra[key]
+        for candidate in (key, *aliases):
+            if candidate in extra and extra[candidate] not in (None, ""):
+                return extra[candidate]
         return default
 
     settings: dict[str, Any] = {
@@ -212,7 +229,14 @@ def _read_account_settings(config: Any) -> dict[str, Any]:
         "host": pick("INFOFLOW_HOST", "host", DEFAULT_HOST) or DEFAULT_HOST,
         "webhook_path": pick("INFOFLOW_WEBHOOK_PATH", "webhook_path", DEFAULT_WEBHOOK_PATH)
         or DEFAULT_WEBHOOK_PATH,
-        "connection_mode": (pick("INFOFLOW_CONNECTION_MODE", "connection_mode", "webhook") or "webhook").lower(),
+        "connection_mode": _normalize_connection_mode(
+            pick(
+                "INFOFLOW_CONNECTION_MODE",
+                "connection_mode",
+                DEFAULT_CONNECTION_MODE,
+                "connectionMode",
+            )
+        ),
         "reply_mode": (pick("INFOFLOW_REPLY_MODE", "reply_mode", "mention-and-watch") or "mention-and-watch"),
         "require_mention_raw": pick("INFOFLOW_REQUIRE_MENTION", "require_mention", "true"),
         "watch_mentions_raw": pick("INFOFLOW_WATCH_MENTIONS", "watch_mentions", ""),
@@ -349,15 +373,24 @@ def _env_enablement() -> dict | None:
     app_secret = os.getenv("INFOFLOW_APP_SECRET", "").strip()
     check_token = os.getenv("INFOFLOW_CHECK_TOKEN", "").strip()
     encoding_aes_key = os.getenv("INFOFLOW_ENCODING_AES_KEY", "").strip()
-    if not (app_key and app_secret and check_token and encoding_aes_key):
+    connection_mode_raw = os.getenv("INFOFLOW_CONNECTION_MODE", "").strip()
+    connection_mode = _normalize_connection_mode(connection_mode_raw)
+    required = (app_key, app_secret)
+    if connection_mode == "webhook":
+        required = required + (check_token, encoding_aes_key)
+    if not all(required):
         return None
     seed: dict[str, Any] = {
         "api_host": api_host,
         "app_key": app_key,
         "app_secret": app_secret,
-        "check_token": check_token,
-        "encoding_aes_key": encoding_aes_key,
     }
+    if check_token:
+        seed["check_token"] = check_token
+    if encoding_aes_key:
+        seed["encoding_aes_key"] = encoding_aes_key
+    if connection_mode_raw:
+        seed["connection_mode"] = connection_mode
     if os.getenv("INFOFLOW_APP_AGENT_ID", "").strip():
         with contextlib.suppress(ValueError):
             seed["app_agent_id"] = int(os.environ["INFOFLOW_APP_AGENT_ID"].strip())
@@ -375,7 +408,6 @@ def _env_enablement() -> dict | None:
         ("INFOFLOW_FOLLOW_UP_WINDOW", "follow_up_window"),
         ("INFOFLOW_IDLE_SESSION_RESET_SECONDS", "idle_session_reset_seconds"),
         ("INFOFLOW_GROUPS", "groups"),
-        ("INFOFLOW_CONNECTION_MODE", "connection_mode"),
         ("HERMES_STATE_DIR", "state_dir"),
         ("INFOFLOW_FILE_API_HOST", "file_api_host"),
         ("HERMES_INFOFLOW_INBOUND_FILE_DIR", "inbound_file_dir"),
@@ -399,18 +431,22 @@ def _check_requirements() -> bool:
     hermes-agent calls this during gateway start; missing env vars surface
     a clear "platform not configured" message instead of a crash.
     """
-    required = (
+    required = [
         "INFOFLOW_APP_KEY",
         "INFOFLOW_APP_SECRET",
-        "INFOFLOW_CHECK_TOKEN",
-        "INFOFLOW_ENCODING_AES_KEY",
-    )
+    ]
+    mode = _normalize_connection_mode(os.getenv("INFOFLOW_CONNECTION_MODE", ""))
+    if mode == "webhook":
+        required.extend(("INFOFLOW_CHECK_TOKEN", "INFOFLOW_ENCODING_AES_KEY"))
     return all(os.getenv(name) for name in required)
 
 
 def _validate_config(config: Any) -> bool:
     settings = _read_account_settings(config)
-    for key in ("api_host", "app_key", "app_secret", "check_token", "encoding_aes_key"):
+    mode = str(settings.get("connection_mode") or DEFAULT_CONNECTION_MODE)
+    if mode not in SUPPORTED_CONNECTION_MODES:
+        return False
+    for key in ("api_host",) + _mode_required_settings(mode):
         if not settings.get(key):
             return False
     return True
@@ -430,6 +466,8 @@ def _interactive_setup() -> None:  # pragma: no cover - manual flow
         "Set these env vars (or hermes config set):\n"
         "  INFOFLOW_APP_KEY=<your appKey>\n"
         "  INFOFLOW_APP_SECRET=<your appSecret>\n"
+        "  INFOFLOW_CONNECTION_MODE=webhook|websocket  # default: webhook\n"
+        "Webhook mode also requires:\n"
         "  INFOFLOW_CHECK_TOKEN=<your checkToken>\n"
         "  INFOFLOW_ENCODING_AES_KEY=<your EncodingAESKey>\n"
         "Optional: INFOFLOW_API_HOST=https://api.im.baidu.com, "

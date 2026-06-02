@@ -40,7 +40,7 @@ kind: platform
 version: 2026.5.26
 description: >
   Baidu Infoflow (如流) channel plugin for Hermes Agent.
-  Receives messages via webhook (AES-ECB encrypted) and sends via REST API.
+  Receives messages via webhook or websocket and sends via REST API.
 author: chengbo05 <chengbo05@baidu.com>
 
 # ``requires_env`` / ``optional_env`` are surfaced by hermes_cli/config.py's
@@ -52,14 +52,6 @@ author: chengbo05 <chengbo05@baidu.com>
 # ``plugin.yaml``; it is kept for discovery compatibility, not as a complete
 # install path.
 requires_env:
-  - name: INFOFLOW_CHECK_TOKEN
-    description: "Infoflow check token (used for echostr signature verification)"
-    prompt: "Infoflow checkToken"
-    password: true
-  - name: INFOFLOW_ENCODING_AES_KEY
-    description: "Infoflow EncodingAESKey (base64URL-safe, 16/24/32 raw bytes)"
-    prompt: "Infoflow EncodingAESKey"
-    password: true
   - name: INFOFLOW_APP_KEY
     description: "Infoflow app key (token endpoint identity)"
     prompt: "Infoflow appKey"
@@ -70,10 +62,22 @@ requires_env:
     password: true
 
 optional_env:
+  - name: INFOFLOW_CONNECTION_MODE
+    description: "Inbound receive transport: webhook or websocket (default webhook)"
+    prompt: "Connection mode (webhook/websocket)"
+    password: false
   - name: INFOFLOW_API_HOST
     description: "Infoflow API host root (default https://api.im.baidu.com)"
     prompt: "Infoflow API host (default https://api.im.baidu.com)"
     password: false
+  - name: INFOFLOW_CHECK_TOKEN
+    description: "Infoflow check token; required only in webhook mode for echostr signature verification"
+    prompt: "Infoflow checkToken (webhook mode)"
+    password: true
+  - name: INFOFLOW_ENCODING_AES_KEY
+    description: "Infoflow EncodingAESKey; required only in webhook mode (base64URL-safe, 16/24/32 raw bytes)"
+    prompt: "Infoflow EncodingAESKey (webhook mode)"
+    password: true
 
   - name: INFOFLOW_ADMIN_USER
     description: "Admin userid list, comma-separated — only these users have full access to sensitive tools"

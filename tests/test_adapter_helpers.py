@@ -39,6 +39,7 @@ from hermes_infoflow.settings import (
     _env_enablement,
     _parse_infoflow_target,
     _read_account_settings,
+    _validate_config,
     infoflow_home_channel_from_env,
     parse_infoflow_admin_users,
     parse_infoflow_op_channel,
@@ -300,6 +301,12 @@ def test_read_settings_defaults_api_host_without_env(monkeypatch) -> None:
     assert s["api_host"] == DEFAULT_API_HOST
 
 
+def test_read_settings_connection_mode_accepts_config_alias(monkeypatch) -> None:
+    monkeypatch.delenv("INFOFLOW_CONNECTION_MODE", raising=False)
+    s = _read_account_settings(_cfg({"connectionMode": " WebSocket "}))
+    assert s["connection_mode"] == "websocket"
+
+
 def test_read_settings_defaults_idle_session_reset_seconds(monkeypatch) -> None:
     monkeypatch.delenv("INFOFLOW_IDLE_SESSION_RESET_SECONDS", raising=False)
     s = _read_account_settings(_cfg())
@@ -344,6 +351,7 @@ def test_read_settings_idle_session_reset_seconds_invalid_uses_default(monkeypat
 
 
 def test_env_enablement_uses_default_api_host(monkeypatch) -> None:
+    monkeypatch.delenv("INFOFLOW_CONNECTION_MODE", raising=False)
     monkeypatch.delenv("INFOFLOW_API_HOST", raising=False)
     monkeypatch.setenv("INFOFLOW_APP_KEY", "k")
     monkeypatch.setenv("INFOFLOW_APP_SECRET", "s")
@@ -354,6 +362,23 @@ def test_env_enablement_uses_default_api_host(monkeypatch) -> None:
 
     assert seed is not None
     assert seed["api_host"] == DEFAULT_API_HOST
+
+
+def test_env_enablement_websocket_requires_only_app_credentials(monkeypatch) -> None:
+    monkeypatch.setenv("INFOFLOW_CONNECTION_MODE", " WebSocket ")
+    monkeypatch.setenv("INFOFLOW_APP_KEY", "k")
+    monkeypatch.setenv("INFOFLOW_APP_SECRET", "s")
+    monkeypatch.delenv("INFOFLOW_CHECK_TOKEN", raising=False)
+    monkeypatch.delenv("INFOFLOW_ENCODING_AES_KEY", raising=False)
+
+    seed = _env_enablement()
+
+    assert seed is not None
+    assert seed["connection_mode"] == "websocket"
+    assert seed["app_key"] == "k"
+    assert seed["app_secret"] == "s"
+    assert "check_token" not in seed
+    assert "encoding_aes_key" not in seed
 
 
 def test_env_enablement_includes_idle_session_reset_seconds(monkeypatch) -> None:
@@ -454,12 +479,63 @@ def test_infoflow_home_channel_falls_back_to_legacy_home(monkeypatch, caplog) ->
 
 
 def test_requirements_do_not_require_api_host(monkeypatch) -> None:
+    monkeypatch.delenv("INFOFLOW_CONNECTION_MODE", raising=False)
     monkeypatch.delenv("INFOFLOW_API_HOST", raising=False)
     monkeypatch.setenv("INFOFLOW_APP_KEY", "k")
     monkeypatch.setenv("INFOFLOW_APP_SECRET", "s")
     monkeypatch.setenv("INFOFLOW_CHECK_TOKEN", "tok")
     monkeypatch.setenv("INFOFLOW_ENCODING_AES_KEY", "aes")
     assert _check_requirements() is True
+
+
+def test_requirements_webhook_still_requires_webhook_credentials(monkeypatch) -> None:
+    monkeypatch.delenv("INFOFLOW_CONNECTION_MODE", raising=False)
+    monkeypatch.setenv("INFOFLOW_APP_KEY", "k")
+    monkeypatch.setenv("INFOFLOW_APP_SECRET", "s")
+    monkeypatch.delenv("INFOFLOW_CHECK_TOKEN", raising=False)
+    monkeypatch.delenv("INFOFLOW_ENCODING_AES_KEY", raising=False)
+    assert _check_requirements() is False
+
+
+def test_requirements_websocket_requires_only_app_credentials(monkeypatch) -> None:
+    monkeypatch.setenv("INFOFLOW_CONNECTION_MODE", "websocket")
+    monkeypatch.setenv("INFOFLOW_APP_KEY", "k")
+    monkeypatch.setenv("INFOFLOW_APP_SECRET", "s")
+    monkeypatch.delenv("INFOFLOW_CHECK_TOKEN", raising=False)
+    monkeypatch.delenv("INFOFLOW_ENCODING_AES_KEY", raising=False)
+    assert _check_requirements() is True
+
+
+def test_validate_config_is_mode_aware(monkeypatch) -> None:
+    for key in (
+        "INFOFLOW_CONNECTION_MODE",
+        "INFOFLOW_API_HOST",
+        "INFOFLOW_APP_KEY",
+        "INFOFLOW_APP_SECRET",
+        "INFOFLOW_CHECK_TOKEN",
+        "INFOFLOW_ENCODING_AES_KEY",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    assert _validate_config(
+        _cfg(
+            {
+                "connection_mode": "websocket",
+                "api_host": "https://api.example.com",
+                "app_key": "k",
+                "app_secret": "s",
+            }
+        )
+    )
+    assert not _validate_config(
+        _cfg(
+            {
+                "connection_mode": "webhook",
+                "api_host": "https://api.example.com",
+                "app_key": "k",
+                "app_secret": "s",
+            }
+        )
+    )
 
 
 def test_read_settings_parses_single_watch_mention_from_env(monkeypatch) -> None:

@@ -43,13 +43,14 @@ from .crypto import InfoflowCryptoError, decrypt_message, verify_echostr_signatu
 # Regex matches IDs with 16 or more digits — anything shorter is safe to
 # leave as a Python int. The capture groups are (field_name, digits).
 _ID_FIELD_RE = re.compile(
-    r'"(messageid|msgid|MsgId|msgkey|msgseqid|fromid|msgid2|MsgId2)"\s*:\s*(\d{16,})'
+    r'"(messageid|clientmsgid|msgid|MsgId|msgkey|msgseqid|fromid|msgid2|MsgId2)"\s*:\s*(\d{16,})'
 )
 
 # Field names we patch through ``patch_precise_ids``. Listed here for
 # documentation; the regex is the authoritative source.
 ID_FIELDS = (
     "messageid",
+    "clientmsgid",
     "msgid",
     "MsgId",
     "msgkey",
@@ -203,6 +204,30 @@ class ParsedWebhook:
     # a full audit trail.
     decoded_payload: str = ""
     diagnostic_reason: str = ""
+
+
+@dataclass
+class ParsedWebSocket:
+    """Result of parsing one websocket data-frame payload.
+
+    ``kind`` is intentionally separate from :class:`ParsedWebhook` because ACK
+    policy is transport-specific:
+
+    * ``"message"`` → dispatch ``inbound`` and ACK the frame.
+    * ``"ignored"`` → ACK the valid frame but do not dispatch.
+    * ``"invalid"`` → do not ACK; Infoflow may retry malformed/truncated data.
+
+    ``transport_*`` fields are websocket-only metadata used before dispatch.
+    They must not be promoted into ``InboundMessage.message_id`` because
+    Infoflow ``clientmsgid`` is only a transport duplicate key.
+    """
+
+    kind: str
+    inbound: InboundMessage | None = None
+    decoded_payload: str = ""
+    diagnostic_reason: str = ""
+    transport_dedup_key: str = ""
+    transport_seen_kind: str = "plain"
 
 
 def _record_ignore_reason(reason_out: list[str] | None, reason: str) -> None:
@@ -708,7 +733,12 @@ def build_private_inbound(
     raw_create_time = msg_data.get("CreateTime", msg_data.get("createtime"))
     if raw_create_time is not None:
         try:
-            timestamp_ms = int(raw_create_time) * 1000
+            raw_timestamp = int(raw_create_time)
+            timestamp_ms = (
+                raw_timestamp
+                if raw_timestamp > 10_000_000_000
+                else raw_timestamp * 1000
+            )
         except (TypeError, ValueError):
             timestamp_ms = int(time.time() * 1000)
     else:
@@ -845,11 +875,19 @@ def build_group_inbound(
 
     raw_text, has_structural_body, image_urls = _extract_body_parts(body_items)
 
-    was_mentioned, discovered_robot_id = _check_bot_mentioned(
+    body_was_mentioned, discovered_robot_id = _check_bot_mentioned(
         body_items,
         robot_name=account.robot_name,
         robot_id=account.robot_id,
     )
+    explicit_was_mentioned = coerce_bool(
+        first_present(msg_data, "wasMentioned", "was_mentioned", "WasMentioned")
+    )
+    was_mentioned = bool(explicit_was_mentioned or body_was_mentioned)
+    if explicit_was_mentioned and not discovered_robot_id and not account.robot_id:
+        robot_ids = [item.robotid for item in body_items if item.type == "AT" and item.robotid]
+        if len(robot_ids) == 1:
+            discovered_robot_id = robot_ids[0]
     event_type = _stringify(msg_data.get("eventtype"))
     fromid_str = _stringify(msg_data.get("fromid"))
     files = _group_files_from_body_items(
@@ -964,7 +1002,503 @@ def build_group_inbound(
 
 
 # ---------------------------------------------------------------------------
-# Public entry point
+# WebSocket payload normalization
+# ---------------------------------------------------------------------------
+
+
+def _ws_as_dict(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _ws_as_list(value: Any) -> list[Any]:
+    return list(value) if isinstance(value, list) else []
+
+
+def _first_non_empty(*values: Any) -> Any:
+    for value in values:
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _first_present_ws(*mappings: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for mapping in mappings:
+        if not isinstance(mapping, dict):
+            continue
+        value = first_present(mapping, *keys, default=None)
+        if value is not None:
+            return value
+    return None
+
+
+def _websocket_payload_roots(
+    data: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+    payload = _ws_as_dict(data.get("raw")) or data
+    original = _ws_as_dict(payload.get("originalMessage")) or payload
+    message = _ws_as_dict(payload.get("message")) or _ws_as_dict(original.get("message"))
+    header = _ws_as_dict(message.get("header")) or _ws_as_dict(original.get("header"))
+    return payload, original, message, header
+
+
+def _is_websocket_group_payload(data: dict[str, Any]) -> bool:
+    payload, original, message, header = _websocket_payload_roots(data)
+    if _first_non_empty(
+        payload.get("groupid"),
+        payload.get("groupId"),
+        original.get("groupid"),
+        original.get("groupId"),
+    ) is not None:
+        return True
+    if not message:
+        return False
+    if _first_non_empty(header.get("groupid"), header.get("groupId")) is not None:
+        return True
+    return str(header.get("totype") or "").upper() == "GROUP"
+
+
+def _websocket_explicit_was_mentioned(
+    data: dict[str, Any],
+    payload: dict[str, Any],
+    original: dict[str, Any],
+) -> bool:
+    marker = _first_present_ws(
+        payload,
+        original,
+        data,
+        keys=("wasMentioned", "was_mentioned", "WasMentioned"),
+    )
+    return coerce_bool(marker)
+
+
+def _normalize_websocket_group_payload(
+    data: dict[str, Any],
+    *,
+    account: AccountConfig,
+) -> tuple[dict[str, Any], str, str]:
+    payload, original, message, header = _websocket_payload_roots(data)
+    raw_event_type_value = _first_non_empty(
+        payload.get("eventtype"),
+        payload.get("eventType"),
+        original.get("eventtype"),
+        original.get("eventType"),
+        data.get("eventtype"),
+        data.get("eventType"),
+    )
+    raw_event_type = (
+        str(raw_event_type_value).upper()
+        if raw_event_type_value not in (None, "")
+        else ""
+    )
+    body_items = (
+        _ws_as_list(message.get("body"))
+        or _ws_as_list(original.get("body"))
+        or _ws_as_list(payload.get("body"))
+        or _ws_as_list(data.get("body"))
+    )
+    content = _first_non_empty(
+        data.get("content"),
+        payload.get("content"),
+        original.get("content"),
+    )
+    if not body_items and content is not None:
+        body_items = [{"type": "TEXT", "content": str(content)}]
+
+    coerced_body_items = [
+        _coerce_body_item(item) for item in body_items if isinstance(item, dict)
+    ]
+    body_was_mentioned, _discovered_robot_id = _check_bot_mentioned(
+        coerced_body_items,
+        robot_name=account.robot_name,
+        robot_id=account.robot_id,
+    )
+    is_mention_event = (
+        raw_event_type == "MESSAGE_RECEIVE"
+        or _websocket_explicit_was_mentioned(data, payload, original)
+        or body_was_mentioned
+    )
+    group_id = _first_non_empty(
+        payload.get("groupid"),
+        payload.get("groupId"),
+        data.get("groupid"),
+        data.get("groupId"),
+        original.get("groupid"),
+        original.get("groupId"),
+        header.get("groupid"),
+        header.get("groupId"),
+        header.get("toid"),
+    )
+    clientmsgid = _first_non_empty(
+        header.get("clientmsgid"),
+        header.get("clientMsgId"),
+        payload.get("clientmsgid"),
+        payload.get("clientMsgId"),
+        original.get("clientmsgid"),
+        original.get("clientMsgId"),
+        data.get("clientmsgid"),
+        data.get("clientMsgId"),
+    )
+    messageid = _first_non_empty(
+        header.get("messageid"),
+        header.get("msgid"),
+        payload.get("MsgId"),
+        payload.get("msgid"),
+        payload.get("msgId"),
+        original.get("MsgId"),
+        original.get("msgid"),
+        original.get("msgId"),
+        data.get("MsgId"),
+        data.get("msgid"),
+        data.get("msgId"),
+    )
+    msg_data = {
+        "eventtype": raw_event_type,
+        "groupid": group_id,
+        "fromid": _first_non_empty(
+            payload.get("fromid"),
+            payload.get("fromId"),
+            original.get("fromid"),
+            original.get("fromId"),
+            data.get("fromid"),
+            data.get("fromId"),
+            header.get("fromid"),
+        ),
+        "msgid2": _first_non_empty(
+            payload.get("msgid2"),
+            payload.get("msgId2"),
+            original.get("msgid2"),
+            original.get("msgId2"),
+            data.get("msgid2"),
+            data.get("msgId2"),
+        ),
+        "wasMentioned": is_mention_event,
+        "message": {
+            "header": {
+                "fromuserid": _first_non_empty(
+                    header.get("fromuserid"),
+                    header.get("fromUserId"),
+                    payload.get("fromUserId"),
+                    payload.get("fromuserid"),
+                    original.get("fromUserId"),
+                    original.get("fromuserid"),
+                    data.get("fromUserId"),
+                    data.get("fromuserid"),
+                    "",
+                ),
+                "toid": _first_non_empty(header.get("toid"), group_id),
+                "totype": _first_non_empty(header.get("totype"), "GROUP"),
+                "msgtype": _first_non_empty(
+                    header.get("msgtype"),
+                    header.get("msgType"),
+                    payload.get("msgType"),
+                    original.get("msgType"),
+                    data.get("msgType"),
+                    "text",
+                ),
+                "messageid": messageid,
+                "clientmsgid": clientmsgid,
+                "msgseqid": _first_non_empty(
+                    header.get("msgseqid"),
+                    payload.get("msgseqid"),
+                    original.get("msgseqid"),
+                    data.get("msgseqid"),
+                ),
+                "servertime": _first_non_empty(
+                    header.get("servertime"),
+                    payload.get("time"),
+                    original.get("time"),
+                    data.get("time"),
+                ),
+                "clienttime": header.get("clienttime"),
+                "at": header.get("at") or {"atrobotids": []},
+                "username": _first_non_empty(
+                    header.get("username"),
+                    header.get("nickname"),
+                    payload.get("username"),
+                    original.get("username"),
+                    data.get("username"),
+                ),
+            },
+            "body": body_items,
+        },
+        "_rawJson": _first_non_empty(
+            payload.get("_rawJson"),
+            original.get("_rawJson"),
+            data.get("_rawJson"),
+        ),
+    }
+    transport_key = _stringify(clientmsgid or messageid)
+    transport_kind = "mention" if is_mention_event else "forward"
+    return msg_data, transport_key, transport_kind
+
+
+def _normalize_websocket_private_payload(data: dict[str, Any]) -> dict[str, Any]:
+    payload, original, _message, _header = _websocket_payload_roots(data)
+    return {
+        "FromUserId": _first_non_empty(
+            payload.get("FromUserId"),
+            payload.get("fromUserId"),
+            data.get("fromUserId"),
+            original.get("FromUserId"),
+            original.get("fromUserId"),
+            "",
+        ),
+        "FromUserName": _first_non_empty(
+            payload.get("FromUserName"),
+            payload.get("fromUserName"),
+            data.get("fromUserName"),
+            original.get("FromUserName"),
+            original.get("fromUserName"),
+        ),
+        "Content": _first_non_empty(
+            payload.get("Content"),
+            payload.get("content"),
+            data.get("content"),
+            original.get("Content"),
+            original.get("content"),
+            "",
+        ),
+        "MsgType": _first_non_empty(
+            payload.get("MsgType"),
+            payload.get("msgType"),
+            data.get("msgType"),
+            original.get("MsgType"),
+            original.get("msgType"),
+            "text",
+        ),
+        "CreateTime": _first_non_empty(
+            payload.get("CreateTime"),
+            payload.get("createTime"),
+            data.get("createTime"),
+            original.get("CreateTime"),
+            original.get("createTime"),
+            str(int(time.time())),
+        ),
+        "PicUrl": _first_non_empty(
+            payload.get("PicUrl"),
+            payload.get("picUrl"),
+            data.get("picUrl"),
+            original.get("PicUrl"),
+            original.get("picUrl"),
+            "",
+        ),
+        "VoiceUrl": _first_non_empty(
+            payload.get("VoiceUrl"),
+            payload.get("voiceUrl"),
+            data.get("voiceUrl"),
+            original.get("VoiceUrl"),
+            original.get("voiceUrl"),
+            "",
+        ),
+        "FromPlatform": _first_non_empty(
+            payload.get("FromPlatform"),
+            payload.get("fromPlatform"),
+            data.get("fromPlatform"),
+            original.get("FromPlatform"),
+            original.get("fromPlatform"),
+            "",
+        ),
+        "agentId": _first_non_empty(
+            payload.get("agentId"),
+            data.get("agentId"),
+            original.get("agentId"),
+            "",
+        ),
+        "OpenCode": _first_non_empty(
+            payload.get("OpenCode"),
+            payload.get("openCode"),
+            data.get("openCode"),
+            original.get("OpenCode"),
+            original.get("openCode"),
+            "",
+        ),
+        "MsgId": _first_non_empty(
+            payload.get("MsgId"),
+            payload.get("msgId"),
+            data.get("MsgId"),
+            data.get("msgId"),
+            original.get("MsgId"),
+            original.get("msgId"),
+        ),
+        "MsgId2": _first_non_empty(
+            payload.get("MsgId2"),
+            payload.get("msgId2"),
+            payload.get("msgid2"),
+            data.get("MsgId2"),
+            data.get("msgId2"),
+            data.get("msgid2"),
+            original.get("MsgId2"),
+            original.get("msgId2"),
+            original.get("msgid2"),
+        ),
+        "FromId": _first_non_empty(
+            payload.get("FromId"),
+            payload.get("fromid"),
+            payload.get("fromId"),
+            data.get("FromId"),
+            data.get("fromid"),
+            data.get("fromId"),
+            original.get("FromId"),
+            original.get("fromid"),
+            original.get("fromId"),
+        ),
+        "Reply": _first_non_empty(
+            payload.get("Reply"),
+            payload.get("reply"),
+            data.get("Reply"),
+            data.get("reply"),
+            original.get("Reply"),
+            original.get("reply"),
+        ),
+        "FileId": _first_non_empty(
+            payload.get("FileId"),
+            payload.get("fileId"),
+            data.get("fileId"),
+            original.get("FileId"),
+            original.get("fileId"),
+        ),
+        "Name": _first_non_empty(
+            payload.get("Name"),
+            payload.get("name"),
+            data.get("name"),
+            original.get("Name"),
+            original.get("name"),
+        ),
+        "FileSize": _first_non_empty(
+            payload.get("FileSize"),
+            payload.get("fileSize"),
+            data.get("fileSize"),
+            original.get("FileSize"),
+            original.get("fileSize"),
+        ),
+        "FileType": _first_non_empty(
+            payload.get("FileType"),
+            payload.get("fileType"),
+            data.get("fileType"),
+            original.get("FileType"),
+            original.get("fileType"),
+        ),
+        "CardType": _first_non_empty(
+            payload.get("CardType"),
+            payload.get("cardType"),
+            data.get("CardType"),
+            data.get("cardType"),
+            original.get("CardType"),
+            original.get("cardType"),
+        ),
+        "Title": _first_non_empty(
+            payload.get("Title"),
+            payload.get("title"),
+            data.get("Title"),
+            data.get("title"),
+            original.get("Title"),
+            original.get("title"),
+        ),
+        "_rawJson": _first_non_empty(
+            payload.get("_rawJson"),
+            original.get("_rawJson"),
+            data.get("_rawJson"),
+        ),
+    }
+
+
+def parse_websocket_payload_text(
+    raw_text: str,
+    *,
+    account: AccountConfig,
+    sent_message_ids: set[str] | None = None,
+) -> ParsedWebSocket:
+    """Parse one websocket data-frame JSON payload into an inbound message.
+
+    WebSocket receives plaintext JSON, unlike webhook which receives encrypted
+    HTTP bodies. After the transport-specific wrapper normalization here, both
+    paths call the same ``build_*_inbound`` helpers so common field parsing and
+    message semantics stay in one place.
+    """
+    if not raw_text or not raw_text.strip():
+        return ParsedWebSocket(
+            kind="invalid",
+            decoded_payload=raw_text or "",
+            diagnostic_reason="empty_payload",
+        )
+    try:
+        parsed = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        return ParsedWebSocket(
+            kind="invalid",
+            decoded_payload=raw_text,
+            diagnostic_reason=f"json_decode_error:{exc}",
+        )
+    if not isinstance(parsed, dict):
+        return ParsedWebSocket(
+            kind="invalid",
+            decoded_payload=raw_text,
+            diagnostic_reason=f"payload_json_not_object:{type(parsed).__name__}",
+        )
+    patch_precise_ids(raw_text, parsed)
+    parsed["_rawJson"] = raw_text
+
+    if parsed.get("echostr"):
+        return ParsedWebSocket(
+            kind="ignored",
+            decoded_payload=raw_text,
+            diagnostic_reason="echostr_challenge",
+        )
+
+    ignore_reasons: list[str] = []
+    if _is_websocket_group_payload(parsed):
+        msg_data, transport_key, transport_kind = _normalize_websocket_group_payload(
+            parsed,
+            account=account,
+        )
+        inbound = build_group_inbound(
+            msg_data,
+            account=account,
+            sent_message_ids=sent_message_ids,
+            ignore_reasons=ignore_reasons,
+        )
+        if inbound is None:
+            return ParsedWebSocket(
+                kind="ignored",
+                decoded_payload=raw_text,
+                diagnostic_reason=ignore_reasons[0]
+                if ignore_reasons
+                else "build_group_inbound returned None",
+                transport_dedup_key=transport_key,
+                transport_seen_kind=transport_kind,
+            )
+        return ParsedWebSocket(
+            kind="message",
+            inbound=inbound,
+            decoded_payload=raw_text,
+            transport_dedup_key=transport_key,
+            transport_seen_kind=transport_kind,
+        )
+
+    msg_data = _normalize_websocket_private_payload(parsed)
+    inbound = build_private_inbound(
+        msg_data,
+        account=account,
+        sent_message_ids=sent_message_ids,
+        ignore_reasons=ignore_reasons,
+    )
+    if inbound is None:
+        return ParsedWebSocket(
+            kind="ignored",
+            decoded_payload=raw_text,
+            diagnostic_reason=ignore_reasons[0]
+            if ignore_reasons
+            else "build_private_inbound returned None",
+        )
+    return ParsedWebSocket(
+        kind="message",
+        inbound=inbound,
+        decoded_payload=raw_text,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public webhook entry point
 # ---------------------------------------------------------------------------
 
 
@@ -1110,9 +1644,11 @@ __all__ = [
     "InboundMessage",
     "ParsedInboundFile",
     "ParsedWebhook",
+    "ParsedWebSocket",
     "build_group_inbound",
     "build_private_inbound",
     "parse_webhook",
+    "parse_websocket_payload_text",
     "parse_xml_message",
     "patch_precise_ids",
 ]

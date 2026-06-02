@@ -102,6 +102,7 @@ class SentMessageStore:
     # OrderedDict lets us prune both dedup and sent-message membership by TTL
     # and by size in O(1) per drop.
     _expiry: OrderedDict[str, float] = field(default_factory=OrderedDict)
+    _seen_kind: dict[str, str] = field(default_factory=dict)
     _db_initialized: bool = False
     _db_lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -136,6 +137,7 @@ class SentMessageStore:
         if messageid:
             self.dedup_set.add(messageid)
             self.sent_message_ids.add(messageid)
+            self._seen_kind[messageid] = "sent"
             # Drop any prior expiry mapping so it re-inserts at the tail (FIFO).
             self._expiry.pop(messageid, None)
             self._expiry[messageid] = ts + self.ttl_seconds
@@ -143,7 +145,13 @@ class SentMessageStore:
         self._persist(entry)
         return entry
 
-    def mark_seen(self, messageid: str, *, now: float | None = None) -> None:
+    def mark_seen(
+        self,
+        messageid: str,
+        *,
+        kind: str = "plain",
+        now: float | None = None,
+    ) -> None:
         """Mark a foreign message_id as seen so future replays are dropped.
 
         Inbound parser calls this with the dedup key after dispatch so a
@@ -154,6 +162,7 @@ class SentMessageStore:
         ts = now if now is not None else time.time()
         self._sweep(ts)
         self.dedup_set.add(messageid)
+        self._seen_kind[messageid] = kind or "plain"
         self._expiry.pop(messageid, None)
         self._expiry[messageid] = ts + self.ttl_seconds
         self._enforce_max_size()
@@ -165,6 +174,14 @@ class SentMessageStore:
         ts = now if now is not None else time.time()
         self._sweep(ts)
         return messageid in self.dedup_set
+
+    def seen_kind(self, messageid: str, *, now: float | None = None) -> str:
+        """Return the dedup kind recorded for ``messageid`` within the TTL."""
+        if not messageid:
+            return ""
+        ts = now if now is not None else time.time()
+        self._sweep(ts)
+        return self._seen_kind.get(messageid, "")
 
     # ------------------------------------------------------------------
     # Query
@@ -230,6 +247,7 @@ class SentMessageStore:
             self._entries[chat_id] = kept
         self.dedup_set.discard(messageid)
         self.sent_message_ids.discard(messageid)
+        self._seen_kind.pop(messageid, None)
         self._expiry.pop(messageid, None)
         self._db_delete(chat_id, messageid)
 
@@ -253,6 +271,7 @@ class SentMessageStore:
         for mid in to_drop:
             self.dedup_set.discard(mid)
             self.sent_message_ids.discard(mid)
+            self._seen_kind.pop(mid, None)
             self._expiry.pop(mid, None)
 
     def _enforce_max_size(self) -> None:
@@ -263,6 +282,7 @@ class SentMessageStore:
             mid, _ = self._expiry.popitem(last=False)
             self.dedup_set.discard(mid)
             self.sent_message_ids.discard(mid)
+            self._seen_kind.pop(mid, None)
 
     # ----- SQLite backing -----
 

@@ -42,8 +42,6 @@ def test_register_registers_platform_and_tool() -> None:
     # Required env names align with the plugin.yaml manifest.
     required = set(platform["required_env"])
     assert required == {
-        "INFOFLOW_CHECK_TOKEN",
-        "INFOFLOW_ENCODING_AES_KEY",
         "INFOFLOW_APP_KEY",
         "INFOFLOW_APP_SECRET",
     }

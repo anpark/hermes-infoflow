@@ -3095,22 +3095,30 @@ def test_delete_message_group_falls_back_via_context_hint(
 
 
 # ---------------------------------------------------------------------------
-# Fix #15: non-webhook connection mode is rejected at connect time
+# Websocket connection mode
 # ---------------------------------------------------------------------------
 
 
-def test_connect_rejects_websocket_mode(configured_env, monkeypatch) -> None:
+def test_connect_starts_websocket_receiver(configured_env, monkeypatch) -> None:
     monkeypatch.setenv("INFOFLOW_CONNECTION_MODE", "websocket")
+    monkeypatch.delenv("INFOFLOW_CHECK_TOKEN", raising=False)
+    monkeypatch.delenv("INFOFLOW_ENCODING_AES_KEY", raising=False)
     adapter = InfoflowAdapter(_make_config())
+    start = AsyncMock()
+    stop = AsyncMock()
+    monkeypatch.setattr(adapter._websocket_receiver, "start", start)
+    monkeypatch.setattr(adapter._websocket_receiver, "stop", stop)
 
     async def _go():
-        return await adapter.connect()
+        try:
+            return await adapter.connect()
+        finally:
+            await adapter.disconnect()
 
     result = asyncio.run(_go())
-    assert result is False
-    # Adapter must surface a clear fatal error (not just a warning).
-    # The exact attribute name depends on hermes-agent's base class; we just
-    # confirm connect() returned False without spinning up the server.
+    assert result is True
+    start.assert_awaited_once()
+    stop.assert_awaited_once()
     assert adapter._webhook_server.is_running is False
     assert adapter._http_session is None
 

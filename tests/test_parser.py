@@ -126,6 +126,28 @@ def test_private_message_extracts_msgid2(account):
     assert inbound.message_id == "1865798223458853292"
 
 
+def test_private_message_preserves_millisecond_create_time(account):
+    acct, raw_key = account
+    inner = json.dumps(
+        {
+            "FromUserId": "chengbo05",
+            "MsgType": "text",
+            "Content": "hi",
+            "MsgId": "1865798223458853292",
+            "CreateTime": 1_700_000_000_123,
+        }
+    )
+    ct = aes_ecb_encrypt_b64url(inner, raw_key)
+    body = urlencode({"messageJson": json.dumps({"Encrypt": ct})})
+    res = parser.parse_webhook(
+        content_type="application/x-www-form-urlencoded",
+        raw_body=body,
+        account=acct,
+    )
+    assert res.kind == "message"
+    assert res.inbound.timestamp_ms == 1_700_000_000_123
+
+
 def test_private_bot_echo_preserves_fromid_and_sender_agent(account):
     acct, raw_key = account
     acct = replace(acct, robot_id="4105000875", app_agent_id=42)
@@ -461,6 +483,36 @@ def test_group_message_receive_at_all_is_not_direct_bot_mention(account):
     assert inbound.mention_agent_ids == []
 
 
+def test_group_explicit_was_mentioned_discovers_single_robot_id(account):
+    acct, raw_key = account
+    payload = {
+        "eventtype": "ALL_MESSAGE_FORWARD",
+        "wasMentioned": True,
+        "message": {
+            "header": {
+                "fromuserid": "bob",
+                "groupid": 123456,
+                "messageid": "mid-was-mentioned",
+            },
+            "body": [
+                {"type": "AT", "name": "helper", "robotid": "8675309"},
+                {"type": "TEXT", "content": "ping"},
+            ],
+        },
+    }
+    ct = aes_ecb_encrypt_b64url(json.dumps(payload), raw_key)
+    res = parser.parse_webhook(
+        content_type="text/plain",
+        raw_body=ct,
+        account=acct,
+    )
+
+    assert res.kind == "message"
+    inbound = res.inbound
+    assert inbound.was_mentioned is True
+    assert inbound.discovered_robot_id == "8675309"
+
+
 def test_group_message_string_false_at_all_is_not_truthy(account):
     acct, raw_key = account
     payload = {
@@ -728,6 +780,214 @@ def test_group_message_reply_to_current_bot_marked_by_reply_imid(account):
     assert res.kind == "message"
     assert res.inbound.is_reply_to_bot is True
     assert res.inbound.reply_targets[0]["isBotMessage"] is True
+
+
+# ---------------------------------------------------------------------------
+# WebSocket plaintext payloads
+# ---------------------------------------------------------------------------
+
+
+def test_websocket_raw_wrapped_group_payload_parses_like_group(account):
+    acct, _ = account
+    raw_text = json.dumps(
+        {
+            "raw": {
+                "eventtype": "MESSAGE_RECEIVE",
+                "groupid": "42",
+                "fromid": "1744775667",
+                "msgid2": "300015554",
+                "message": {
+                    "header": {
+                        "fromuserid": "alice",
+                        "groupid": "42",
+                        "messageid": "real-mid",
+                        "clientmsgid": "client-mid",
+                    },
+                    "body": [{"type": "TEXT", "content": "hello"}],
+                },
+            }
+        },
+        ensure_ascii=False,
+    )
+
+    res = parser.parse_websocket_payload_text(raw_text, account=acct)
+
+    assert res.kind == "message"
+    assert res.transport_dedup_key == "client-mid"
+    assert res.transport_seen_kind == "mention"
+    inbound = res.inbound
+    assert inbound.chat_type == "group"
+    assert inbound.message_id == "real-mid"
+    assert inbound.group_id == "42"
+    assert inbound.text == "hello"
+    assert inbound.msgid2 == "300015554"
+    assert inbound.event_type == "MESSAGE_RECEIVE"
+    assert inbound.was_mentioned is True
+    assert inbound.raw_msgdata["_rawJson"] == raw_text
+
+
+def test_websocket_clientmsgid_is_transport_only_not_message_id(account):
+    acct, _ = account
+    raw_text = json.dumps(
+        {
+            "eventtype": "ALL_MESSAGE_FORWARD",
+            "groupid": "42",
+            "message": {
+                "header": {
+                    "fromuserid": "alice",
+                    "groupid": "42",
+                    "messageid": "real-mid",
+                    "clientmsgid": "client-mid",
+                },
+                "body": [{"type": "TEXT", "content": "ambient"}],
+            },
+        },
+        ensure_ascii=False,
+    )
+
+    res = parser.parse_websocket_payload_text(raw_text, account=acct)
+
+    assert res.kind == "message"
+    assert res.inbound.message_id == "real-mid"
+    assert res.inbound.dedupe_key() == "real-mid"
+    assert res.transport_dedup_key == "client-mid"
+    assert res.transport_seen_kind == "forward"
+
+
+def test_websocket_forward_body_mention_is_transport_mention(account):
+    acct, _ = account
+    raw_text = json.dumps(
+        {
+            "eventtype": "ALL_MESSAGE_FORWARD",
+            "groupid": "42",
+            "message": {
+                "header": {
+                    "fromuserid": "bob",
+                    "groupid": "42",
+                    "messageid": "forward-mid",
+                    "clientmsgid": "client-forward",
+                },
+                "body": [
+                    {"type": "AT", "name": "hermes", "robotid": "8675309"},
+                    {"type": "TEXT", "content": "ping"},
+                ],
+            },
+        },
+        ensure_ascii=False,
+    )
+
+    res = parser.parse_websocket_payload_text(raw_text, account=acct)
+
+    assert res.kind == "message"
+    assert res.transport_dedup_key == "client-forward"
+    assert res.transport_seen_kind == "mention"
+    assert res.inbound.event_type == "ALL_MESSAGE_FORWARD"
+    assert res.inbound.was_mentioned is True
+    assert res.inbound.discovered_robot_id == "8675309"
+
+
+def test_websocket_group_without_eventtype_does_not_default_to_mention(account):
+    acct, _ = account
+    raw_text = json.dumps(
+        {
+            "groupid": "42",
+            "message": {
+                "header": {
+                    "fromuserid": "bob",
+                    "groupid": "42",
+                    "messageid": "missing-event-mid",
+                    "clientmsgid": "missing-event-client",
+                },
+                "body": [{"type": "TEXT", "content": "ambient"}],
+            },
+        },
+        ensure_ascii=False,
+    )
+
+    res = parser.parse_websocket_payload_text(raw_text, account=acct)
+
+    assert res.kind == "message"
+    assert res.transport_dedup_key == "missing-event-client"
+    assert res.transport_seen_kind == "forward"
+    assert res.inbound.event_type == ""
+    assert res.inbound.was_mentioned is False
+
+
+def test_websocket_group_without_eventtype_body_mention_is_mention(account):
+    acct, _ = account
+    raw_text = json.dumps(
+        {
+            "groupid": "42",
+            "message": {
+                "header": {
+                    "fromuserid": "bob",
+                    "groupid": "42",
+                    "messageid": "missing-event-at-mid",
+                    "clientmsgid": "missing-event-at-client",
+                },
+                "body": [
+                    {"type": "AT", "name": "hermes", "robotid": "8675309"},
+                    {"type": "TEXT", "content": "ping"},
+                ],
+            },
+        },
+        ensure_ascii=False,
+    )
+
+    res = parser.parse_websocket_payload_text(raw_text, account=acct)
+
+    assert res.kind == "message"
+    assert res.transport_dedup_key == "missing-event-at-client"
+    assert res.transport_seen_kind == "mention"
+    assert res.inbound.event_type == ""
+    assert res.inbound.was_mentioned is True
+    assert res.inbound.discovered_robot_id == "8675309"
+
+
+def test_websocket_private_payload_parses_like_dm(account):
+    acct, _ = account
+    raw_text = json.dumps(
+        {
+            "fromUserId": "alice",
+            "content": "hello dm",
+            "msgType": "text",
+            "msgId": "dm-mid",
+            "createTime": 1_700_000_000,
+        },
+        ensure_ascii=False,
+    )
+
+    res = parser.parse_websocket_payload_text(raw_text, account=acct)
+
+    assert res.kind == "message"
+    assert res.inbound.chat_type == "dm"
+    assert res.inbound.from_user == "alice"
+    assert res.inbound.text == "hello dm"
+    assert res.inbound.message_id == "dm-mid"
+    assert res.inbound.timestamp_ms == 1_700_000_000_000
+
+
+def test_websocket_invalid_payload_is_not_an_ignored_message(account):
+    malformed = parser.parse_websocket_payload_text("{", account=parser.AccountConfig("", ""))
+    non_object = parser.parse_websocket_payload_text("[]", account=parser.AccountConfig("", ""))
+
+    assert malformed.kind == "invalid"
+    assert malformed.diagnostic_reason.startswith("json_decode_error:")
+    assert non_object.kind == "invalid"
+    assert non_object.diagnostic_reason == "payload_json_not_object:list"
+
+
+def test_websocket_valid_but_unusable_payload_is_ignored(account):
+    raw_text = json.dumps({"content": "missing sender"})
+
+    res = parser.parse_websocket_payload_text(
+        raw_text,
+        account=parser.AccountConfig("", ""),
+    )
+
+    assert res.kind == "ignored"
+    assert res.decoded_payload == raw_text
+    assert res.diagnostic_reason.startswith("private_missing_from_user")
 
 
 def test_unsupported_content_type(account):

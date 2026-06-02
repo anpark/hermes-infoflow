@@ -24,9 +24,18 @@ def test_mark_seen_marks_foreign_id_without_sent_membership() -> None:
     shared: set[str] = set()
     sent: set[str] = set()
     store = SentMessageStore(dedup_set=shared, sent_message_ids=sent)
-    store.mark_seen("inbound-42")
+    store.mark_seen("inbound-42", kind="forward")
     assert "inbound-42" in shared
     assert "inbound-42" not in sent
+    assert store.seen_kind("inbound-42") == "forward"
+    store.mark_seen("inbound-42", kind="mention")
+    assert store.seen_kind("inbound-42") == "mention"
+
+
+def test_record_marks_seen_kind_as_sent() -> None:
+    store = SentMessageStore()
+    store.record("group:1", "mid-1")
+    assert store.seen_kind("mid-1") == "sent"
 
 
 def test_recent_returns_newest_first() -> None:
@@ -55,6 +64,7 @@ def test_ttl_expiry_evicts_old_dedup_entries() -> None:
     store.mark_seen("m2", now=1_100.0)
     assert "m1" not in shared
     assert "m1" not in sent
+    assert store.seen_kind("m1", now=1_100.0) == ""
     assert "m2" in shared
     assert "m2" not in sent
 

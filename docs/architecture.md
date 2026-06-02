@@ -18,7 +18,7 @@
 │    ↕  ServerAPI / IncomingMessage / SentResult            │
 │  serverapi.py  (如流 API 适配：统一字段 ↔ 凌乱线格式)      │
 │    ↕↕                                                    │
-│  webhook.py    websocket.py  (传输层，仅 webhook 实现)     │
+│  webhook.py    websocket.py  (入站传输层)                  │
 └─────────────────────────────────────────────────────────┘
 
 辅助模块：
@@ -41,21 +41,22 @@
 
 | 模块 | 职责（仅以下，不越界） |
 |------|----------------------|
-| `adapter.py` | 解析 Hermes config → settings、创建 ServerAPI + Bot 实例、转换 IncomingMessage ↔ MessageEvent、转换 Hermes send() 调用 ↔ bot.send_message()、运行 HTTP webhook 服务器 |
+| `adapter.py` | 解析 Hermes config → settings、创建 ServerAPI + Bot 实例、转换 IncomingMessage ↔ MessageEvent、转换 Hermes send() 调用 ↔ bot.send_message()、按连接模式启动入站传输 |
 | `bot.py` | 策略判定（DISPATCH/DROP/RECORD）、去重、群消息存储管理、follow-up 状态追踪、NO_REPLY sentinel 判定 |
 | `serverapi.py` | 如流 API 适配（统一字段 ↔ 线格式）、HTTP 请求封装 |
 | `parser.py` | 文本解析、@mention 提取、消息类型判断 |
 | `policy.py` | 策略引擎（纯判定逻辑 + prompt 模板，无副作用） |
 | `webhook.py` | AES-ECB 解密、HTTP handler 注册 |
+| `websocket.py` | WebSocket endpoint 获取、Frame 编解码、ACK、心跳、重连、入站 payload 标准化 |
 
 ---
 
 ## 2. 消息生命周期（完整 12 步）
 
 ```
-如流 Webhook POST
+如流 Webhook POST / WebSocket DATA frame
   │
-  ▼ Step 1: [iflow:raw]           adapter._handle_webhook() — AES 解密 + 原始 payload 日志
+  ▼ Step 1: [iflow:raw]           webhook/websocket — 解密或解帧 + 原始 payload 日志
   │
   ▼ Step 2: [iflow:event]          parser.parse_inbound() → IncomingMessage
   │

@@ -10,7 +10,7 @@ Baidu Infoflow（如流）Channel 插件 for [Hermes Agent](https://github.com/n
 
 ## 功能（balanced scope · v0.2）
 
-- ✅ Webhook 接入 + AES-ECB 解密 + echostr 签名校验
+- ✅ Webhook 接入 + AES-ECB 解密 + echostr 签名校验；WebSocket 接入
 - ✅ 群聊 / 私聊 文本 & Markdown 双向（含分块）
 - ✅ 图片入站（含 `Bearer-` 鉴权 fallback 下载）+ 出站（含 path-traversal 校验）
 - ✅ @-mention 检测：`require_mention` + 五种 `reply_mode`（`ignore` / `record` / `mention-only` / `mention-and-watch` / `proactive`）+ `watch_mentions` + `watch_regex`
@@ -21,7 +21,6 @@ Baidu Infoflow（如流）Channel 插件 for [Hermes Agent](https://github.com/n
 - ✅ cron `deliver=infoflow` 投递（home channel）+ 独立进程发送（`standalone_sender_fn`）
 - ⚠️ 已知限制（计划在后续版本支持）：
   - 单账号（不支持 OpenClaw 的 `accounts.*` 子配置）
-  - WebSocket 接入模式未实现（仅 webhook）
 
 ---
 
@@ -191,12 +190,17 @@ bash scripts/deploy.sh --port 9000 # 指定 webhook 端口并写入 ~/.hermes/.e
 
 任一安装路径完成后，下面这些环境变量都需要在 hermes 运行的 shell / `~/.hermes/.env` 里设置。
 
-### 必需
+### 必需（所有连接模式）
 
 | 变量 | 含义 |
 |------|------|
 | `INFOFLOW_APP_KEY` | 应用 appKey |
 | `INFOFLOW_APP_SECRET` | 应用 appSecret（原始；插件会自动 MD5 lowercase hex） |
+
+### Webhook 模式额外必需
+
+| 变量 | 含义 |
+|------|------|
 | `INFOFLOW_CHECK_TOKEN` | echostr 签名校验用 token |
 | `INFOFLOW_ENCODING_AES_KEY` | base64-URL-safe 的 AES 密钥（16/24/32 字节明文，对应 AES-128/192/256） |
 
@@ -204,13 +208,14 @@ bash scripts/deploy.sh --port 9000 # 指定 webhook 端口并写入 ~/.hermes/.e
 
 | 变量 | 默认 | 含义 |
 |------|------|------|
+| `INFOFLOW_CONNECTION_MODE` | `webhook` | 入站连接模式：`webhook` 或 `websocket` |
 | `INFOFLOW_API_HOST` | `https://api.im.baidu.com` | 如流 API 根地址 |
 | `INFOFLOW_APP_AGENT_ID` | 无 | 私聊撤回必须；如流后台「应用 ID」 |
 | `INFOFLOW_ROBOT_NAME` | 无 | 机器人显示名，用于 @-mention 识别 |
 | `INFOFLOW_ROBOT_ID` | 无 | 如流 IM robot_id / imid；通常自动发现并持久化，可手动提供 |
-| `INFOFLOW_PORT` | `26521` | Webhook 监听端口 |
-| `INFOFLOW_HOST` | `0.0.0.0` | Webhook 监听地址 |
-| `INFOFLOW_WEBHOOK_PATH` | `/webhook/infoflow` | Webhook 路径 |
+| `INFOFLOW_PORT` | `26521` | Webhook 模式监听端口 |
+| `INFOFLOW_HOST` | `0.0.0.0` | Webhook 模式监听地址 |
+| `INFOFLOW_WEBHOOK_PATH` | `/webhook/infoflow` | Webhook 模式路径 |
 | `INFOFLOW_OP_CHANNEL` | 无 | 单个运维通知通道，同时作为 Hermes home channel / cron `deliver=infoflow` 缺省目标；如 `bob`、`group:12345` 或纯数字群 ID |
 | `INFOFLOW_REPLY_MODE` | `mention-and-watch` | `ignore` / `record` / `mention-only` / `mention-and-watch` / `proactive` |
 | `INFOFLOW_REQUIRE_MENTION` | `true` | 群消息是否仅在 @ 时响应 |
