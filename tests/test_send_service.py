@@ -121,6 +121,134 @@ def test_send_service_preview_strips_internal_at_metadata() -> None:
     ]
 
 
+def test_send_service_auto_preview_rebuilds_group_raw_body_with_reply_placeholder() -> None:
+    serverapi = _ServerAPI()
+    raw_json = json.dumps({
+        "fromid": 3003593460,
+        "message": {
+            "body": [
+                {
+                    "type": "replyData",
+                    "content": "quoted alert text",
+                    "sBasemsgId": "OLD",
+                },
+                {"type": "TEXT", "content": "\n"},
+                {"type": "AT", "userid": "chengbo05", "name": "成博"},
+                {"type": "TEXT", "content": " 博哥再看看"},
+            ],
+        },
+    }, ensure_ascii=False)
+    service = InfoflowSendService(
+        serverapi=serverapi,
+        message_store=_Store({
+            "MID": {
+                "content": (
+                    "<Quote message_id:'OLD'>quoted alert text</Quote>\n\n"
+                    "@成博 (user_id:chengbo05) 博哥再看看"
+                ),
+                "raw_json": raw_json,
+            },
+        }),
+    )
+
+    asyncio.run(service.send_group("4507088", message="ok", reply_to="MID"))
+
+    assert serverapi.group_calls[0]["reply_to"] == [
+        {
+            "message_id": "MID",
+            "preview": "[Reply] @成博 博哥再看看",
+            "sender_imid": "3003593460",
+        }
+    ]
+
+
+def test_send_service_auto_preview_preserves_literal_quote_in_user_text() -> None:
+    serverapi = _ServerAPI()
+    literal = "用户正文里手写 <Quote message_id:'1866864758693687627'> 不应删除"
+    raw_json = json.dumps({
+        "message": {
+            "body": [{"type": "TEXT", "content": literal}],
+        },
+    }, ensure_ascii=False)
+    service = InfoflowSendService(
+        serverapi=serverapi,
+        message_store=_Store({
+            "MID": {
+                "content": literal,
+                "raw_json": raw_json,
+            },
+        }),
+    )
+
+    asyncio.run(service.send_group("4507088", message="ok", reply_to="MID"))
+
+    assert serverapi.group_calls[0]["reply_to"] == [
+        {"message_id": "MID", "preview": literal}
+    ]
+
+
+def test_send_service_explicit_leaked_quote_preview_is_rebuilt_from_raw_body() -> None:
+    serverapi = _ServerAPI()
+    raw_json = json.dumps({
+        "message": {
+            "body": [
+                {"type": "replyData", "content": "quoted alert text"},
+                {"type": "TEXT", "content": "继续看下"},
+            ],
+        },
+    }, ensure_ascii=False)
+    service = InfoflowSendService(
+        serverapi=serverapi,
+        message_store=_Store({
+            "MID": {
+                "content": "<Quote message_id:'OLD'>quoted alert text</Quote>\n继续看下",
+                "raw_json": raw_json,
+            },
+        }),
+    )
+
+    asyncio.run(service.send_private(
+        "chengbo05",
+        message="ok",
+        reply_to={
+            "message_id": "MID",
+            "preview": "<Quote message_id:'OLD'>quoted alert text</Quote> 继续看下",
+        },
+    ))
+
+    assert serverapi.private_calls[0]["reply_to"] == [
+        {"message_id": "MID", "preview": "[Reply] 继续看下"}
+    ]
+
+
+def test_send_service_private_raw_reply_preview_uses_reply_placeholder() -> None:
+    serverapi = _ServerAPI()
+    raw_json = json.dumps({
+        "FromId": 1744775667,
+        "Reply": [{"ReplyMsgId": "OLD", "ReplyContent": "quoted private text"}],
+        "Content": "收到",
+    }, ensure_ascii=False)
+    service = InfoflowSendService(
+        serverapi=serverapi,
+        message_store=_Store({
+            "MID": {
+                "content": "<Quote message_id:'OLD'>quoted private text</Quote>\n收到",
+                "raw_json": raw_json,
+            },
+        }),
+    )
+
+    asyncio.run(service.send_private("chengbo05", message="ok", reply_to="MID"))
+
+    assert serverapi.private_calls[0]["reply_to"] == [
+        {
+            "message_id": "MID",
+            "preview": "[Reply] 收到",
+            "sender_imid": "1744775667",
+        }
+    ]
+
+
 def test_send_service_preview_falls_back_to_inbound_context() -> None:
     serverapi = _ServerAPI()
     service = InfoflowSendService(

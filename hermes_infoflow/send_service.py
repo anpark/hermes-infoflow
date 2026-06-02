@@ -20,6 +20,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from .serverapi import ServerAPI
 
 _REPLY_AUTO_PREVIEW_LIMIT = 100
+_REPLY_PLACEHOLDER = "[Reply]"
 _INTERNAL_AT_MARKER_RE = re.compile(
     r"(@[^\s()]+)\s+\((?:agent_id|user_id):[^)]*\)"
 )
@@ -59,6 +60,101 @@ def _json_field(data: Any, *path: str) -> str:
     if current in (None, ""):
         return ""
     return str(current).strip()
+
+
+def _json_message_body(data: Any) -> list[Any]:
+    if not isinstance(data, dict):
+        return []
+    message = data.get("message")
+    if isinstance(message, dict) and isinstance(message.get("body"), list):
+        return list(message["body"])
+    body = data.get("body")
+    if isinstance(body, list):
+        return list(body)
+    return []
+
+
+def _append_preview_part(parts: list[str], text: object) -> None:
+    value = str(text or "").strip()
+    if value:
+        parts.append(value)
+
+
+def _preview_from_raw_body_items(body_items: list[Any]) -> str:
+    parts: list[str] = []
+    saw_reply = False
+    for raw_item in body_items:
+        if not isinstance(raw_item, dict):
+            continue
+        item_type = str(raw_item.get("type") or "").upper()
+        if item_type in {"REPLYDATA", "REPLY"}:
+            saw_reply = True
+            continue
+        if item_type in {"TEXT", "MD"}:
+            _append_preview_part(parts, raw_item.get("content"))
+        elif item_type == "AT":
+            if coerce_bool(raw_item.get("atall") or raw_item.get("at_all")):
+                parts.append("@所有人")
+                continue
+            name = str(raw_item.get("name") or "").strip()
+            user_id = str(
+                raw_item.get("userid") or raw_item.get("user_id") or ""
+            ).strip()
+            robot_id = str(
+                raw_item.get("robotid") or raw_item.get("robot_id") or ""
+            ).strip()
+            _append_preview_part(parts, f"@{name or user_id or robot_id or '?'}")
+        elif item_type == "LINK":
+            _append_preview_part(
+                parts,
+                raw_item.get("label")
+                or raw_item.get("content")
+                or raw_item.get("href"),
+            )
+        elif item_type == "IMAGE":
+            parts.append("[image]")
+        elif item_type == "FILE":
+            _append_preview_part(
+                parts,
+                raw_item.get("filename")
+                or raw_item.get("fileName")
+                or raw_item.get("FileName")
+                or raw_item.get("name")
+                or "[file]",
+            )
+    if saw_reply:
+        parts.insert(0, _REPLY_PLACEHOLDER)
+    return _clean_reply_preview(" ".join(parts)) if parts else ""
+
+
+def _reply_preview_from_record_raw_json(record: Any) -> str:
+    raw_json = str(getattr(record, "raw_json", "") or "").strip()
+    if not raw_json:
+        return ""
+    try:
+        data = json.loads(raw_json)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+
+    preview = _preview_from_raw_body_items(_json_message_body(data))
+    if preview:
+        return preview
+
+    # Private webhook messages do not carry message.body; rebuild from
+    # top-level fields when available and represent structured replies only
+    # as an outbound-safe placeholder.
+    parts: list[str] = []
+    reply_raw = data.get("Reply") or data.get("reply")
+    if isinstance(reply_raw, list) and reply_raw:
+        parts.append(_REPLY_PLACEHOLDER)
+    _append_preview_part(
+        parts,
+        data.get("Content")
+        or data.get("content")
+        or data.get("text")
+        or data.get("mes"),
+    )
+    return _clean_reply_preview(" ".join(parts)) if parts else ""
 
 
 class InfoflowSendService:
@@ -192,6 +288,8 @@ class InfoflowSendService:
                 return [], "reply_to must be a message_id string, object, or array"
             if not message_id:
                 return [], "reply_to.message_id is required"
+            if preview and "<Quote" in preview:
+                preview = self._sanitize_explicit_reply_preview(message_id, preview)
             if not preview:
                 preview = self._lookup_reply_preview(message_id)
             target = {"message_id": message_id}
@@ -211,6 +309,12 @@ class InfoflowSendService:
         record = self._find_message_record(message_id)
         if record is not None:
             preview = _clean_reply_preview(
+                _reply_preview_from_record_raw_json(record),
+                limit=_REPLY_AUTO_PREVIEW_LIMIT,
+            )
+            if preview:
+                return preview
+            preview = _clean_reply_preview(
                 getattr(record, "content", "") or "",
                 limit=_REPLY_AUTO_PREVIEW_LIMIT,
             )
@@ -226,6 +330,13 @@ class InfoflowSendService:
                 if preview:
                     return preview
         return ""
+
+    def _sanitize_explicit_reply_preview(self, message_id: str, preview: str) -> str:
+        record = self._find_message_record(message_id)
+        if record is None:
+            return preview
+        rebuilt = _clean_reply_preview(_reply_preview_from_record_raw_json(record))
+        return rebuilt or preview
 
     def _lookup_reply_sender_imid(self, message_id: str) -> str:
         record = self._find_message_record(message_id)
