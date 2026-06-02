@@ -61,6 +61,31 @@ class BodyItem:
     preview: str = ""
     sender_imid: str = ""
     is_bot_message: bool = False
+    fid: str = ""
+    size: int = 0
+    md5: str = ""
+
+
+@dataclass
+class InboundFile:
+    """Normalized file attachment received from Infoflow."""
+
+    fid: str
+    name: str
+    size: int = 0
+    ext: str = ""
+    md5: str = ""
+    chat_type: str = ""       # "group" | "dm"
+    api_chat_type: int = 0    # group=2, dm=1 for file-download API
+    chat_id: str = ""         # groupid; empty for DM file-download API
+    file_msg_id: str = ""
+    msgid2: str = ""
+    sender_id: str = ""
+    sender_imid: str = ""
+    local_path: str = ""
+    download_status: str = "not_downloaded"  # not_downloaded | downloaded | failed
+    download_source: str = ""         # network | cache | empty
+    error: str = ""
 
 
 def coerce_reply_target(value: Any) -> ReplyTarget:
@@ -163,6 +188,7 @@ class IncomingMessage:
 
     # Media
     image_urls: list[str] = field(default_factory=list)
+    files: list[InboundFile] = field(default_factory=list)
 
     # Normalized body items from serverapi (used by bot/policy/content logic).
     body_items: list[BodyItem] = field(default_factory=list)

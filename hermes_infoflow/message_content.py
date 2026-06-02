@@ -149,6 +149,7 @@ def render_message_content(
     body_items = list(getattr(msg, "body_items", None) or [])
     image_urls = list(getattr(msg, "image_urls", None) or [])
     reply_targets = list(getattr(msg, "reply_targets", None) or [])
+    files = list(getattr(msg, "files", None) or [])
 
     if body_items:
         text, body_has_image = _render_body_items(
@@ -169,7 +170,7 @@ def render_message_content(
         if prefix_parts:
             text = "\n".join(prefix_parts + ([text] if text else []))
 
-    is_at_only = bool(getattr(msg, "is_at_only", False))
+    is_at_only = bool(getattr(msg, "is_at_only", False)) and not files
     if is_at_only:
         text = _at_only_description(
             body_items,
@@ -178,6 +179,8 @@ def render_message_content(
     elif not text.strip():
         if image_urls:
             text = "<media:image>" if len(image_urls) == 1 else f"<media:image> ({len(image_urls)} images)"
+        elif files:
+            text = ""
         else:
             text = _at_only_description(
                 body_items,

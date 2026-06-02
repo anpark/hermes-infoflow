@@ -2,6 +2,9 @@
 
 本文档描述 `file_delivery` 能力：把本地文件发布为可通过 Infoflow 对外分享的 URL。
 
+接收如流用户发来的文件、解析 webhook 文件 payload、获取下载 URL 并落盘保存，见
+[`infoflow-inbound-files.md`](infoflow-inbound-files.md)。两者方向相反，接口、权限和数据边界不同。
+
 ## 能力边界
 
 `file_delivery` 只负责：

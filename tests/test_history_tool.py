@@ -101,6 +101,197 @@ def test_history_tool_message_window_returns_json_array(
     assert "[Handling Strategy]" not in parsed[1]["content"]
 
 
+def test_history_tool_persists_group_file_metadata_without_downloading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ms, "_STATE_BASE_DIR", tmp_path)
+    store = MessageStore(account_id="test-acct")
+    file_raw = {
+        "eventtype": "ALL_MESSAGE_FORWARD",
+        "groupid": 4507088,
+        "message": {
+            "header": {
+                "fromuserid": "chengbo05",
+                "messageid": "1866800473468690376",
+            },
+            "body": [{
+                "type": "FILE",
+                "name": "IphoneCom-2026-06-01-015930.ips",
+                "fid": "C3DB3FF50968BDE3A8A2DF76ADDA4A12",
+                "size": 53703,
+                "md5": "",
+            }],
+        },
+        "fromid": 1744775667,
+        "msgid2": 300015560,
+    }
+    created = _today_at(21, 14, 25)
+    store.persist_group(
+        message_id="1866800473468690376",
+        group_id="4507088",
+        sender="user:chengbo05",
+        content="",
+        created_time=_ms(created),
+        msg_id2="300015560",
+        raw_json=json.dumps(file_raw),
+    )
+    store.persist_group(
+        message_id="1866800481628708809",
+        group_id="4507088",
+        sender="user:chengbo05",
+        content="@bot 分析下这个文件",
+        created_time=_ms(_today_at(21, 14, 33)),
+    )
+
+    adapter = _adapter_for(store)
+    monkeypatch.setattr(tools, "_get_live_adapter", lambda: adapter)
+
+    handler = tools.make_history_handler()
+    with recall_inbound_message_id_hint_scope("1866800481628708809"):
+        result = asyncio.run(handler({
+            "message_id": "1866800481628708809",
+            "before_count": 1,
+            "after_count": 0,
+        }))
+
+    parsed = json.loads(result)
+    first = parsed[0]["content"]
+    assert "[Attachments]\n" in first
+    assert first.index("[Attachments]") < first.index("[Message:")
+    assert '"name":"IphoneCom-2026-06-01-015930.ips"' in first
+    assert '"status":"not_downloaded"' in first
+    assert '"message_id":"1866800473468690376"' in first
+    assert '"file_index":0' in first
+    assert '"path"' not in first
+
+    stored_raw = json.loads(
+        store.find_any("1866800473468690376").raw_json  # type: ignore[union-attr]
+    )
+    assert stored_raw["_hermes_infoflow_files"][0]["download_status"] == "not_downloaded"
+
+
+def test_download_attachment_tool_downloads_and_persists_group_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ms, "_STATE_BASE_DIR", tmp_path)
+    store = MessageStore(account_id="test-acct")
+    store.persist_group(
+        message_id="file-msg",
+        group_id="4507088",
+        sender="user:chengbo05",
+        content="",
+        created_time=_ms(_today_at(21, 14, 25)),
+        msg_id2="300015560",
+        raw_json=json.dumps({
+            "groupid": 4507088,
+            "message": {
+                "header": {
+                    "fromuserid": "chengbo05",
+                    "messageid": "file-msg",
+                },
+                "body": [{
+                    "type": "FILE",
+                    "name": "sample.csv",
+                    "fid": "FID",
+                    "size": 19,
+                }],
+            },
+            "msgid2": 300015560,
+        }),
+    )
+    store.persist_group(
+        message_id="current",
+        group_id="4507088",
+        sender="user:chengbo05",
+        content="@bot 分析下这个文件",
+        created_time=_ms(_today_at(21, 14, 33)),
+    )
+
+    class FakeServerAPI:
+        async def download_inbound_file(self, file, *, session=None):
+            assert session is None
+            assert file.chat_type == "group"
+            assert file.chat_id == "4507088"
+            assert file.file_msg_id == "file-msg"
+            file.download_status = "downloaded"
+            file.download_source = "network"
+            file.local_path = str(tmp_path / "sample.csv")
+            return file
+
+    adapter = _adapter_for(store)
+    adapter._serverapi = FakeServerAPI()
+    adapter._http_session = object()
+    monkeypatch.setattr(tools, "_get_live_adapter", lambda: adapter)
+
+    handler = tools.make_download_attachment_handler()
+    with recall_inbound_message_id_hint_scope("current"):
+        result = asyncio.run(handler({
+            "message_id": "file-msg",
+            "file_index": 0,
+        }))
+
+    parsed = json.loads(result)
+    assert parsed["success"] is True
+    assert parsed["status"] == "downloaded"
+    assert parsed["path"] == str(tmp_path / "sample.csv")
+
+    stored_raw = json.loads(
+        store.find_any("file-msg").raw_json  # type: ignore[union-attr]
+    )
+    assert stored_raw["_hermes_infoflow_files"][0]["download_status"] == "downloaded"
+    assert stored_raw["_hermes_infoflow_files"][0]["local_path"] == str(tmp_path / "sample.csv")
+
+
+def test_download_attachment_tool_rejects_invalid_file_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ms, "_STATE_BASE_DIR", tmp_path)
+    store = MessageStore(account_id="test-acct")
+    store.persist_group(
+        message_id="file-msg",
+        group_id="4507088",
+        sender="user:chengbo05",
+        content="",
+        created_time=_ms(_today_at(21, 14, 25)),
+        raw_json=json.dumps({
+            "_hermes_infoflow_files": [{
+                "fid": "FID",
+                "name": "sample.csv",
+                "chat_type": "group",
+                "chat_id": "4507088",
+                "file_msg_id": "file-msg",
+                "download_status": "not_downloaded",
+            }]
+        }),
+    )
+    store.persist_group(
+        message_id="current",
+        group_id="4507088",
+        sender="user:chengbo05",
+        content="@bot 分析下这个文件",
+        created_time=_ms(_today_at(21, 14, 33)),
+    )
+
+    class FakeServerAPI:
+        async def download_inbound_file(self, file, *, session=None):
+            raise AssertionError("invalid file_index must not download")
+
+    adapter = _adapter_for(store)
+    adapter._serverapi = FakeServerAPI()
+    monkeypatch.setattr(tools, "_get_live_adapter", lambda: adapter)
+
+    handler = tools.make_download_attachment_handler()
+    with recall_inbound_message_id_hint_scope("current"):
+        result = asyncio.run(handler({
+            "message_id": "file-msg",
+            "file_index": -1,
+        }))
+
+    parsed = json.loads(result)
+    assert parsed["success"] is False
+    assert "file_index must be a non-negative integer" in parsed["error"]
+
+
 def test_history_tool_rejects_cross_conversation_for_restricted_sender(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

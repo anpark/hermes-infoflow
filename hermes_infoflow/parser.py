@@ -96,6 +96,27 @@ class BodyItem:
     preview: str = ""    # for replyData items
     sender_imid: str = ""  # for replyData items, quoted sender's Infoflow imid
     is_bot_message: bool = False  # platform says replyData target is a bot
+    fid: str = ""          # for FILE items
+    size: int = 0          # for FILE items
+    md5: str = ""          # for FILE items
+
+
+@dataclass
+class ParsedInboundFile:
+    """File attachment metadata extracted from an Infoflow webhook payload."""
+
+    fid: str
+    name: str
+    size: int = 0
+    ext: str = ""
+    md5: str = ""
+    chat_type: str = ""       # "group" | "dm"
+    api_chat_type: int = 0    # group=2, dm=1 for file-download API
+    chat_id: str = ""         # groupid; empty for DM file-download API
+    file_msg_id: str = ""
+    msgid2: str = ""
+    sender_id: str = ""
+    sender_imid: str = ""
 
 
 @dataclass
@@ -121,6 +142,7 @@ class InboundMessage:
     raw_msgdata: dict[str, Any] = field(default_factory=dict)
     body_items: list[BodyItem] = field(default_factory=list)
     image_urls: list[str] = field(default_factory=list)
+    files: list[ParsedInboundFile] = field(default_factory=list)
     mention_user_ids: list[str] = field(default_factory=list)
     # Infoflow AT.robotid values are robot_id / imid values, not app agent_id.
     # They are mapped to mention_agent_ids later when the participants table
@@ -292,12 +314,24 @@ def _stringify(value: Any) -> str:
     return str(value)
 
 
+def _int_or_zero(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _coerce_body_item(raw: dict[str, Any]) -> BodyItem:
     return BodyItem(
         type=_stringify(raw.get("type")),
         content=_stringify(raw.get("content")),
         label=_stringify(raw.get("label")),
-        name=_stringify(raw.get("name")),
+        name=_stringify(
+            raw.get("name")
+            or raw.get("filename")
+            or raw.get("fileName")
+            or raw.get("FileName")
+        ),
         userid=_stringify(raw.get("userid")),
         robotid=_stringify(raw.get("robotid")),
         atall=coerce_bool(raw.get("atall")),
@@ -311,6 +345,27 @@ def _coerce_body_item(raw: dict[str, Any]) -> BodyItem:
             or raw.get("senderImid")
         ),
         is_bot_message=coerce_bool(first_present(raw, "isBotMessage", "is_bot_message")),
+        fid=_stringify(
+            raw.get("fid")
+            or raw.get("fileid")
+            or raw.get("fileId")
+            or raw.get("file_id")
+            or raw.get("FileId")
+        ),
+        size=_int_or_zero(
+            raw.get("size")
+            or raw.get("FileSize")
+            or raw.get("filesize")
+            or raw.get("fileSize")
+            or raw.get("file_size")
+        ),
+        md5=_stringify(
+            raw.get("md5")
+            or raw.get("FileMd5")
+            or raw.get("filemd5")
+            or raw.get("fileMd5")
+            or raw.get("file_md5")
+        ),
     )
 
 
@@ -428,7 +483,110 @@ def _extract_body_parts(body_items: list[BodyItem]) -> tuple[str, bool, list[str
                 has_structural_body = True
         elif t == "IMAGE" and item.downloadurl:
             image_urls.append(item.downloadurl)
+        elif t == "FILE":
+            has_structural_body = True
     return ("".join(raw_parts).strip(), has_structural_body, image_urls)
+
+
+def _file_ext_from_name(name: str) -> str:
+    if "." not in name:
+        return ""
+    ext = name.rsplit(".", 1)[-1].strip().lower()
+    return ext[:32] if ext else ""
+
+
+def _group_files_from_body_items(
+    body_items: list[BodyItem],
+    *,
+    group_id: str,
+    file_msg_id: str,
+    msgid2: str,
+    sender_id: str,
+    sender_imid: str,
+) -> list[ParsedInboundFile]:
+    files: list[ParsedInboundFile] = []
+    for item in body_items:
+        if (item.type or "").upper() != "FILE":
+            continue
+        fid = (item.fid or "").strip()
+        name = (item.name or "").strip() or (f"file-{fid}" if fid else "file")
+        files.append(
+            ParsedInboundFile(
+                fid=fid,
+                name=name,
+                size=max(0, int(item.size or 0)),
+                ext=_file_ext_from_name(name),
+                md5=(item.md5 or "").strip(),
+                chat_type="group",
+                api_chat_type=2,
+                chat_id=str(group_id or ""),
+                file_msg_id=str(file_msg_id or ""),
+                msgid2=str(msgid2 or ""),
+                sender_id=str(sender_id or ""),
+                sender_imid=str(sender_imid or ""),
+            )
+        )
+    return files
+
+
+def _private_files_from_payload(
+    msg_data: dict[str, Any],
+    *,
+    file_msg_id: str,
+    msgid2: str,
+    sender_id: str,
+    sender_imid: str,
+) -> list[ParsedInboundFile]:
+    fid = _stringify(
+        msg_data.get("FileId")
+        or msg_data.get("fileId")
+        or msg_data.get("fileid")
+        or msg_data.get("file_id")
+        or msg_data.get("fid")
+    ).strip()
+    msg_type = _stringify(msg_data.get("MsgType") or msg_data.get("msgtype")).lower()
+    if not fid and msg_type != "file":
+        return []
+    name = _stringify(
+        msg_data.get("Name")
+        or msg_data.get("FileName")
+        or msg_data.get("fileName")
+        or msg_data.get("filename")
+        or msg_data.get("name")
+    ).strip() or (f"file-{fid}" if fid else "file")
+    ext = _stringify(
+        msg_data.get("FileType")
+        or msg_data.get("filetype")
+        or ""
+    ).strip().lower() or _file_ext_from_name(name)
+    return [
+        ParsedInboundFile(
+            fid=fid,
+            name=name,
+            size=_int_or_zero(
+                msg_data.get("FileSize")
+                or msg_data.get("fileSize")
+                or msg_data.get("filesize")
+                or msg_data.get("file_size")
+                or msg_data.get("size")
+            ),
+            ext=ext[:32],
+            md5=_stringify(
+                msg_data.get("FileMd5")
+                or msg_data.get("fileMd5")
+                or msg_data.get("filemd5")
+                or msg_data.get("file_md5")
+                or msg_data.get("md5")
+            ).strip(),
+            chat_type="dm",
+            api_chat_type=1,
+            chat_id="",
+            file_msg_id=str(file_msg_id or ""),
+            msgid2=str(msgid2 or ""),
+            sender_id=str(sender_id or ""),
+            sender_imid=str(sender_imid or ""),
+        )
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -587,10 +745,18 @@ def build_private_inbound(
             if is_bot:
                 is_reply_to_bot = True
 
-    if not text and not image_urls and not reply_targets:
+    files = _private_files_from_payload(
+        msg_data,
+        file_msg_id=str(message_id or ""),
+        msgid2=msgid2_str,
+        sender_id=from_user,
+        sender_imid=fromid_str,
+    )
+
+    if not text and not image_urls and not reply_targets and not files:
         _record_ignore_reason(
             ignore_reasons,
-            "private_empty_content:no text/image/reply",
+            "private_empty_content:no text/image/reply/file",
         )
         return None
 
@@ -611,6 +777,7 @@ def build_private_inbound(
         timestamp_ms=timestamp_ms,
         raw_msgdata=msg_data,
         image_urls=image_urls,
+        files=files,
         was_mentioned=True,  # private chat is always "directly addressed"
         reply_targets=reply_targets,
         is_reply_to_bot=is_reply_to_bot,
@@ -685,6 +852,14 @@ def build_group_inbound(
     )
     event_type = _stringify(msg_data.get("eventtype"))
     fromid_str = _stringify(msg_data.get("fromid"))
+    files = _group_files_from_body_items(
+        body_items,
+        group_id=group_id_str or "",
+        file_msg_id=str(message_id or ""),
+        msgid2=msgid2,
+        sender_id=from_user,
+        sender_imid=fromid_str,
+    )
 
     mention_user_ids, mention_robot_ids = _extract_mention_ids(
         body_items,
@@ -696,10 +871,16 @@ def build_group_inbound(
         bot_robot_id=account.robot_id,
     )
 
-    if not raw_text.strip() and not image_urls and not reply_targets and not has_structural_body:
+    if (
+        not raw_text.strip()
+        and not image_urls
+        and not reply_targets
+        and not has_structural_body
+        and not files
+    ):
         _record_ignore_reason(
             ignore_reasons,
-            "group_empty_content:no text/image/reply/structural body",
+            "group_empty_content:no text/image/reply/structural body/file",
         )
         return None
 
@@ -721,7 +902,7 @@ def build_group_inbound(
         # AT-only message (no TEXT/MD body, e.g. user just @'s the bot).
         # Keep text empty; final readable content is rendered from body_items.
         text_out = ""
-        _is_at_only = True
+        _is_at_only = not files
     else:
         text_out = raw_text
         _is_at_only = False
@@ -767,6 +948,7 @@ def build_group_inbound(
         raw_msgdata=msg_data,
         body_items=body_items,
         image_urls=image_urls,
+        files=files,
         mention_user_ids=mention_user_ids,
         mention_robot_ids=mention_robot_ids,
         mention_agent_ids=[],
@@ -926,6 +1108,7 @@ __all__ = [
     "AccountConfig",
     "BodyItem",
     "InboundMessage",
+    "ParsedInboundFile",
     "ParsedWebhook",
     "build_group_inbound",
     "build_private_inbound",

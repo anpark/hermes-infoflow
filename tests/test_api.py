@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -762,6 +763,180 @@ def test_token_endpoint_uses_md5_appsecret_and_caches(monkeypatch):
     assert t1 == t2
     # Token cache means we only fetch once.
     assert calls["count"] == 1
+
+
+def test_get_app_access_token_cache_key_includes_api_host() -> None:
+    calls = {"count": 0}
+
+    class _Resp:
+        status = 200
+
+        def __init__(self, token: str):
+            self._token = token
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return None
+
+        async def text(self):
+            return json.dumps({
+                "errcode": 0,
+                "data": {"app_access_token": self._token, "expires_in": 7200},
+            })
+
+    class _Sess:
+        def post(self, url, *, json=None, headers=None, timeout=None):
+            del json, headers, timeout
+            calls["count"] += 1
+            return _Resp(f"TOK-{urlparse(url).netloc}")
+
+    api.clear_token_cache()
+    account_a = api.InfoflowAccountAPI(
+        api_host="https://api-a.example.com",
+        app_key="same-key",
+        app_secret="secret",
+    )
+    account_b = api.InfoflowAccountAPI(
+        api_host="https://api-b.example.com",
+        app_key="same-key",
+        app_secret="secret",
+    )
+
+    async def _go():
+        sess = _Sess()
+        return (
+            await api.get_app_access_token(account_a, session=sess),
+            await api.get_app_access_token(account_b, session=sess),
+        )
+
+    token_a, token_b = asyncio.run(_go())
+
+    assert token_a == "TOK-api-a.example.com"
+    assert token_b == "TOK-api-b.example.com"
+    assert calls["count"] == 2
+
+
+def test_get_app_access_token_concurrent_refresh_is_singleflight() -> None:
+    calls = {"count": 0}
+
+    async def _go():
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        class _Resp:
+            status = 200
+
+            async def __aenter__(self):
+                entered.set()
+                await release.wait()
+                return self
+
+            async def __aexit__(self, *exc):
+                return None
+
+            async def text(self):
+                return '{"errcode":0,"data":{"app_access_token":"TOK","expires_in":7200}}'
+
+        class _Sess:
+            def post(self, url, *, json=None, headers=None, timeout=None):
+                del url, json, headers, timeout
+                calls["count"] += 1
+                return _Resp()
+
+        api.clear_token_cache()
+        account = api.InfoflowAccountAPI(
+            api_host="https://api.example.com",
+            app_key=f"singleflight-{id(calls)}",
+            app_secret="secret",
+        )
+        sess = _Sess()
+        first = asyncio.create_task(api.get_app_access_token(account, session=sess))
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        second = asyncio.create_task(api.get_app_access_token(account, session=sess))
+        await asyncio.sleep(0)
+        release.set()
+        return await asyncio.gather(first, second)
+
+    tokens = asyncio.run(_go())
+
+    assert tokens == ["TOK", "TOK"]
+    assert calls["count"] == 1
+
+
+def test_get_app_access_token_cross_loop_refresh_is_singleflight() -> None:
+    calls = {"count": 0}
+    entered = threading.Event()
+    release = threading.Event()
+
+    class _Resp:
+        status = 200
+
+        async def __aenter__(self):
+            entered.set()
+            await asyncio.to_thread(release.wait)
+            return self
+
+        async def __aexit__(self, *exc):
+            return None
+
+        async def text(self):
+            return '{"errcode":0,"data":{"app_access_token":"TOK","expires_in":7200}}'
+
+    class _Sess:
+        def post(self, url, *, json=None, headers=None, timeout=None):
+            del url, json, headers, timeout
+            calls["count"] += 1
+            return _Resp()
+
+    api.clear_token_cache()
+    account = api.InfoflowAccountAPI(
+        api_host="https://api.example.com",
+        app_key=f"cross-loop-{id(calls)}",
+        app_secret="secret",
+    )
+    thread_result: list[str] = []
+    thread_errors: list[BaseException] = []
+
+    def _thread_run() -> None:
+        try:
+            token = asyncio.run(api.get_app_access_token(account, session=_Sess()))
+            thread_result.append(token)
+        except BaseException as exc:  # pragma: no cover - test diagnostics
+            thread_errors.append(exc)
+
+    thread = threading.Thread(target=_thread_run)
+    thread.start()
+    assert entered.wait(timeout=1)
+
+    async def _go():
+        task = asyncio.create_task(api.get_app_access_token(account, session=_Sess()))
+        await asyncio.sleep(0.05)
+        assert not task.done()
+        release.set()
+        return await asyncio.wait_for(task, timeout=1)
+
+    second = asyncio.run(_go())
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert thread_errors == []
+    assert thread_result == ["TOK"]
+    assert second == "TOK"
+    assert calls["count"] == 1
+
+
+def test_token_header_helpers_use_infoflow_bearer_format() -> None:
+    headers = api.auth_headers("TOK", content_type="application/json")
+    assert headers["Authorization"] == "Bearer-TOK"
+    assert headers["Content-Type"] == "application/json"
+    assert headers["LOGID"]
+    no_logid_headers = api.auth_headers("TOK", content_type=None, include_logid=False)
+    assert no_logid_headers == {"Authorization": "Bearer-TOK"}
+    assert api.openapi_gateway_identity_headers("TOK") == {
+        "x-openapi-gateway-identity": "Bearer-TOK",
+    }
 
 
 def test_recall_private_message_body_uses_json_dumps(monkeypatch):

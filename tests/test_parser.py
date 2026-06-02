@@ -263,6 +263,50 @@ def test_private_image_message_promotes_to_placeholder(account):
     assert res.inbound.text == "<media:image>"
 
 
+def test_private_file_only_message_extracts_file_metadata(account):
+    acct, raw_key = account
+    inner = json.dumps(
+        {
+            "FromUserId": "chengbo05",
+            "FromId": 1744775667,
+            "MsgType": "file",
+            "MsgId": "1866778292427810227",
+            "MsgId2": "300017075",
+            "FileId": "7cdfbc96f22b2e760048f3779f7229a1",
+            "Name": "sample.csv",
+            "FileType": "csv",
+            "FileSize": "19",
+            "FileMd5": "97D40B4AEFCE859765CAB2CA3DD05671",
+        }
+    )
+    ct = aes_ecb_encrypt_b64url(inner, raw_key)
+    body = urlencode({"messageJson": json.dumps({"Encrypt": ct})})
+
+    res = parser.parse_webhook(
+        content_type="application/x-www-form-urlencoded",
+        raw_body=body,
+        account=acct,
+    )
+
+    assert res.kind == "message"
+    inbound = res.inbound
+    assert inbound.text == ""
+    assert len(inbound.files) == 1
+    file = inbound.files[0]
+    assert file.fid == "7cdfbc96f22b2e760048f3779f7229a1"
+    assert file.name == "sample.csv"
+    assert file.size == 19
+    assert file.ext == "csv"
+    assert file.md5 == "97D40B4AEFCE859765CAB2CA3DD05671"
+    assert file.chat_type == "dm"
+    assert file.api_chat_type == 1
+    assert file.chat_id == ""
+    assert file.file_msg_id == "1866778292427810227"
+    assert file.msgid2 == "300017075"
+    assert file.sender_id == "chengbo05"
+    assert file.sender_imid == "1744775667"
+
+
 def test_private_message_reply_to_bot_marked_when_in_sent_set(account):
     acct, raw_key = account
     inner = json.dumps(
@@ -444,6 +488,98 @@ def test_group_message_string_false_at_all_is_not_truthy(account):
     inbound = res.inbound
     assert inbound.body_items[0].atall is False
     assert inbound.mention_user_ids == ["alice"]
+
+
+def test_group_file_only_message_extracts_file_metadata(account):
+    acct, raw_key = account
+    payload = {
+        "eventtype": "ALL_MESSAGE_FORWARD",
+        "groupid": 4507088,
+        "message": {
+            "header": {
+                "fromuserid": "chengbo05",
+                "groupid": 4507088,
+                "messageid": "1866778298451877826",
+            },
+            "body": [
+                {
+                    "type": "FILE",
+                    "name": "sample.csv",
+                    "fid": "E0500D6F0F12CC5A88392E1B584FD23A",
+                    "size": 19,
+                    "md5": "",
+                }
+            ],
+        },
+        "fromid": 1744775667,
+        "msgid2": 300015554,
+    }
+    ct = aes_ecb_encrypt_b64url(json.dumps(payload), raw_key)
+
+    res = parser.parse_webhook(
+        content_type="text/plain",
+        raw_body=ct,
+        account=acct,
+    )
+
+    assert res.kind == "message"
+    inbound = res.inbound
+    assert inbound.text == ""
+    assert inbound.is_at_only is False
+    assert len(inbound.files) == 1
+    file = inbound.files[0]
+    assert file.fid == "E0500D6F0F12CC5A88392E1B584FD23A"
+    assert file.name == "sample.csv"
+    assert file.size == 19
+    assert file.ext == "csv"
+    assert file.chat_type == "group"
+    assert file.api_chat_type == 2
+    assert file.chat_id == "4507088"
+    assert file.file_msg_id == "1866778298451877826"
+    assert file.msgid2 == "300015554"
+    assert file.sender_id == "chengbo05"
+    assert file.sender_imid == "1744775667"
+
+
+def test_group_multiple_files_preserve_order(account):
+    acct, raw_key = account
+    payload = {
+        "eventtype": "ALL_MESSAGE_FORWARD",
+        "groupid": 4507088,
+        "message": {
+            "header": {
+                "fromuserid": "chengbo05",
+                "groupid": 4507088,
+                "messageid": "1866778298451877826",
+            },
+            "body": [
+                {
+                    "type": "FILE",
+                    "name": "old.csv",
+                    "fid": "FIDOLD",
+                    "size": 128,
+                },
+                {
+                    "type": "FILE",
+                    "name": "new.csv",
+                    "fid": "FIDNEW",
+                    "size": 132,
+                },
+            ],
+        },
+        "fromid": 1744775667,
+    }
+    ct = aes_ecb_encrypt_b64url(json.dumps(payload), raw_key)
+
+    res = parser.parse_webhook(
+        content_type="text/plain",
+        raw_body=ct,
+        account=acct,
+    )
+
+    assert res.kind == "message"
+    assert [file.name for file in res.inbound.files] == ["old.csv", "new.csv"]
+    assert [file.fid for file in res.inbound.files] == ["FIDOLD", "FIDNEW"]
 
 
 def test_group_message_reply_to_bot_marked_when_in_sent_set(account):

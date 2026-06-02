@@ -9,6 +9,7 @@ from hermes_infoflow import file_to_url as file_to_url_mod
 from hermes_infoflow import serverapi as serverapi_mod
 from hermes_infoflow.parser import BodyItem as ParserBodyItem
 from hermes_infoflow.parser import InboundMessage
+from hermes_infoflow.parser import ParsedInboundFile
 from hermes_infoflow.itypes import GroupMember
 from hermes_infoflow.serverapi import (
     GroupMembersFetchResult,
@@ -2130,6 +2131,46 @@ def test_to_incoming_normalizes_body_item_field_names() -> None:
     assert item.message_id == "QUOTE-1"
     assert not hasattr(item, "userid")
     assert not hasattr(item, "robotid")
+
+
+def test_to_incoming_preserves_inbound_files() -> None:
+    api = ServerAPI(settings=_settings())
+    incoming = api.to_incoming(
+        InboundMessage(
+            chat_type="dm",
+            from_user="chengbo05",
+            text="",
+            message_id="DM-FILE",
+            files=[
+                ParsedInboundFile(
+                    fid="FID",
+                    name="sample.csv",
+                    size=19,
+                    ext="csv",
+                    md5="MD5",
+                    chat_type="dm",
+                    api_chat_type=1,
+                    file_msg_id="DM-FILE",
+                    msgid2="MSGID2",
+                    sender_id="chengbo05",
+                    sender_imid="1744775667",
+                )
+            ],
+        )
+    )
+
+    assert len(incoming.files) == 1
+    file = incoming.files[0]
+    assert file.fid == "FID"
+    assert file.name == "sample.csv"
+    assert file.size == 19
+    assert file.ext == "csv"
+    assert file.chat_type == "dm"
+    assert file.api_chat_type == 1
+    assert file.file_msg_id == "DM-FILE"
+    assert file.msgid2 == "MSGID2"
+    assert file.sender_id == "chengbo05"
+    assert file.download_status == "not_downloaded"
 
 
 def test_to_incoming_coerces_string_false_body_booleans() -> None:

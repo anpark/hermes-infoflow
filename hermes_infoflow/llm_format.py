@@ -7,10 +7,12 @@ messages and history-tool results.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
+from .inbound_files import inbound_file_from_raw_dict, render_attachments_block
 from .llm_tags import string_field
 from .settings import parse_infoflow_admin_users
 
@@ -145,13 +147,15 @@ def unread_message_context_line(count: int) -> str:
             "[Unread Message Context: 请优先调用 infoflow_get_message_history，"
             "使用当前 Message 标签中的 message_id 作为锚点，"
             f"设置 before_count={n}、after_count=0。"
-            "该范围内有未读历史消息，请阅读参考上下文后再判断如何回复。]"
+            "该范围内有未读历史消息；如果当前消息依赖上文或附件，"
+            "必须先阅读参考上下文后再判断如何回复。]"
         )
     return (
         "[Unread Message Context: 当前消息前较大历史范围内有未读消息。"
         "请优先调用 infoflow_get_message_history，使用当前 Message 标签中的 "
         f"message_id 作为锚点，设置 before_count={read_count}、after_count=0。"
-        "先阅读参考上下文后再判断如何回复；如果上下文仍不足，再按需继续扩大历史范围。]"
+        "如果当前消息依赖上文或附件，必须先阅读参考上下文后再判断如何回复；"
+        "如果上下文仍不足，再按需继续扩大历史范围。]"
     )
 
 
@@ -164,6 +168,7 @@ def format_message_envelope(
     created_time_ms: int = 0,
     handling_strategy: str = "",
     unread_message_context_count: int = 0,
+    attachments_block: str = "",
 ) -> str:
     lines: list[str] = []
     if unread_message_context_count > 0:
@@ -177,6 +182,10 @@ def format_message_envelope(
     lines.extend([
         attention_line,
         sender_line_text,
+    ])
+    if attachments_block:
+        lines.append(str(attachments_block).strip())
+    lines.extend([
         message_line(message_id, created_time_ms=created_time_ms),
         content or "",
     ])
@@ -213,6 +222,7 @@ def format_group_record(
         message_id=_clean(getattr(record, "message_id", "")),
         created_time_ms=int(getattr(record, "created_time", 0) or 0),
         content=str(getattr(record, "content", "") or ""),
+        attachments_block=_attachments_block_from_record(record),
     )
 
 
@@ -239,4 +249,28 @@ def format_dm_record(
         message_id=_clean(getattr(record, "message_id", "")),
         created_time_ms=int(getattr(record, "created_time", 0) or 0),
         content=str(getattr(record, "content", "") or ""),
+        attachments_block=_attachments_block_from_record(record),
     )
+
+
+def _attachments_block_from_record(record: object) -> str:
+    raw_json = str(getattr(record, "raw_json", "") or "")
+    if not raw_json:
+        return ""
+    try:
+        payload = json.loads(raw_json)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    raw_files = payload.get("_hermes_infoflow_files")
+    if not isinstance(raw_files, list):
+        return ""
+    files = []
+    for item in raw_files:
+        if not isinstance(item, dict):
+            continue
+        file = inbound_file_from_raw_dict(item)
+        if file is not None:
+            files.append(file)
+    return render_attachments_block(files)

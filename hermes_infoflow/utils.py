@@ -18,6 +18,8 @@ from urllib.parse import urlparse
 
 import aiohttp
 
+from .api import auth_headers
+
 logger = logging.getLogger(__name__)
 
 
@@ -167,7 +169,10 @@ async def _download_inbound_image(
             except Exception:
                 token = None
             if token:
-                result = await _try(sess, {"Authorization": f"Bearer-{token}"})
+                result = await _try(
+                    sess,
+                    auth_headers(token, content_type=None, include_logid=False),
+                )
         return result
     finally:
         if own_session:

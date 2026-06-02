@@ -166,6 +166,17 @@ def test_register_registers_platform_and_tool() -> None:
     assert "end_time" in history_props
     assert "date" not in history_props
 
+    assert any(t["name"] == "infoflow_download_attachment" for t in ctx.tools)
+    download_tool = next(
+        t for t in ctx.tools if t["name"] == "infoflow_download_attachment"
+    )
+    assert download_tool["toolset"] == "infoflow"
+    assert download_tool["is_async"] is True
+    assert download_tool["schema"]["parameters"]["required"] == ["message_id"]
+    download_props = download_tool["schema"]["parameters"]["properties"]
+    assert "file_index" in download_props
+    assert "force" in download_props
+
 
 def test_plugin_name_consistency() -> None:
     """plugin.yaml.name, register(name=...), and entry-point key must align."""

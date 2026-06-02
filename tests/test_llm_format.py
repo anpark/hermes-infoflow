@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import json
+from types import SimpleNamespace
+
 from hermes_infoflow.llm_format import (
     GroupAttention,
+    format_group_record,
     group_attention_line,
     message_line,
     permission_for_sender,
@@ -61,3 +65,30 @@ def test_attention_regex_pattern_is_quoted_but_booleans_are_bare() -> None:
 
 def test_quote_tag_value_escapes_single_quote_and_backslash() -> None:
     assert quote_tag_value(r"a\b'c") == r"'a\\b\'c'"
+
+
+def test_format_group_record_renders_persisted_attachments_before_message() -> None:
+    record = SimpleNamespace(
+        message_id="MID",
+        group_id="4507088",
+        sender="user:chengbo05",
+        content="",
+        raw_json=json.dumps({
+            "_hermes_infoflow_files": [{
+                "fid": "FID",
+                "name": "sample.csv",
+                "ext": "csv",
+                "size": 19,
+                "local_path": "/tmp/sample.csv",
+                "download_status": "downloaded",
+            }]
+        }),
+    )
+
+    content = format_group_record(record)
+
+    assert "[Attachments]\n" in content
+    assert content.index("[Attachments]") < content.index("[Message:")
+    assert '"name":"sample.csv"' in content
+    assert '"status":"downloaded"' in content
+    assert '"/tmp/sample.csv"' in content

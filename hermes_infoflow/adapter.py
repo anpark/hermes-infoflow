@@ -293,18 +293,21 @@ from .dashboard import get_tracker, normalize_chat_id
 from .identity import raw_id_from_key, sender_key
 from .iftools import (
     CREATE_GROUP_TOOL_SCHEMA,
+    DOWNLOAD_ATTACHMENT_TOOL_SCHEMA,
     FILE_DELIVERY_TOOL_SCHEMA,
     GROUP_MEMBERS_TOOL_SCHEMA,
     HISTORY_TOOL_SCHEMA,
     RECALL_TOOL_SCHEMA,
     SEND_MESSAGE_TOOL_SCHEMA,
     make_create_group_handler,
+    make_download_attachment_handler,
     make_file_delivery_handler,
     make_group_members_handler,
     make_history_handler,
     make_recall_handler,
     make_send_message_handler,
 )
+from .inbound_files import inbound_file_to_raw_dict, render_attachments_block
 from .itypes import IncomingMessage, reply_target_to_dict
 from .llm_format import (
     DMAttention,
@@ -315,6 +318,7 @@ from .llm_format import (
     sender_line,
     unread_message_context_line,
 )
+from .log_cleanup import cleanup_old_logs
 from .media import IMAGE_LOAD_MAX_BYTES, prepare_infoflow_image_bytes
 from .message_content import render_message_content
 from .message_store import MessageStore
@@ -323,9 +327,11 @@ from .policy import (
     _DM_FORMAT_DOC,
     _GROUP_FORMAT_DOC,
     _GROUP_MENTION_RULES_DOC,
+    _INFOFLOW_FIELD_DOC,
     _INFOFLOW_MESSAGE_FORMAT_DOC,
     _INFOFLOW_PERMISSION_SECURITY_DOC,
     _INFOFLOW_REFERENCE_RULES_DOC,
+    _INFOFLOW_SESSION_HISTORY_DOC,
     _INFOFLOW_TOOL_RULES_DOC,
     GroupConfigOverride,
     GroupPolicy,
@@ -372,6 +378,7 @@ from .utils import (
 from .webhook import WebhookServer
 
 logger = logging.getLogger(__name__)
+_LOG_CLEANUP_INTERVAL_SECONDS = 24 * 60 * 60
 
 
 # ---------------------------------------------------------------------------
@@ -533,6 +540,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         )
 
         self._http_session: aiohttp.ClientSession | None = None
+        self._log_cleanup_task: asyncio.Task[Any] | None = None
         self._infoflow_original_busy_session_handler = None
         self._busy_steer_reaction_by_session: dict[str, Any] = {}
         self._busy_steer_reply_scope_by_session: dict[
@@ -867,6 +875,8 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         except (ConnectionRefusedError, OSError):
             pass
 
+        self._run_log_cleanup_once()
+
         self._http_session = aiohttp.ClientSession()
         self._serverapi.http_session = self._http_session
         try:
@@ -881,6 +891,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             return False
 
         self._running = True
+        self._start_log_cleanup_task()
         self._mark_connected()
         logger.info(
             "[infoflow] Webhook listening on %s:%d%s",
@@ -890,11 +901,44 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
 
     async def disconnect(self) -> None:
         self._running = False
+        await self._stop_log_cleanup_task()
         with contextlib.suppress(Exception):
             await self._webhook_server.stop()
         await self._close_http_session()
         self._mark_disconnected()
         gw_log().info("[infoflow] Disconnected")
+
+    def _run_log_cleanup_once(self) -> None:
+        try:
+            removed_logs = cleanup_old_logs(settings=self._settings)
+            if removed_logs:
+                gw_log().info(
+                    "[infoflow:log_cleanup] removed=%d retention_days=14",
+                    len(removed_logs),
+                )
+        except Exception as exc:
+            gw_log().warning("[infoflow:log_cleanup] failed: %s", exc)
+
+    def _start_log_cleanup_task(self) -> None:
+        task = self._log_cleanup_task
+        if task is not None and not task.done():
+            return
+        self._log_cleanup_task = asyncio.create_task(self._periodic_log_cleanup())
+
+    async def _stop_log_cleanup_task(self) -> None:
+        task = self._log_cleanup_task
+        self._log_cleanup_task = None
+        if task is None or task.done():
+            return
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    async def _periodic_log_cleanup(self) -> None:
+        while self._running:
+            await asyncio.sleep(_LOG_CLEANUP_INTERVAL_SECONDS)
+            if self._running:
+                self._run_log_cleanup_once()
 
     async def _close_http_session(self) -> None:
         if self._http_session is not None:
@@ -1094,6 +1138,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             content=content,
             created_time_ms=self._message_created_time_for_llm(msg),
             handling_strategy=handling_strategy,
+            attachments_block=render_attachments_block(list(getattr(msg, "files", []) or [])),
         )
 
     @staticmethod
@@ -1394,7 +1439,9 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         common_parts = [
             identity,
             _INFOFLOW_MESSAGE_FORMAT_DOC,
+            _INFOFLOW_FIELD_DOC,
             _INFOFLOW_PERMISSION_SECURITY_DOC,
+            _INFOFLOW_SESSION_HISTORY_DOC,
             _INFOFLOW_REFERENCE_RULES_DOC,
         ]
         if msg.is_group:
@@ -1563,6 +1610,10 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             "is_reply_to_bot": msg.is_reply_to_bot,
             "was_mentioned": msg.bot_was_mentioned,
             "image_urls": list(msg.image_urls),
+            "files": [
+                inbound_file_to_raw_dict(file)
+                for file in list(getattr(msg, "files", []) or [])
+            ],
             "msgseqid": msg.msgseqid,
             "raw_msgdata": msg.raw_data,
             "event_type": msg.event_type,
@@ -2799,7 +2850,11 @@ def register(ctx: Any) -> None:
             "【历史消息】使用 `infoflow_get_message_history` 查询聊天历史。"
             "成功返回 JSON 数组字符串，每项含 `time` 和 `content`；"
             "`time` 格式为 `YYYY.MM.DD HH.mm.ss`；"
-            "`content` 与当前消息 envelope 格式一致。"
+            "`content` 与当前消息 envelope 格式一致。\n"
+            "\n"
+            "【入站附件】历史或当前消息中的 `[Attachments]` 若显示 "
+            "`status:\"not_downloaded\"`，需要读取文件内容时先调用 "
+            "`infoflow_download_attachment`，再读取返回的本地 path。"
         ),
     )
 
@@ -2889,6 +2944,20 @@ def register(ctx: Any) -> None:
         except Exception as exc:
             gw_log().warning(
                 "[infoflow] failed to register history tool: %s", exc,
+            )
+        try:
+            register_tool(
+                name="infoflow_download_attachment",
+                toolset="infoflow",
+                schema=DOWNLOAD_ATTACHMENT_TOOL_SCHEMA,
+                handler=make_download_attachment_handler(),
+                is_async=True,
+                description="Download an inbound Infoflow file attachment on demand.",
+                emoji="📎",
+            )
+        except Exception as exc:
+            gw_log().warning(
+                "[infoflow] failed to register download attachment tool: %s", exc,
             )
 
     from .dashboard import make_plugin_hooks

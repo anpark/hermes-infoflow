@@ -8,6 +8,7 @@ verification, and request routing.  Delegates field parsing to
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -144,6 +145,69 @@ def _log_decoded_payload(
         reason or "-",
         decoded_payload,
     )
+
+
+def _request_headers_for_log(request: Any) -> list[list[str]]:
+    """Return request headers as ordered pairs, preserving duplicates when possible."""
+    raw_headers = getattr(request, "raw_headers", None)
+    if raw_headers:
+        headers: list[list[str]] = []
+        for raw_name, raw_value in raw_headers:
+            if isinstance(raw_name, bytes):
+                name = raw_name.decode("latin-1", errors="replace")
+            else:
+                name = str(raw_name)
+            if isinstance(raw_value, bytes):
+                value = raw_value.decode("latin-1", errors="replace")
+            else:
+                value = str(raw_value)
+            headers.append([name, value])
+        return headers
+
+    request_headers = getattr(request, "headers", None)
+    if request_headers is None:
+        return []
+    try:
+        return [[str(key), str(value)] for key, value in request_headers.items()]
+    except Exception:
+        return []
+
+
+def _request_version_for_log(request: Any) -> str:
+    version = getattr(request, "version", None)
+    major = getattr(version, "major", None)
+    minor = getattr(version, "minor", None)
+    if major is not None and minor is not None:
+        return f"HTTP/{major}.{minor}"
+    return str(version or "")
+
+
+def _log_full_request(
+    *,
+    request: Any,
+    raw_body: str,
+    body_len: int,
+) -> None:
+    """Log the complete inbound HTTP request metadata and raw body."""
+    try:
+        headers = json.dumps(
+            _request_headers_for_log(request),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        gw_log().info(
+            "[iflow:request_full] method=%s path=%s version=%s remote=%s "
+            "body_len=%d headers=%s body=%s",
+            getattr(request, "method", "") or "",
+            getattr(request, "path_qs", "") or getattr(request, "path", "") or "",
+            _request_version_for_log(request),
+            getattr(request, "remote", None) or "unknown",
+            body_len,
+            headers,
+            raw_body,
+        )
+    except Exception:
+        gw_log().debug("[iflow:request_full] logging failed", exc_info=True)
 
 
 def _log_request_body(
@@ -289,6 +353,11 @@ class WebhookServer:
             "[infoflow] webhook received: ct=%s body_len=%d ip=%s",
             content_type, len(raw_bytes),
             getattr(request, "remote", None) or "unknown",
+        )
+        _log_full_request(
+            request=request,
+            raw_body=raw_body,
+            body_len=len(raw_bytes),
         )
 
         # 3. Protocol parse

@@ -26,11 +26,13 @@ Non-obvious wire contract bits (do NOT change without an upstream notice):
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
 import hashlib
 import json
 import logging
 import re
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -138,10 +140,12 @@ BOS_GET_URL_TIMEOUT_SECONDS = 15.0
 BOS_URL_PROBE_TIMEOUT_SECONDS = 15.0
 BOS_GET_URL_DEFAULT_EXPIRATION_SECONDS = 3600
 
-# In-memory token cache, keyed by appKey. Survives across InfoflowClient
+# In-memory token cache, keyed by api_host + appKey. Survives across InfoflowClient
 # instances within the same process — matches OpenClaw's module-level
 # Map<string, {token, expiresAt}>.
 _token_cache: dict[str, tuple[str, float]] = {}
+_token_refreshes: dict[str, concurrent.futures.Future[str]] = {}
+_token_refresh_guard = threading.Lock()
 _last_clientmsgid = 0
 
 
@@ -295,61 +299,103 @@ class InfoflowAPIError(Exception):
     """Raised when an Infoflow REST call returns a non-ok response."""
 
 
+def _token_cache_key(account: InfoflowAccountAPI) -> str:
+    return f"{str(account.api_host or '').rstrip('/')}|{account.app_key}"
+
+
+def _cached_token(key: str, now: float) -> str | None:
+    cached = _token_cache.get(key)
+    if cached and cached[1] > now:
+        return cached[0]
+    return None
+
+
 async def get_app_access_token(
     account: InfoflowAccountAPI,
     *,
     session: aiohttp.ClientSession | None = None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    force_refresh: bool = False,
 ) -> str:
     """Fetch (or reuse a cached) app access token.
 
-    Cache key is ``account.app_key``. The token's announced ``expires_in`` is
-    honored minus a 5-minute safety buffer.
+    Cache key is ``api_host + app_key`` so different Infoflow environments do
+    not share credentials. The token's announced ``expires_in`` is honored minus
+    a 5-minute safety buffer. A per-key refresh future ensures only one
+    coroutine in this process refreshes an expired token at a time, even when
+    callers run on different event loops.
     """
-    cached = _token_cache.get(account.app_key)
-    now = time.time()
-    if cached and cached[1] > now:
-        return cached[0]
+    key = _token_cache_key(account)
+    created_refresh = False
+    with _token_refresh_guard:
+        now = time.time()
+        if not force_refresh:
+            cached = _cached_token(key, now)
+            if cached is not None:
+                return cached
 
-    md5_secret = hashlib.md5(account.app_secret.encode("utf-8")).hexdigest().lower()
-    url = _join(account.api_host, INFOFLOW_AUTH_PATH)
-    payload = {"app_key": account.app_key, "app_secret": md5_secret}
+        refresh = _token_refreshes.get(key)
+        if refresh is None or refresh.done():
+            refresh = concurrent.futures.Future()
+            _token_refreshes[key] = refresh
+            created_refresh = True
 
-    async with _ensure_session(session) as sess, sess.post(
-        url,
-        json=payload,
-        timeout=aiohttp.ClientTimeout(total=timeout),
-        headers={"Content-Type": "application/json"},
-    ) as resp:
-        text = await resp.text()
-        if resp.status >= 400:
+    if not created_refresh:
+        return await asyncio.shield(asyncio.wrap_future(refresh))
+
+    try:
+        md5_secret = hashlib.md5(account.app_secret.encode("utf-8")).hexdigest().lower()
+        url = _join(account.api_host, INFOFLOW_AUTH_PATH)
+        payload = {"app_key": account.app_key, "app_secret": md5_secret}
+
+        async with _ensure_session(session) as sess, sess.post(
+            url,
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=timeout),
+            headers={"Content-Type": "application/json"},
+        ) as resp:
+            text = await resp.text()
+            if resp.status >= 400:
+                raise InfoflowAPIError(
+                    f"token endpoint HTTP {resp.status}: {text[:200]}"
+                )
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError as exc:
+                raise InfoflowAPIError(f"token response is not JSON: {exc}") from exc
+
+        errcode = data.get("errcode")
+        if errcode not in (None, 0):
             raise InfoflowAPIError(
-                f"token endpoint HTTP {resp.status}: {text[:200]}"
+                f"token endpoint errcode={errcode} errmsg={data.get('errmsg')}"
             )
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError as exc:
-            raise InfoflowAPIError(f"token response is not JSON: {exc}") from exc
 
-    errcode = data.get("errcode")
-    if errcode not in (None, 0):
-        raise InfoflowAPIError(
-            f"token endpoint errcode={errcode} errmsg={data.get('errmsg')}"
-        )
+        inner = data.get("data") or {}
+        token = inner.get("app_access_token") if isinstance(inner, dict) else None
+        if not token:
+            raise InfoflowAPIError(f"token response missing app_access_token: {text[:200]}")
+        expires_in = TOKEN_DEFAULT_LIFETIME_SECONDS
+        if isinstance(inner, dict) and isinstance(inner.get("expires_in"), (int, float)):
+            expires_in = int(inner["expires_in"])
 
-    inner = data.get("data") or {}
-    token = inner.get("app_access_token") if isinstance(inner, dict) else None
-    if not token:
-        raise InfoflowAPIError(f"token response missing app_access_token: {text[:200]}")
-    expires_in = TOKEN_DEFAULT_LIFETIME_SECONDS
-    if isinstance(inner, dict) and isinstance(inner.get("expires_in"), (int, float)):
-        expires_in = int(inner["expires_in"])
-
-    _token_cache[account.app_key] = (
-        token,
-        now + max(60, expires_in - TOKEN_TTL_BUFFER_SECONDS),
-    )
-    return token
+        expires_at = time.time() + max(60, expires_in - TOKEN_TTL_BUFFER_SECONDS)
+        with _token_refresh_guard:
+            _token_cache[key] = (token, expires_at)
+            if _token_refreshes.get(key) is refresh:
+                _token_refreshes.pop(key, None)
+        with contextlib.suppress(concurrent.futures.InvalidStateError):
+            refresh.set_result(token)
+        return token
+    except BaseException as exc:
+        with _token_refresh_guard:
+            if _token_refreshes.get(key) is refresh:
+                _token_refreshes.pop(key, None)
+        if isinstance(exc, asyncio.CancelledError):
+            refresh.cancel()
+        else:
+            with contextlib.suppress(concurrent.futures.InvalidStateError):
+                refresh.set_exception(exc)
+        raise
 
 
 async def get_user_info_by_code(
@@ -419,9 +465,17 @@ async def get_user_info_by_code(
     return str(user_id)
 
 
-def clear_token_cache() -> None:
+def clear_token_cache(account: InfoflowAccountAPI | None = None) -> None:
     """Test-only: drop all cached tokens."""
-    _token_cache.clear()
+    if account is None:
+        with _token_refresh_guard:
+            _token_cache.clear()
+            _token_refreshes.clear()
+        return
+    key = _token_cache_key(account)
+    with _token_refresh_guard:
+        _token_cache.pop(key, None)
+        _token_refreshes.pop(key, None)
 
 
 def _ensure_session(session: aiohttp.ClientSession | None):
@@ -445,10 +499,11 @@ def _ensure_session(session: aiohttp.ClientSession | None):
     return _Wrap(session)
 
 
-def _auth_headers(
+def auth_headers(
     token: str,
     *,
     content_type: str | None = "application/json; charset=utf-8",
+    include_logid: bool = True,
 ) -> dict[str, str]:
     """Build the Infoflow auth headers.
 
@@ -457,11 +512,24 @@ def _auth_headers(
     """
     headers = {
         "Authorization": f"Bearer-{token}",
-        "LOGID": str(uuid.uuid4()),
     }
+    if include_logid:
+        headers["LOGID"] = str(uuid.uuid4())
     if content_type:
         headers["Content-Type"] = content_type
     return headers
+
+
+def openapi_gateway_identity_headers(token: str) -> dict[str, str]:
+    return {"x-openapi-gateway-identity": f"Bearer-{token}"}
+
+
+def _auth_headers(
+    token: str,
+    *,
+    content_type: str | None = "application/json; charset=utf-8",
+) -> dict[str, str]:
+    return auth_headers(token, content_type=content_type)
 
 
 # ---------------------------------------------------------------------------
@@ -1482,6 +1550,7 @@ __all__ = [
     "InfoflowAccountAPI",
     "ReplyContext",
     "add_message_reaction",
+    "auth_headers",
     "build_bos_public_url",
     "clear_token_cache",
     "create_group",
@@ -1493,6 +1562,7 @@ __all__ = [
     "im_bos_head_url",
     "im_bos_range_probe_url",
     "im_bos_upload",
+    "openapi_gateway_identity_headers",
     "recall_group_message",
     "recall_private_message",
 ]

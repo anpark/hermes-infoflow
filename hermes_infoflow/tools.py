@@ -13,6 +13,11 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
+from .inbound_files import (
+    inbound_file_from_raw_dict,
+    inbound_file_to_raw_dict,
+    inbound_files_from_raw_payload,
+)
 from .llm_format import format_created_time_ms, format_dm_record, format_group_record
 from .media import prepare_infoflow_image_bytes
 from .prompt_rules import INFOFLOW_DELIVERY_TOOL_RULES
@@ -226,6 +231,8 @@ SEND_MESSAGE_TOOL_SCHEMA = {
         "当前会话普通文字回复通常直接输出最终回复；需要指定 target、"
         "跨会话发送、发送链接、群聊 @ 或引用消息时使用本工具。"
         "分享本地图片或文件前，先调用 `file_delivery` 获取 URL；"
+        "如果文件来自当前 user message 的 `[Attachments]` 本地 path，"
+        "也必须先用 `file_delivery` 转成 URL，不能直接发送 path；"
         "不需要 Markdown 排版、只发送本地图片时使用 `image_paths`。\n\n"
         "目标：群聊用 `group:<群组ID>` 或纯数字群 ID；私聊用 "
         "`user:<uuapName>` 或 `<uuapName>`，可加 `infoflow:` 前缀。"
@@ -272,8 +279,10 @@ SEND_MESSAGE_TOOL_SCHEMA = {
                 "description": (
                     "消息正文。支持 Markdown 语法；只发送链接、群聊 @ "
                     "或引用时可为空字符串。分享本地图片或文件时，"
-                    "先调用 `file_delivery` 获取 URL，不要直接写入本地路径。HTTP/HTTPS "
-                    "jpg/png/gif/webp 图片 URL（包括内网 URL）需要以内联方式显示时，"
+                    "先调用 `file_delivery` 获取 URL，不要直接写入本地路径。"
+                    "当前 user message 的 `[Attachments]` path 也是本地路径，"
+                    "发给用户前必须先转成 URL。"
+                    "HTTP/HTTPS jpg/png/gif/webp 图片 URL（包括内网 URL）需要以内联方式显示时，"
                     "保持 `format=auto` 或使用 `format=markdown`，并在正文中写 "
                     "`![图片说明](URL)`；其它文件 URL 用普通链接。"
                 ),
@@ -389,6 +398,8 @@ FILE_DELIVERY_TOOL_SCHEMA = {
         "直接分享文件时发送 URL；需要把链接显示成可点击文字或把图片以内联方式显示时，"
         "使用支持 Markdown 渲染的正文格式，并在 `message` 中写 `[可见文字](URL)` "
         "或 `![图片说明](URL)`。"
+        "可以传入当前 user message 的 `[Attachments]` 中 status 为 downloaded 的 path，"
+        "或你处理/生成后的本地文件路径。"
         "只接受本地真实文件路径；单文件当前不能超过 69MiB。"
     ),
     "parameters": {
@@ -582,6 +593,37 @@ HISTORY_TOOL_SCHEMA = {
                 "default": 20,
             },
         },
+    },
+}
+
+
+DOWNLOAD_ATTACHMENT_TOOL_SCHEMA = {
+    "name": "infoflow_download_attachment",
+    "description": (
+        "按需下载当前如流会话或已授权历史消息中的入站文件附件。"
+        "当 `[Attachments]` 中的文件为 `status:\"not_downloaded\"` 且需要读取文件内容时使用。"
+        "成功和失败都返回 JSON 字符串；成功时包含本地 `path`。"
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "message_id": {
+                "type": "string",
+                "description": "附件所属 Infoflow 消息的 message_id。",
+            },
+            "file_index": {
+                "type": "integer",
+                "description": "附件在 `[Attachments].files[]` 中的下标，从 0 开始。",
+                "minimum": 0,
+                "default": 0,
+            },
+            "force": {
+                "type": "boolean",
+                "description": "可选。为 true 时忽略已有下载状态并重新下载。",
+                "default": False,
+            },
+        },
+        "required": ["message_id"],
     },
 }
 
@@ -1022,6 +1064,181 @@ def _record_is_admin(record: Any, admin_uid: str) -> bool:
     if sender.startswith("user:"):
         sender = sender.removeprefix("user:")
     return sender in admins
+
+
+def _record_raw_payload(record: Any) -> dict[str, Any]:
+    raw_json = str(getattr(record, "raw_json", "") or "")
+    if not raw_json:
+        return {}
+    try:
+        payload = json.loads(raw_json)
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _record_sender_id(record: Any) -> str:
+    sender = str(getattr(record, "sender", "") or "").strip()
+    return sender.removeprefix("user:").removeprefix("bot:")
+
+
+def _persist_record_raw_json(store: Any, record: Any, raw_json: str) -> None:
+    group_id = str(getattr(record, "group_id", "") or "")
+    if group_id:
+        store.persist_group(
+            message_id=str(getattr(record, "message_id", "") or ""),
+            group_id=group_id,
+            sender=str(getattr(record, "sender", "") or ""),
+            self_id=str(getattr(record, "self_id", "") or ""),
+            is_outgoing=bool(getattr(record, "is_outgoing", False)),
+            local_sent=bool(getattr(record, "local_sent", False)),
+            mentions_you=bool(getattr(record, "mentions_you", False)),
+            matched_regex_pattern=str(
+                getattr(record, "matched_regex_pattern", "") or ""
+            ),
+            mentions_everyone=bool(getattr(record, "mentions_everyone", False)),
+            quotes_your_message=bool(getattr(record, "quotes_your_message", False)),
+            mentions_other_people=bool(
+                getattr(record, "mentions_other_people", False)
+            ),
+            quotes_other_peoples_message=bool(
+                getattr(record, "quotes_other_peoples_message", False)
+            ),
+            msg_id2=str(getattr(record, "msg_id2", "") or ""),
+            content=str(getattr(record, "content", "") or ""),
+            created_time=int(getattr(record, "created_time", 0) or 0),
+            msg_time=int(getattr(record, "msg_time", 0) or 0),
+            raw_json=raw_json,
+        )
+        return
+    store.persist_dm(
+        message_id=str(getattr(record, "message_id", "") or ""),
+        peer=str(getattr(record, "peer", "") or ""),
+        self_id=str(getattr(record, "self_id", "") or ""),
+        sender=str(getattr(record, "sender", "") or ""),
+        is_outgoing=bool(getattr(record, "is_outgoing", False)),
+        local_sent=bool(getattr(record, "local_sent", False)),
+        quotes_your_message=bool(getattr(record, "quotes_your_message", False)),
+        msg_id2=str(getattr(record, "msg_id2", "") or ""),
+        content=str(getattr(record, "content", "") or ""),
+        created_time=int(getattr(record, "created_time", 0) or 0),
+        msg_time=int(getattr(record, "msg_time", 0) or 0),
+        raw_json=raw_json,
+    )
+
+
+def _attachment_files_from_record(record: Any) -> tuple[dict[str, Any], list[Any]]:
+    payload = _record_raw_payload(record)
+    if not payload:
+        return {}, []
+
+    raw_files = payload.get("_hermes_infoflow_files")
+    files = []
+    if isinstance(raw_files, list):
+        for item in raw_files:
+            if not isinstance(item, dict):
+                continue
+            file = inbound_file_from_raw_dict(item)
+            if file is not None:
+                files.append(file)
+        return payload, files
+
+    target = _target_from_record(record)
+    files = inbound_files_from_raw_payload(
+        payload,
+        chat_type=target[0],
+        chat_id=target[1] if target[0] == "group" else "",
+        file_msg_id=str(getattr(record, "message_id", "") or ""),
+        msgid2=str(getattr(record, "msg_id2", "") or ""),
+        sender_id=_record_sender_id(record),
+    )
+    for file in files:
+        if file.download_status == "pending":
+            file.download_status = "not_downloaded"
+    return payload, files
+
+
+def _record_with_persisted_attachments(adapter: Any, record: Any) -> Any:
+    payload, files = _attachment_files_from_record(record)
+    if not payload or not files or isinstance(payload.get("_hermes_infoflow_files"), list):
+        return record
+    store = getattr(adapter, "_message_store", None)
+    if store is None:
+        return record
+    payload["_hermes_infoflow_files"] = [
+        inbound_file_to_raw_dict(file)
+        for file in files
+    ]
+    _persist_record_raw_json(
+        store,
+        record,
+        json.dumps(payload, ensure_ascii=False),
+    )
+    return store.find_any(str(getattr(record, "message_id", "") or "")) or record
+
+
+def _records_with_persisted_attachments(adapter: Any, records: list[Any]) -> list[Any]:
+    return [_record_with_persisted_attachments(adapter, record) for record in records]
+
+
+def _local_file_readable(path: str) -> bool:
+    if not path:
+        return False
+    try:
+        return os.path.isfile(path)
+    except OSError:
+        return False
+
+
+def _download_attachment_payload(
+    *,
+    success: bool,
+    message_id: str,
+    file_index: int,
+    file: Any | None = None,
+    error: str = "",
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "success": bool(success),
+        "message_id": message_id,
+        "file_index": int(file_index),
+    }
+    if file is not None:
+        payload.update({
+            "name": str(getattr(file, "name", "") or ""),
+            "status": str(getattr(file, "download_status", "") or "not_downloaded"),
+        })
+        local_path = str(getattr(file, "local_path", "") or "")
+        if success and local_path:
+            payload["path"] = local_path
+        if getattr(file, "download_source", ""):
+            payload["download_source"] = str(getattr(file, "download_source") or "")
+    if error:
+        payload["error"] = error
+    elif file is not None and getattr(file, "error", ""):
+        payload["error"] = str(getattr(file, "error") or "")
+    return payload
+
+
+def _parse_file_index_arg(value: Any) -> tuple[int | None, str | None]:
+    if isinstance(value, bool):
+        return None, "file_index must be a non-negative integer"
+    if isinstance(value, int):
+        index = value
+    elif isinstance(value, float):
+        if not value.is_integer():
+            return None, "file_index must be a non-negative integer"
+        index = int(value)
+    elif isinstance(value, str):
+        raw = value.strip()
+        if not re.fullmatch(r"\d+", raw):
+            return None, "file_index must be a non-negative integer"
+        index = int(raw)
+    else:
+        return None, "file_index must be a non-negative integer"
+    if index < 0:
+        return None, "file_index must be a non-negative integer"
+    return index, None
 
 
 def _records_to_history_payload(adapter: Any, records: list[Any]) -> list[dict[str, str]]:
@@ -1730,6 +1947,7 @@ def make_history_handler():
                     before_count=before_count,
                     after_count=after_count,
                 )
+            records = _records_with_persisted_attachments(adapter, records)
             return tool_result_json(_records_to_history_payload(adapter, records))
 
         assert target is not None
@@ -1754,7 +1972,119 @@ def make_history_handler():
                 )
             else:
                 records = list(reversed(store.recent_dm(dm_user, limit=limit)))
+        records = _records_with_persisted_attachments(adapter, records)
         return tool_result_json(_records_to_history_payload(adapter, records))
+
+    return _handler
+
+
+def make_download_attachment_handler():
+    """Build the ``infoflow_download_attachment`` tool handler."""
+
+    async def _handler(args: dict, **_kwargs) -> str:
+        adapter = _get_live_adapter()
+        if adapter is None:
+            return _json_error("Infoflow adapter not running — cannot download attachment.")
+        store = getattr(adapter, "_message_store", None)
+        if store is None:
+            return _json_error("Infoflow message store is unavailable.")
+        serverapi = getattr(adapter, "_serverapi", None)
+        downloader = getattr(serverapi, "download_inbound_file", None)
+        if not callable(downloader):
+            return _json_error("Infoflow file downloader is unavailable.")
+
+        message_id = str(args.get("message_id") or "").strip()
+        if not message_id:
+            return _json_error("message_id is required")
+        file_index, file_index_error = _parse_file_index_arg(
+            args.get("file_index", 0)
+        )
+        if file_index_error:
+            return _json_error(file_index_error)
+        assert file_index is not None
+        force = bool(args.get("force", False))
+
+        from .bot import get_recall_inbound_message_id_hint  # noqa: E402
+
+        current_message_id = get_recall_inbound_message_id_hint() or ""
+        current_record = store.find_any(current_message_id) if current_message_id else None
+        if current_record is None:
+            return _json_error(
+                "Current Infoflow message context is required to download attachments."
+            )
+        current_target = _target_from_record(current_record)
+        admin_uid = str(getattr(adapter, "_admin_uid", "") or "")
+        current_is_admin = _record_is_admin(current_record, admin_uid)
+
+        record = store.find_any(message_id)
+        if record is None:
+            return _json_error("message_id not found")
+        record_target = _target_from_record(record)
+        if not _same_target(record_target, current_target) and not current_is_admin:
+            return _json_error("Only admin can download attachments outside the current conversation.")
+
+        record = _record_with_persisted_attachments(adapter, record)
+        payload, files = _attachment_files_from_record(record)
+        if not files:
+            return _json_error("message_id has no file attachments")
+        if file_index >= len(files):
+            return _json_error("file_index out of range")
+
+        file = files[file_index]
+        if (
+            not force
+            and getattr(file, "download_status", "") == "downloaded"
+            and _local_file_readable(str(getattr(file, "local_path", "") or ""))
+        ):
+            return tool_result_json(_download_attachment_payload(
+                success=True,
+                message_id=message_id,
+                file_index=file_index,
+                file=file,
+            ))
+
+        try:
+            file = await _with_temp_session(
+                adapter,
+                downloader(file, session=None),
+            )
+        except Exception as exc:
+            logger.warning(
+                "[infoflow:download_attachment] download failed mid=%s file_index=%s: %s",
+                message_id,
+                file_index,
+                exc,
+            )
+            file.download_status = "failed"
+            file.download_source = ""
+            file.error = f"download_exception:{type(exc).__name__}"
+
+        payload, files = _attachment_files_from_record(record)
+        if file_index < len(files):
+            files[file_index] = file
+        else:
+            files.append(file)
+        payload["_hermes_infoflow_files"] = [
+            inbound_file_to_raw_dict(item)
+            for item in files
+        ]
+        _persist_record_raw_json(
+            store,
+            record,
+            json.dumps(payload, ensure_ascii=False),
+        )
+
+        success = (
+            getattr(file, "download_status", "") == "downloaded"
+            and bool(getattr(file, "local_path", "") or "")
+        )
+        return tool_result_json(_download_attachment_payload(
+            success=success,
+            message_id=message_id,
+            file_index=file_index,
+            file=file,
+            error="" if success else (getattr(file, "error", "") or "download_failed"),
+        ))
 
     return _handler
 

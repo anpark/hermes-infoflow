@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .identity import bot_key, private_peer_key, self_key, sender_key, user_key
+from .inbound_files import inbound_file_to_raw_dict
 from .itypes import (
     IncomingMessage,
     ProcessResult,
@@ -949,7 +950,17 @@ class Bot:
             )
 
         # Persist to unified message store.
-        raw_json = json.dumps(msg.raw_data, ensure_ascii=False) if msg.raw_data else ""
+        raw_payload: dict[str, Any] = {}
+        if isinstance(msg.raw_data, dict):
+            raw_payload = dict(msg.raw_data)
+        elif msg.raw_data:
+            raw_payload = {"raw": msg.raw_data}
+        if getattr(msg, "files", None):
+            raw_payload["_hermes_infoflow_files"] = [
+                inbound_file_to_raw_dict(file)
+                for file in list(getattr(msg, "files", []) or [])
+            ]
+        raw_json = json.dumps(raw_payload, ensure_ascii=False) if raw_payload else ""
         msg_time = self._msg_time_ms(msg)
         self_id = self_key(self._settings)
         if msg.dm_user_id is not None:

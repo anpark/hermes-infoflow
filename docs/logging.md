@@ -46,6 +46,8 @@ def gw_log():
 | 标签 | 触发位置 | 记录内容 | 格式 |
 |------|---------|---------|------|
 | `[iflow:raw]` | `webhook.py` | Webhook 收到的**原始明文 payload** | JSON 全文 |
+| `[iflow:request_full]` | `webhook.py` | Webhook HTTP 请求方法、路径、header 和 raw body | 全量请求文本 |
+| `[iflow:request_raw]` | `webhook.py` | 无法解密或不支持格式时的 raw body fallback | 原始请求 body |
 | `[iflow:event]` | `adapter.py` `_build_message_event()` | Enrichment 后的**标准字段** | `sender_id= sender_name= group= mentioned= text=` |
 | `[infoflow-enrich]` | `adapter.py` `_enrich_sender()` | Sender 补全**结果** | `sender= name= agent_id= is_bot= degraded=` |
 | `[iflow:decision]` | `adapter.py` | 策略**判定结果** | `action= trigger= reason= sender= text=` |
@@ -67,6 +69,23 @@ def gw_log():
 |------|---------|------|
 | `[infoflow]` | `adapter.py` 各处 | 插件通用信息（连接状态、配置加载等） |
 | `[iflow:at_only]` | `adapter.py` | AT-only 消息处理 |
+| `[infoflow:file_inbound]` | `inbound_files.py` | 入站文件下载、缓存命中、下载失败状态；不记录 token、下载 URL 或文件内容 |
+| `[infoflow:log_cleanup]` | `adapter.py` connect 阶段和每日后台任务 | 清理 `~/.hermes/logs` 下超过 14 天的轮转日志文件 |
+
+### 2.4 日志保留
+
+插件启动连接时会执行一次 best-effort 清理，并在运行期间每 24 小时重复清理一次：
+
+```text
+~/.hermes/logs/
+```
+
+规则：
+
+- 删除超过 14 天未修改的轮转日志普通文件：`*.log.*`、`*.log-*`。
+- 不删除当前活跃日志文件：`gateway.log`、`gateway.error.log`、`agent.log` 等 `*.log`。
+- 不删除目录，不扫描 `~/.hermes/logs` 之外的路径。
+- 清理失败不影响 webhook 启动，只记录 `[infoflow:log_cleanup] failed`。
 
 ---
 

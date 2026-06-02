@@ -38,6 +38,7 @@ from .coerce import coerce_bool
 from .itypes import (
     BodyItem,
     GroupMember,
+    InboundFile,
     IncomingMessage,
     RecallResult,
     ReplyInfo,
@@ -155,6 +156,12 @@ def _sent_result_from_api_response(
 
 def _normalize_body_item(item: Any) -> BodyItem:
     """Convert parser/raw body item fields to internal snake_case fields."""
+    def _int_or_zero(value: Any) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
     return BodyItem(
         type=str(getattr(item, "type", "") or ""),
         content=str(getattr(item, "content", "") or ""),
@@ -168,6 +175,33 @@ def _normalize_body_item(item: Any) -> BodyItem:
         preview=str(getattr(item, "preview", "") or ""),
         sender_imid=str(getattr(item, "sender_imid", "") or ""),
         is_bot_message=coerce_bool(getattr(item, "is_bot_message", False)),
+        fid=str(getattr(item, "fid", "") or ""),
+        size=_int_or_zero(getattr(item, "size", 0)),
+        md5=str(getattr(item, "md5", "") or ""),
+    )
+
+
+def _normalize_inbound_file(item: Any) -> InboundFile:
+    """Convert parser file metadata to the internal inbound file structure."""
+    def _int_or_zero(value: Any) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    return InboundFile(
+        fid=str(getattr(item, "fid", "") or ""),
+        name=str(getattr(item, "name", "") or ""),
+        size=max(0, _int_or_zero(getattr(item, "size", 0))),
+        ext=str(getattr(item, "ext", "") or ""),
+        md5=str(getattr(item, "md5", "") or ""),
+        chat_type=str(getattr(item, "chat_type", "") or ""),
+        api_chat_type=_int_or_zero(getattr(item, "api_chat_type", 0)),
+        chat_id=str(getattr(item, "chat_id", "") or ""),
+        file_msg_id=str(getattr(item, "file_msg_id", "") or ""),
+        msgid2=str(getattr(item, "msgid2", "") or ""),
+        sender_id=str(getattr(item, "sender_id", "") or ""),
+        sender_imid=str(getattr(item, "sender_imid", "") or ""),
     )
 
 
@@ -1153,6 +1187,10 @@ class ServerAPI:
             is_reply_to_bot=parser_inbound.is_reply_to_bot,
             body_for_agent=parser_inbound.body_for_agent or "",
             image_urls=list(parser_inbound.image_urls),
+            files=[
+                _normalize_inbound_file(item)
+                for item in getattr(parser_inbound, "files", [])
+            ],
             body_items=[_normalize_body_item(item) for item in parser_inbound.body_items],
             dedupe_key=parser_inbound.dedupe_key() or "",
             msgseqid=str(parser_inbound.msgseqid or ""),
@@ -2648,7 +2686,11 @@ class ServerAPI:
                 token = await self.get_access_token(session=sess)
                 async with sess.get(
                     url,
-                    headers={"Authorization": f"Bearer-{token}"},
+                    headers=self.auth_headers(
+                        token,
+                        content_type=None,
+                        include_logid=False,
+                    ),
                     timeout=aiohttp.ClientTimeout(total=30.0),
                 ) as resp:
                     if resp.status >= 400:
@@ -2663,6 +2705,21 @@ class ServerAPI:
                 logger.warning("[serverapi] download_image(%s) failed: %s", url[:80], exc)
                 return None
 
+    async def download_inbound_file(
+        self,
+        file: InboundFile,
+        *,
+        session: aiohttp.ClientSession | None = None,
+    ) -> InboundFile:
+        from .inbound_files import download_inbound_file
+
+        return await download_inbound_file(
+            self,
+            file,
+            session=session,
+            settings=self._settings,
+        )
+
     # ------------------------------------------------------------------
     # Access token
     # ------------------------------------------------------------------
@@ -2671,7 +2728,28 @@ class ServerAPI:
         self,
         *,
         session: aiohttp.ClientSession | None = None,
+        force_refresh: bool = False,
     ) -> str:
         """Return a valid app access token (cached / refreshed)."""
         async with self._ensure_session(session) as sess:
-            return await _api.get_app_access_token(self._api_account, session=sess)
+            return await _api.get_app_access_token(
+                self._api_account,
+                session=sess,
+                force_refresh=force_refresh,
+            )
+
+    def auth_headers(
+        self,
+        token: str,
+        *,
+        content_type: str | None = "application/json; charset=utf-8",
+        include_logid: bool = True,
+    ) -> dict[str, str]:
+        return _api.auth_headers(
+            token,
+            content_type=content_type,
+            include_logid=include_logid,
+        )
+
+    def openapi_gateway_identity_headers(self, token: str) -> dict[str, str]:
+        return _api.openapi_gateway_identity_headers(token)

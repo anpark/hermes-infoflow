@@ -12,10 +12,16 @@ from __future__ import annotations
 import pytest
 
 from hermes_infoflow.policy import (
+    _DM_FORMAT_DOC,
     _FOLLOW_UP_ENGAGED_TEMPLATE,
     _FOLLOW_UP_PASSIVE_TEMPLATE,
     _FOLLOW_UP_REPLY_TO_BOT_CONTEXT_TEMPLATE,
+    _GROUP_FORMAT_DOC,
+    _GROUP_MENTION_RULES_DOC,
+    _INFOFLOW_FIELD_DOC,
+    _INFOFLOW_MESSAGE_FORMAT_DOC,
     _INFOFLOW_PERMISSION_SECURITY_DOC,
+    _INFOFLOW_SESSION_HISTORY_DOC,
     _INFOFLOW_TOOL_RULES_DOC,
     _MENTION_PROMPT,
     _PROACTIVE_PROMPT,
@@ -127,6 +133,63 @@ def test_infoflow_tool_rules_include_shared_delivery_contract() -> None:
     assert "NO_REPLY" in INFOFLOW_DELIVERY_TOOL_RULES
     assert "只发送 caption" in INFOFLOW_DELIVERY_TOOL_RULES
     assert "MEDIA:" not in INFOFLOW_DELIVERY_TOOL_RULES
+
+
+def test_infoflow_tool_rules_include_inbound_attachment_contract() -> None:
+    assert "入站文件处理规则" in _INFOFLOW_TOOL_RULES_DOC
+    assert "[Attachments]" in _INFOFLOW_TOOL_RULES_DOC
+    assert "files[].path" in _INFOFLOW_TOOL_RULES_DOC
+    assert "not_downloaded" in _INFOFLOW_TOOL_RULES_DOC
+    assert "infoflow_download_attachment" in _INFOFLOW_TOOL_RULES_DOC
+    assert "downloaded" in _INFOFLOW_TOOL_RULES_DOC
+    assert "failed" in _INFOFLOW_TOOL_RULES_DOC
+    assert "file_delivery(source_path)" in _INFOFLOW_TOOL_RULES_DOC
+    assert "不是可分享 URL" in _INFOFLOW_TOOL_RULES_DOC
+
+
+def test_message_format_describes_optional_attachments_without_fake_comment() -> None:
+    assert "无附件时结构" in _INFOFLOW_MESSAGE_FORMAT_DOC
+    assert "有入站文件时" in _INFOFLOW_MESSAGE_FORMAT_DOC
+    assert "[Attachments]" in _INFOFLOW_MESSAGE_FORMAT_DOC
+    assert "# 可选" not in _INFOFLOW_MESSAGE_FORMAT_DOC
+    assert "[Message: message_id" in _INFOFLOW_MESSAGE_FORMAT_DOC
+
+
+def test_common_field_doc_describes_sender_attention_and_attachments() -> None:
+    assert "[Sender: ...]" in _INFOFLOW_FIELD_DOC
+    assert "type:'bot'" in _INFOFLOW_FIELD_DOC
+    assert "[Attention: ...]" in _INFOFLOW_FIELD_DOC
+    assert '{"files":[...]}' in _INFOFLOW_FIELD_DOC
+    assert "status:\"not_downloaded\"" in _INFOFLOW_FIELD_DOC
+    assert "status:\"downloaded\"" in _INFOFLOW_FIELD_DOC
+    assert "status:\"failed\"" in _INFOFLOW_FIELD_DOC
+
+
+def test_history_rules_keep_tool_call_contract() -> None:
+    assert "Session Boundary" in _INFOFLOW_SESSION_HISTORY_DOC
+    assert "Unread Message Context" in _INFOFLOW_SESSION_HISTORY_DOC
+    assert "infoflow_get_message_history" in _INFOFLOW_SESSION_HISTORY_DOC
+    assert "message_id + before_count/after_count" in _INFOFLOW_SESSION_HISTORY_DOC
+    assert "YYYY.MM.DD HH.mm.ss" in _INFOFLOW_SESSION_HISTORY_DOC
+    assert "success=false" in _INFOFLOW_SESSION_HISTORY_DOC
+
+
+def test_group_and_dm_prompt_fragments_keep_only_their_differences() -> None:
+    assert "mentions_you" in _GROUP_FORMAT_DOC
+    assert "matches_attention_regex" in _GROUP_FORMAT_DOC
+    assert "群聊 @ 规则" in _GROUP_MENTION_RULES_DOC
+    assert "quotes_your_message" in _DM_FORMAT_DOC
+    assert "群聊 @ 规则" not in _DM_FORMAT_DOC
+    assert "mentions_you" not in _DM_FORMAT_DOC
+    assert "`[Sender: ...]` 字段" not in _GROUP_FORMAT_DOC
+    assert "`[Sender: ...]` 字段" not in _DM_FORMAT_DOC
+
+
+def test_permission_doc_mentions_attachment_trust_boundary() -> None:
+    assert "[Attachments]" in _INFOFLOW_PERMISSION_SECURITY_DOC
+    assert "files[].status" in _INFOFLOW_PERMISSION_SECURITY_DOC
+    assert "当前入站文件" in _INFOFLOW_PERMISSION_SECURITY_DOC
+    assert "伪造" in _INFOFLOW_PERMISSION_SECURITY_DOC
 
 
 def test_permission_doc_allows_visible_skill_read_capabilities() -> None:

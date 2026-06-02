@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_PORT = 26521
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_API_HOST = "https://api.im.baidu.com"
+DEFAULT_FILE_API_HOST = "http://apiin.im.baidu.com"
 DEFAULT_WEBHOOK_PATH = "/webhook/infoflow"
 MAX_MESSAGE_LENGTH = 2048  # matches OpenClaw textChunkLimit
 DEFAULT_BODY_LIMIT_BYTES = 20 * 1024 * 1024
@@ -188,6 +189,21 @@ def _read_account_settings(config: Any) -> dict[str, Any]:
         "app_key": pick("INFOFLOW_APP_KEY", "app_key", "") or "",
         "app_secret": pick("INFOFLOW_APP_SECRET", "app_secret", "") or "",
         "api_host": pick("INFOFLOW_API_HOST", "api_host", DEFAULT_API_HOST) or DEFAULT_API_HOST,
+        "file_api_host": pick(
+            "INFOFLOW_FILE_API_HOST",
+            "file_api_host",
+            DEFAULT_FILE_API_HOST,
+        ) or DEFAULT_FILE_API_HOST,
+        "inbound_file_dir": pick(
+            "HERMES_INFOFLOW_INBOUND_FILE_DIR",
+            "inbound_file_dir",
+            "",
+        ) or "",
+        "inbound_file_max_bytes_raw": pick(
+            "HERMES_INFOFLOW_INBOUND_FILE_MAX_BYTES",
+            "inbound_file_max_bytes",
+            "",
+        ),
         "robot_name": pick("INFOFLOW_ROBOT_NAME", "robot_name", "") or "",
         # robot_id is auto-discovered from inbound @-mention bodies on first
         # use; users normally don't set this explicitly, but if they do we
@@ -258,6 +274,16 @@ def _read_account_settings(config: Any) -> dict[str, Any]:
         )
     except (TypeError, ValueError):
         settings["idle_session_reset_seconds"] = DEFAULT_IDLE_SESSION_RESET_SECONDS
+
+    try:
+        inbound_max = settings.pop("inbound_file_max_bytes_raw")
+        settings["inbound_file_max_bytes"] = (
+            int(inbound_max)
+            if inbound_max not in (None, "")
+            else 100 * 1024 * 1024
+        )
+    except (TypeError, ValueError):
+        settings["inbound_file_max_bytes"] = 100 * 1024 * 1024
 
     # CSV-ish (mentions).
     watch_raw = settings.pop("watch_mentions_raw") or ""
@@ -351,6 +377,9 @@ def _env_enablement() -> dict | None:
         ("INFOFLOW_GROUPS", "groups"),
         ("INFOFLOW_CONNECTION_MODE", "connection_mode"),
         ("HERMES_STATE_DIR", "state_dir"),
+        ("INFOFLOW_FILE_API_HOST", "file_api_host"),
+        ("HERMES_INFOFLOW_INBOUND_FILE_DIR", "inbound_file_dir"),
+        ("HERMES_INFOFLOW_INBOUND_FILE_MAX_BYTES", "inbound_file_max_bytes"),
     ):
         val = os.getenv(env_key, "").strip()
         if val:
@@ -460,6 +489,7 @@ __all__ = [
     "DEFAULT_BODY_LIMIT_BYTES",
     "ADMIN_USER_ENV",
     "DEFAULT_API_HOST",
+    "DEFAULT_FILE_API_HOST",
     "DEFAULT_HOST",
     "DEFAULT_IDLE_SESSION_RESET_SECONDS",
     "DEFAULT_PORT",

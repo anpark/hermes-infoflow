@@ -22,6 +22,7 @@ class _Msg:
     image_urls: list[str] | None = None
     reply_targets: list[object] | None = None
     is_at_only: bool = False
+    files: list[object] | None = None
 
 
 def test_render_ignores_legacy_body_for_agent_when_body_items_exist() -> None:
@@ -130,6 +131,20 @@ def test_render_at_only_description_and_hint() -> None:
     assert "用户 @ 了你但没有输入正文" in content
     assert "请优先阅读并理解上下文" in content
     assert "只有在上下文中没有可识别的问题、话题或待办时" in content
+
+
+def test_render_file_only_message_keeps_empty_body() -> None:
+    msg = _Msg(files=[{"name": "sample.csv"}])
+    assert render_message_content(msg) == ""
+
+
+def test_render_file_with_at_does_not_become_at_only_hint() -> None:
+    msg = _Msg(
+        body_items=[_At(name="chengbo5.1", robot_id="6471")],
+        is_at_only=True,
+        files=[{"name": "sample.csv"}],
+    )
+    assert render_message_content(msg) == "@chengbo5.1"
 
 
 def test_render_string_false_boolean_fields_are_not_truthy() -> None:

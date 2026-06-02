@@ -33,6 +33,10 @@
   utils.py        — 工具函数（图片下载、安全 URL 判断、gw_log）
 ```
 
+入站文件接收、解析、下载和落盘机制见
+[`infoflow-inbound-files.md`](infoflow-inbound-files.md)。该能力沿现有入站链路接入
+`parser.py`、`itypes.py`、`adapter.py`、`serverapi.py`，但不复用出站 `file_delivery` 的分享目录和 URL 缓存。
+
 ### 1.2 职责边界
 
 | 模块 | 职责（仅以下，不越界） |
