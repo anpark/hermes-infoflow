@@ -15,6 +15,13 @@ class _At:
 
 
 @dataclass
+class _Face:
+    type: str = "FACE"
+    face_name: str = ""
+    face_cid: str = ""
+
+
+@dataclass
 class _Msg:
     body_for_agent: str = ""
     text: str = ""
@@ -153,6 +160,31 @@ def test_render_string_false_boolean_fields_are_not_truthy() -> None:
 
     msg_all = _Msg(body_items=[_At(name="成博", user_id="chengbo05", at_all="true")])
     assert render_message_content(msg_all) == "@所有人"
+
+
+def test_render_face_marker_with_group_mention_body() -> None:
+    msg = _Msg(
+        body_items=[
+            _At(name="chengbo5.1", robot_id="6471"),
+            _Face(face_name="自定义表情"),
+        ],
+    )
+    assert render_message_content(msg) == (
+        "@chengbo5.1 <Face type:'sticker'; name:'自定义表情'>"
+    )
+
+
+def test_render_face_body_is_not_overridden_by_at_only_flag() -> None:
+    msg = _Msg(
+        body_items=[
+            _At(name="chengbo5.1", robot_id="6471"),
+            _Face(face_name="doge", face_cid="d95"),
+        ],
+        is_at_only=True,
+    )
+    assert render_message_content(msg) == (
+        "@chengbo5.1 <Face type:'sticker'; name:'doge'; id:'d95'>"
+    )
 
 
 def test_render_image_placeholder_when_no_text() -> None:

@@ -93,6 +93,8 @@ class BodyItem:
     robotid: str = ""   # stored as str to preserve precision; "" when absent
     atall: bool = False  # True when {"type": "AT", "atall": true}
     downloadurl: str = ""
+    facecid: str = ""      # for FACE items
+    facename: str = ""     # for FACE items
     messageid: str = ""  # for replyData items, the quoted message id (str)
     preview: str = ""    # for replyData items
     sender_imid: str = ""  # for replyData items, quoted sender's Infoflow imid
@@ -361,6 +363,16 @@ def _coerce_body_item(raw: dict[str, Any]) -> BodyItem:
         robotid=_stringify(raw.get("robotid")),
         atall=coerce_bool(raw.get("atall")),
         downloadurl=_stringify(raw.get("downloadurl")),
+        facecid=_stringify(
+            raw.get("facecid")
+            or raw.get("faceCid")
+            or raw.get("FaceCid")
+        ),
+        facename=_stringify(
+            raw.get("facename")
+            or raw.get("faceName")
+            or raw.get("FaceName")
+        ),
         messageid=_stringify(raw.get("messageid") or raw.get("sBasemsgId")),
         preview=_stringify(raw.get("preview")),
         sender_imid=_stringify(
@@ -511,6 +523,24 @@ def _extract_body_parts(body_items: list[BodyItem]) -> tuple[str, bool, list[str
         elif t == "FILE":
             has_structural_body = True
     return ("".join(raw_parts).strip(), has_structural_body, image_urls)
+
+
+def _body_is_at_only(body_items: list[BodyItem]) -> bool:
+    """True only for AT plus optional blank TEXT/MD items.
+
+    FACE, IMAGE, FILE, LINK, REPLY, and unknown body items are not plain @ pings
+    even when they do not contribute normal text.
+    """
+    saw_at = False
+    for item in body_items:
+        t = (item.type or "").upper()
+        if t == "AT":
+            saw_at = True
+            continue
+        if t in ("TEXT", "MD") and not (item.content or "").strip():
+            continue
+        return False
+    return saw_at
 
 
 def _file_ext_from_name(name: str) -> str:
@@ -940,7 +970,7 @@ def build_group_inbound(
         # AT-only message (no TEXT/MD body, e.g. user just @'s the bot).
         # Keep text empty; final readable content is rendered from body_items.
         text_out = ""
-        _is_at_only = not files
+        _is_at_only = (not files) and _body_is_at_only(body_items)
     else:
         text_out = raw_text
         _is_at_only = False

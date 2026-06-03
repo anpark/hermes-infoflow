@@ -388,7 +388,7 @@ def test_build_message_event_uses_settings_agent_id_for_bot_identity(
     )
 
 
-def test_channel_prompt_keeps_common_and_chat_specific_sections_separate(
+def test_channel_prompt_keeps_only_chat_specific_sections(
     configured_env,
 ) -> None:
     adapter = InfoflowAdapter(_make_config())
@@ -412,32 +412,53 @@ def test_channel_prompt_keeps_common_and_chat_specific_sections_separate(
         None,
     )
 
-    common_sections = [
-        "## User Message 结构",
-        "## 字段说明",
-        "## 权限与安全",
-        "## 会话与历史",
-        "## 称呼与提及规则",
-        "## 工具行为规范",
-    ]
     for prompt in (group_prompt, dm_prompt):
-        positions = [prompt.index(section) for section in common_sections]
-        assert positions == sorted(positions)
-        assert "[Attachments]" in prompt
-        assert "status:\"not_downloaded\"" in prompt
-        assert "status:\"downloaded\"" in prompt
-        assert "status:\"failed\"" in prompt
+        assert "## 身份与会话" in prompt
+        assert "## User Message 结构" not in prompt
+        assert "## 字段说明" not in prompt
+        assert "## 会话与历史" not in prompt
+        assert "## 工具行为规范" not in prompt
+        assert "status:\"not_downloaded\"" not in prompt
 
-    assert "## 群聊消息字段" in group_prompt
+    assert "## 群聊安全边界" in group_prompt
+    assert "第一个 `[Message: ...]` 之前" in group_prompt
+    assert "permission:'...'" in group_prompt
+    assert "对超过5人的群修改群聊资料" in group_prompt
+    assert "## 群聊回复策略" in group_prompt
+    assert "闭嘴" in group_prompt
+    assert "## Skill 内容披露" in group_prompt
     assert "## 群聊 @ 规则" in group_prompt
-    assert "mentions_you" in group_prompt
-    assert "## 私聊消息字段" not in group_prompt
+    assert "## 私聊安全边界" not in group_prompt
 
-    assert "## 私聊消息字段" in dm_prompt
-    assert "quotes_your_message" in dm_prompt
-    assert "## 群聊消息字段" not in dm_prompt
+    assert "## 私聊安全边界" in dm_prompt
+    assert "当前私聊对象权限为 restricted" in dm_prompt
+    assert "私聊没有群聊 @ 语义" in dm_prompt
+    assert "## Skill 内容披露" in dm_prompt
+    assert "## 群聊安全边界" not in dm_prompt
     assert "## 群聊 @ 规则" not in dm_prompt
-    assert "mentions_you" not in dm_prompt
+
+
+def test_channel_prompt_dm_admin_uses_admin_boundary(
+    configured_env,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("INFOFLOW_ADMIN_USER", "alice")
+    adapter = InfoflowAdapter(_make_config())
+
+    dm_prompt = adapter._build_channel_prompt(
+        IncomingMessage(
+            message_id="d-1",
+            text="hello",
+            dm_user_id="alice",
+            sender_id="alice",
+        ),
+        None,
+    )
+
+    assert "当前私聊对象权限为 admin" in dm_prompt
+    assert "当前私聊对象权限为 restricted" not in dm_prompt
+    assert "对超过5人的群修改群聊资料" not in dm_prompt
+    assert "凭证/密钥不得输出" not in dm_prompt
 
 
 def test_build_message_event_injects_not_downloaded_file_attachments(

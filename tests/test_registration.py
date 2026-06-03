@@ -36,7 +36,11 @@ def test_register_registers_platform_and_tool() -> None:
     assert platform["cron_deliver_env_var"] == "INFOFLOW_OP_CHANNEL"
     assert platform["max_message_length"] == 2048
     assert "infoflow" in (platform.get("install_hint") or "").lower() or platform.get("install_hint")
-    assert "外发工具规则" in platform["platform_hint"]
+    assert "【回复与发送】" in platform["platform_hint"]
+    assert "【内容与格式】" in platform["platform_hint"]
+    assert "【文件与图片】" in platform["platform_hint"]
+    assert "【外发结果】" in platform["platform_hint"]
+    assert "【消息格式】" in platform["platform_hint"]
     assert "file_delivery" in platform["platform_hint"]
     assert "NO_REPLY" in platform["platform_hint"]
     # Required env names align with the plugin.yaml manifest.
@@ -97,16 +101,18 @@ def test_register_registers_platform_and_tool() -> None:
         "降级",
         "双发",
         "自动选择可正常展示",
-        "Markdown 链接",
         "LINK body",
         "richtext",
         "TEXT",
     ):
         assert forbidden not in platform["platform_hint"]
-    assert "auto`，优先以 Markdown 发送" in platform["platform_hint"]
-    assert "`markdown` 表示希望以 Markdown 发送" in platform["platform_hint"]
-    assert "`text` 表示正文必须以纯文本发送" in platform["platform_hint"]
-    assert "使用 `text` 时" in platform["platform_hint"]
+    assert "直接回复可以包含 Markdown" in platform["platform_hint"]
+    assert "只通过 `links`、`image_paths`、群聊 @ 或 `reply_to`" in (
+        platform["platform_hint"]
+    )
+    assert "强制 Markdown 用 `format=markdown`" in platform["platform_hint"]
+    assert "纯文本用 `format=text`" in platform["platform_hint"]
+    assert "format=text` 时不要" in platform["platform_hint"]
     assert "[可见文字](URL)" in platform["platform_hint"]
     assert "![图片说明](URL)" in platform["platform_hint"]
     assert "format=text" in platform["platform_hint"]

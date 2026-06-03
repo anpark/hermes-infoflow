@@ -171,6 +171,16 @@ def _normalize_body_item(item: Any) -> BodyItem:
         robot_id=str(getattr(item, "robotid", "") or ""),
         at_all=coerce_bool(getattr(item, "atall", False)),
         download_url=str(getattr(item, "downloadurl", "") or ""),
+        face_cid=str(
+            getattr(item, "facecid", "")
+            or getattr(item, "face_cid", "")
+            or ""
+        ),
+        face_name=str(
+            getattr(item, "facename", "")
+            or getattr(item, "face_name", "")
+            or ""
+        ),
         message_id=str(getattr(item, "messageid", "") or ""),
         preview=str(getattr(item, "preview", "") or ""),
         sender_imid=str(getattr(item, "sender_imid", "") or ""),

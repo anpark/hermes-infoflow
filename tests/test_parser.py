@@ -420,6 +420,101 @@ def test_group_message_extracts_mention_and_msgseqid(account):
     assert inbound.image_urls == ["https://media.infoflow/img.jpg"]
 
 
+def test_group_at_face_message_is_not_at_only(account):
+    acct, raw_key = account
+    payload = {
+        "message": {
+            "header": {
+                "fromuserid": "bob",
+                "groupid": 123456,
+                "messageid": "face-with-at",
+            },
+            "body": [
+                {"type": "AT", "name": "hermes", "robotid": "4105000875"},
+                {"type": "TEXT", "content": " "},
+                {"type": "FACE", "facecid": "d95", "facename": "doge"},
+                {"type": "TEXT", "content": ""},
+            ],
+        }
+    }
+    ct = aes_ecb_encrypt_b64url(json.dumps(payload), raw_key)
+
+    res = parser.parse_webhook(
+        content_type="text/plain",
+        raw_body=ct,
+        account=acct,
+    )
+
+    assert res.kind == "message"
+    inbound = res.inbound
+    assert inbound.was_mentioned is True
+    assert inbound.text == ""
+    assert inbound.is_at_only is False
+    assert inbound.image_urls == []
+    face = inbound.body_items[2]
+    assert face.type == "FACE"
+    assert face.facecid == "d95"
+    assert face.facename == "doge"
+
+
+def test_group_at_inline_image_without_download_url_is_not_at_only(account):
+    acct, raw_key = account
+    payload = {
+        "message": {
+            "header": {
+                "fromuserid": "bob",
+                "groupid": 123456,
+                "messageid": "inline-image-with-at",
+            },
+            "body": [
+                {"type": "AT", "name": "hermes", "robotid": "4105000875"},
+                {"type": "TEXT", "content": " "},
+                {"type": "IMAGE"},
+            ],
+        }
+    }
+    ct = aes_ecb_encrypt_b64url(json.dumps(payload), raw_key)
+
+    res = parser.parse_webhook(
+        content_type="text/plain",
+        raw_body=ct,
+        account=acct,
+    )
+
+    assert res.kind == "message"
+    assert res.inbound.text == ""
+    assert res.inbound.is_at_only is False
+    assert res.inbound.image_urls == []
+
+
+def test_group_blank_at_message_is_at_only(account):
+    acct, raw_key = account
+    payload = {
+        "message": {
+            "header": {
+                "fromuserid": "bob",
+                "groupid": 123456,
+                "messageid": "blank-at",
+            },
+            "body": [
+                {"type": "AT", "name": "hermes", "robotid": "4105000875"},
+                {"type": "TEXT", "content": " "},
+            ],
+        }
+    }
+    ct = aes_ecb_encrypt_b64url(json.dumps(payload), raw_key)
+
+    res = parser.parse_webhook(
+        content_type="text/plain",
+        raw_body=ct,
+        account=acct,
+    )
+
+    assert res.kind == "message"
+    assert res.inbound.text == ""
+    assert res.inbound.is_at_only is True
+
+
 def test_group_message_does_not_match_robotid_to_app_agent_id(account):
     acct, raw_key = account
     payload = {

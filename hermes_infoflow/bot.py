@@ -337,12 +337,6 @@ class Bot:
         for mid in expired:
             self._silent_tool_success_by_inbound_mid.pop(mid, None)
 
-    @staticmethod
-    def _no_reply_fallback_for_path(path: str) -> str:
-        if path == "bot-mentioned":
-            return "收到，我在。你想让我处理什么，直接说就行。"
-        return ""
-
     async def _broadcast_mixed_no_reply_to_ops(
         self,
         *,
@@ -1420,38 +1414,26 @@ class Bot:
         # NO_REPLY sentinel — see ``no_reply_sentinel_hits`` for acceptance rules.
         if no_reply_sentinel_hits(text):
             inbound_mid = _mid_var.get("")
-            silent_tool_success = self._consume_silent_tool_success(inbound_mid)
-            fallback_text = ""
-            if group_id is not None and _path == "bot-mentioned":
-                if not silent_tool_success:
-                    fallback_text = self._no_reply_fallback_for_path(_path)
-            if fallback_text:
-                gw_log().warning(
-                    "[iflow:send] mid=%s path=%s recovered unexpected NO_REPLY",
-                    inbound_mid,
-                    _path,
-                )
-                text = fallback_text
-            else:
-                await self._broadcast_mixed_no_reply_to_ops(
-                    text=text or "",
-                    group_id=group_id,
-                    dm_user_id=dm_user_id,
-                    path=_path,
-                    inbound_mid=inbound_mid,
-                    session=session,
-                )
-                gw_log().info(
-                    "[iflow:send] mid=%s path=%s NO_REPLY sentinel suppressed",
-                    inbound_mid, _path,
-                )
-                await self._finish_reaction_for_send_target(
-                    group_id=group_id,
-                    dm_user_id=dm_user_id,
-                    reaction_message_id=reaction_message_id,
-                    reason="no_reply",
-                )
-                return SentResult(success=True)
+            self._consume_silent_tool_success(inbound_mid)
+            await self._broadcast_mixed_no_reply_to_ops(
+                text=text or "",
+                group_id=group_id,
+                dm_user_id=dm_user_id,
+                path=_path,
+                inbound_mid=inbound_mid,
+                session=session,
+            )
+            gw_log().info(
+                "[iflow:send] mid=%s path=%s NO_REPLY sentinel suppressed",
+                inbound_mid, _path,
+            )
+            await self._finish_reaction_for_send_target(
+                group_id=group_id,
+                dm_user_id=dm_user_id,
+                reaction_message_id=reaction_message_id,
+                reason="no_reply",
+            )
+            return SentResult(success=True)
 
         # Static refusal-regex filter (zero-latency Layer-3 fallback).
         # Only applied on the followUp path so that @bot/watch responses
@@ -1550,7 +1532,6 @@ class Bot:
                 reply_to_sender=_reply_key,
             )
             gw_log().info("[iflow:send] mid=%s step=record_bot_reply group=%s reply_to=%s", _mid_var.get(""), group_id, _reply_key)
-
         if first_error:
             await self._finish_reaction_for_send_target(
                 group_id=group_id,

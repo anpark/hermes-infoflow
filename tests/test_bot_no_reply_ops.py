@@ -74,7 +74,7 @@ async def test_plain_no_reply_is_suppressed_without_ops_noise(monkeypatch) -> No
 
 
 @pytest.mark.asyncio
-async def test_bot_mentioned_plain_no_reply_recovers_without_silent_tool(monkeypatch) -> None:
+async def test_bot_mentioned_plain_no_reply_stays_silent(monkeypatch) -> None:
     _install_gateway_stub(monkeypatch)
     bot = _bot()
     bot._serverapi.send_group_message_intent.return_value = SentResult(
@@ -91,9 +91,32 @@ async def test_bot_mentioned_plain_no_reply_recovers_without_silent_tool(monkeyp
         _send_path_cv.reset(path_token)
 
     assert result.success is True
+    bot._serverapi.send_group_message_intent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_bot_mentioned_no_reply_stays_silent_after_visible_reply(monkeypatch) -> None:
+    _install_gateway_stub(monkeypatch)
+    bot = _bot()
+    bot._serverapi.send_group_message_intent.return_value = SentResult(
+        success=True,
+        message_id="OUT-1",
+    )
+
+    path_token = _send_path_cv.set("bot-mentioned")
+    mid_token = _inbound_mid.set("IN-1")
+    try:
+        first = await bot.send_message(group_id="12605371", text="已回复正文")
+        second = await bot.send_message(group_id="12605371", text="NO_REPLY")
+    finally:
+        _inbound_mid.reset(mid_token)
+        _send_path_cv.reset(path_token)
+
+    assert first.success is True
+    assert second.success is True
     bot._serverapi.send_group_message_intent.assert_awaited_once()
     _args, kwargs = bot._serverapi.send_group_message_intent.await_args
-    assert kwargs["message"] == "收到，我在。你想让我处理什么，直接说就行。"
+    assert kwargs["message"] == "已回复正文"
 
 
 @pytest.mark.asyncio

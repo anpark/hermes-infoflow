@@ -57,6 +57,8 @@ class BodyItem:
     robot_id: str = ""
     at_all: bool = False
     download_url: str = ""
+    face_cid: str = ""
+    face_name: str = ""
     message_id: str = ""
     preview: str = ""
     sender_imid: str = ""

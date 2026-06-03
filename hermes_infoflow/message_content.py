@@ -82,6 +82,30 @@ def _has_media_image_marker(text: str) -> bool:
     return any(line.strip().startswith("<media:image>") for line in text.splitlines())
 
 
+def _body_items_are_at_only(body_items: list[Any]) -> bool:
+    saw_at = False
+    for item in body_items:
+        item_type = _first_attr(item, "type").upper()
+        if item_type == "AT":
+            saw_at = True
+            continue
+        if item_type in {"TEXT", "MD"} and not _first_attr(item, "content").strip():
+            continue
+        return False
+    return saw_at
+
+
+def _render_face(item: Any) -> str:
+    fields = [string_field("type", "sticker")]
+    face_name = _first_attr(item, "face_name", "facename", "content")
+    face_cid = _first_attr(item, "face_cid", "facecid")
+    if face_name:
+        fields.append(string_field("name", face_name))
+    if face_cid:
+        fields.append(string_field("id", face_cid))
+    return f"<Face {'; '.join(fields)}>"
+
+
 def _render_body_items(
     body_items: list[Any],
     *,
@@ -110,6 +134,8 @@ def _render_body_items(
             rendered = _render_reply_target(reply_target_by_id.get(message_id, item))
             if rendered:
                 parts.append(rendered + "\n")
+        elif item_type == "FACE":
+            parts.append(_render_face(item) + " ")
         elif item_type == "IMAGE":
             has_image = True
     return "".join(parts).strip(), has_image
@@ -170,7 +196,11 @@ def render_message_content(
         if prefix_parts:
             text = "\n".join(prefix_parts + ([text] if text else []))
 
-    is_at_only = bool(getattr(msg, "is_at_only", False)) and not files
+    is_at_only = (
+        bool(getattr(msg, "is_at_only", False))
+        and not files
+        and _body_items_are_at_only(body_items)
+    )
     if is_at_only:
         text = _at_only_description(
             body_items,

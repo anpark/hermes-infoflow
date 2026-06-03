@@ -42,21 +42,15 @@ def infoflow_file_delivery_prompt(shared_root: str | Path | None = None) -> str:
         shared_root = get_infoflow_shared_files_root()
     root = str(Path(shared_root).expanduser())
     return (
-        "【文件/图片 URL 分享】通过 Infoflow 分享本地文件、图片、音频、视频、"
-        "压缩包或其它生成内容时，必须先调用 `file_delivery(source_path)` 获取 URL。"
-        "直接分享文件时发送 URL；需要把链接显示成可点击文字或把图片以内联方式显示时，"
-        "使用支持 Markdown 渲染的正文格式，保持 `format=auto` 或使用 `format=markdown`，"
-        "并在 `message` 中写 `[可见文字](URL)` 或 `![图片说明](URL)`；"
-        "使用 `format=text` 时不要写这些语法，改为发送 URL 或使用 `links`。\n"
-        "不需要 Markdown 排版、只发送本地图片时，使用 `infoflow_send_message.image_paths`。\n"
-        f"Infoflow 可分享文件目录：`{root}`\n"
-        f"临时文件建议放在：`{root}/temp/<YYYYMMDD>/`。"
+        "【可分享文件目录】\n"
+        f"- Infoflow 可分享文件目录：`{root}`。\n"
+        f"- 临时文件建议放在：`{root}/temp/<YYYYMMDD>/`。"
         "适合一次性分享、临时报告、截图、导出结果、调试产物、定时任务产物；"
         "推荐子目录：`media/`、`report/`、`screenshots/`、`cron/`、`probe/`。\n"
-        f"长期复用文件建议放在：`{root}/permanent/`。"
+        f"- 长期复用文件建议放在：`{root}/permanent/`。"
         "适合固定素材、长期报告、稳定导出、用户资料；"
         "推荐子目录：`assets/`、`reports/`、`exports/`、`profiles/`。\n"
-        "如果文件已在可分享目录下，直接把该真实路径传给 `file_delivery`；"
+        "- 如果文件已在可分享目录下，直接把该真实路径传给 `file_delivery`；"
         "如果在其它目录，也可以传给 `file_delivery`，工具会导入到当天临时目录后发布。"
         "单文件当前不能超过 69MiB。"
     )

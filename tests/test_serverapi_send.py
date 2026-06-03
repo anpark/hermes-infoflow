@@ -2118,7 +2118,12 @@ def test_to_incoming_normalizes_body_item_field_names() -> None:
                     atall=True,
                     downloadurl="https://example.test/a.png",
                     messageid="QUOTE-1",
-                )
+                ),
+                ParserBodyItem(
+                    type="FACE",
+                    facecid="d95",
+                    facename="doge",
+                ),
             ],
         )
     )
@@ -2131,6 +2136,9 @@ def test_to_incoming_normalizes_body_item_field_names() -> None:
     assert item.message_id == "QUOTE-1"
     assert not hasattr(item, "userid")
     assert not hasattr(item, "robotid")
+    face = incoming.body_items[1]
+    assert face.face_cid == "d95"
+    assert face.face_name == "doge"
 
 
 def test_to_incoming_preserves_inbound_files() -> None:
