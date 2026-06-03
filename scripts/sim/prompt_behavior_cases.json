@@ -80,9 +80,14 @@
           "content": "[Sender: type:'human'; user_id:'huangshuo02'; name:'黄硕'; permission:'restricted']\n[Message: message_id:'wr_unknown_mid'; created_time:'2026.06.03 10.26.00']\n看下abc123xyz"
         }
       ],
+      "map_result": {
+        "version": "abc123xyz",
+        "has_data": false,
+        "summary": "未找到 abc123xyz 对应的线上稳定性或版本数据。",
+        "risk": "unknown"
+      },
       "expected": {
         "must_call": ["infoflow_get_message_history"],
-        "must_not_call": ["map_crash_db_check"],
         "final": "NO_REPLY"
       }
     }

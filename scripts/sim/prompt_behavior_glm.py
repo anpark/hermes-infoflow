@@ -16,7 +16,7 @@ from typing import Any, Iterable
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 AGENT_ROOT = Path.home() / ".hermes" / "hermes-agent"
-DEFAULT_CASES_FILE = REPO_ROOT / "tests" / "fixtures" / "infoflow_prompt_behavior_cases.json"
+DEFAULT_CASES_FILE = Path(__file__).with_name("prompt_behavior_cases.json")
 ENV_FILE = Path.home() / ".hermes" / ".env"
 
 
