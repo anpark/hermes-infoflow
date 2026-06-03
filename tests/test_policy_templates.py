@@ -98,14 +98,17 @@ def test_watch_mention_requires_skill_check_before_no_reply() -> None:
     assert "按旁听助手处理" in text
     assert "输出 `NO_REPLY` 前都必须先读最近群历史并检查 skills/tools" in text
     assert "可查关键词" in text
+    assert "具体对象/标识符" in text
+    assert "查看、判断、确认、评估、给建议" in text
     assert "视为需要先探索的任务" in text
-    assert "仅 @ 他人 / 无事实问题 / sender 是 bot" in text
-    assert "直接 `NO_REPLY`" in text
+    assert "被 @ 的人不是你" in text
+    assert "旁听助手身份查可用信息" in text
     assert "先读最近群历史补上下文" in text
     assert "检查已有 skills" in text
     assert "相关就用 skill" in text
     assert "不能替代 skills 检查" in text
-    assert "sender 是 bot" in text
+    assert "不替人做最终决定" in text
+    assert "skills/tools 能提供依据" in text
     assert "完成上述检查后仍无公开有用信息" in text
     assert "单独一行 `NO_REPLY`" in text
     assert "不要把拒绝/转述当作答案" in text
