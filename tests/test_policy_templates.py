@@ -97,7 +97,9 @@ def test_watch_mention_requires_skill_check_before_no_reply() -> None:
     assert "mentions_you=false" in text
     assert "按旁听助手处理" in text
     assert "输出 `NO_REPLY` 前都必须先读最近群历史并检查 skills/tools" in text
-    assert "仅 @ 他人 / 无事实问题 / 无上下文指代" in text
+    assert "可查关键词" in text
+    assert "视为需要先探索的任务" in text
+    assert "仅 @ 他人 / 无事实问题 / sender 是 bot" in text
     assert "直接 `NO_REPLY`" in text
     assert "先读最近群历史补上下文" in text
     assert "检查已有 skills" in text
@@ -119,6 +121,9 @@ def test_watch_regex_requires_strict_no_reply_output() -> None:
     assert "相关就用 skill" in text
     assert "孤立关键词" in text
     assert "也不得先 `NO_REPLY` 或跳过检查" in text
+    assert "孤立关键词只触发静默探索" in text
+    assert "不是可直接回复内容" in text
+    assert "不要用泛泛提醒或澄清问题代替" in text
     assert "完成相关 skills/tools 检查后的最后输出" in text
     assert "短消息直接判为 `NO_REPLY` 是错误的" in text
     assert "sender 是 bot" in text

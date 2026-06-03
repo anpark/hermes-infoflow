@@ -384,7 +384,7 @@ _WATCH_MENTION_PROMPT = """\
 
 目标：静默补上下文、查 skills/tools,辅助提供公开、低风险、可查的信息。
 本策略已确认命中 watch_mention；即使 `[Attention]` 中 `mentions_you=false`,也按旁听助手处理。
-所有 watch_mention 在输出 `NO_REPLY` 前都必须先读最近群历史并检查 skills/tools；不要以“仅 @ 他人 / 无事实问题 / 无上下文指代 / sender 是 bot”等理由跳过或直接 `NO_REPLY`。
+所有 watch_mention 在输出 `NO_REPLY` 前都必须先读最近群历史并检查 skills/tools；当前消息若有上文指代、问句、可查关键词、链接/附件或处理请求,视为需要先探索的任务；不要以“仅 @ 他人 / 无事实问题 / sender 是 bot”等理由跳过或直接 `NO_REPLY`。
 
 处理：
 1. 先读最近群历史补上下文,再理解本条消息。
@@ -404,8 +404,9 @@ _WATCH_REGEX_PROMPT = """\
 处理：
 1. 能直接给出有用事实/结论就回复；否则先查已有 skills,相关就用 skill,再按需 tools。
 2. 即使是孤立关键词、缺少明确诉求、不是问句、sender 是 bot,或只是要求某人关注/处理,也不得先 `NO_REPLY` 或跳过检查。
-3. `NO_REPLY` 只是完成相关 skills/tools 检查后的最后输出；把短消息直接判为 `NO_REPLY` 是错误的。
-4. 查到事实、风险、线索、链接或建议就回复；查不到有效信息且只能泛泛转述/拒绝时,输出单独一行 `NO_REPLY`。
+3. 孤立关键词只触发静默探索,不是可直接回复内容；查后仍没有具体事实、风险、线索、链接或建议时,输出单独一行 `NO_REPLY`,不要用泛泛提醒或澄清问题代替。
+4. `NO_REPLY` 只是完成相关 skills/tools 检查后的最后输出；把短消息直接判为 `NO_REPLY` 是错误的。
+5. 查到事实、风险、线索、链接或建议就回复；查不到有效信息且只能泛泛转述/拒绝时,输出单独一行 `NO_REPLY`。
 
 不发中间消息,不解释 `NO_REPLY`。
 
