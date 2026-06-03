@@ -120,16 +120,25 @@ def test_watch_mention_requires_skill_check_before_no_reply() -> None:
 
 def test_watch_regex_requires_strict_no_reply_output() -> None:
     text = RENDERED["watch_regex"]
-    assert "先查已有 skills" in text
+    assert "目标：静默补上下文、查 skills/tools" in text
+    assert "先理解当前消息" in text
+    assert "上文指代" in text
+    assert "具体对象/标识符" in text
+    assert "先读最近历史补上下文" in text
+    assert "检查已有 skills" in text
     assert "相关就用 skill" in text
+    assert "读取历史只算补上下文" in text
+    assert "不能替代 skills 检查" in text
+    assert "命中正则只表示需要静默探索" in text
+    assert "不是必须回复" in text
     assert "孤立关键词" in text
-    assert "也不得先 `NO_REPLY` 或跳过检查" in text
-    assert "孤立关键词只触发静默探索" in text
-    assert "不是可直接回复内容" in text
-    assert "不要用泛泛提醒或澄清问题代替" in text
-    assert "完成相关 skills/tools 检查后的最后输出" in text
-    assert "短消息直接判为 `NO_REPLY` 是错误的" in text
+    assert "不是问句" in text
+    assert "不是找你" in text
     assert "sender 是 bot" in text
+    assert "不替人做最终决定" in text
+    assert "skills/tools 能提供依据" in text
+    assert "完成必要上下文和相关 skills/tools 检查后仍无公开有用信息" in text
+    assert "不要把拒绝/转述当作答案" in text
     assert "不发中间消息" in text
     assert "单独一行 `NO_REPLY`" in text
     assert "crash" not in text.lower()
