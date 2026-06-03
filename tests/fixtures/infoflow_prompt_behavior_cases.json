@@ -1,0 +1,96 @@
+{
+  "cases": [
+    {
+      "id": "watch_mention_release_readiness",
+      "description": "watch_mention with a concrete version and judgement request must read history and use the relevant skill/tool.",
+      "strategy": "watch_mention",
+      "who": "chengbo05",
+      "content": "@成博 (user_id:chengbo05)  看下v21.16.20的是否可以开始上架",
+      "message_id": "wm_release_mid",
+      "history": [
+        {
+          "time": "2026.05.28 09.04.57",
+          "content": "[Sender: type:'bot'; agent_id:'6471'; name:'chengbo5.1'; permission:'restricted']\n[Message: message_id:'h1'; created_time:'2026.05.28 09.04.57']\n现在我将从每日指标中提取日期数据部分："
+        },
+        {
+          "time": "2026.05.28 09.04.58",
+          "content": "[Sender: type:'bot'; agent_id:'6471'; name:'chengbo5.1'; permission:'restricted']\n[Message: message_id:'h2'; created_time:'2026.05.28 09.04.58']\nv21.16.0 放量稳定性报告：整体平稳，未见明显风险，可按计划继续放量。"
+        },
+        {
+          "time": "2026.06.03 10.26.07",
+          "content": "[Sender: type:'human'; user_id:'huangshuo02'; name:'黄硕'; permission:'restricted']\n[Message: message_id:'wm_release_mid'; created_time:'2026.06.03 10.26.07']\n@成博 看下v21.16.20的是否可以开始上架"
+        }
+      ],
+      "expected": {
+        "must_call": ["infoflow_get_message_history", "map_crash_db_check"],
+        "final": "answer"
+      }
+    },
+    {
+      "id": "watch_mention_owner_decision",
+      "description": "watch_mention with only a request for the mentioned person to decide should not invent a skill answer.",
+      "strategy": "watch_mention",
+      "who": "chengbo05",
+      "content": "@成博 (user_id:chengbo05)  你来拍板吧",
+      "message_id": "wm_owner_mid",
+      "history": [
+        {
+          "time": "2026.06.03 10.24.00",
+          "content": "[Sender: type:'human'; user_id:'alice'; name:'张三'; permission:'restricted']\n[Message: message_id:'h1'; created_time:'2026.06.03 10.24.00']\n这个事情先等等吧"
+        },
+        {
+          "time": "2026.06.03 10.25.00",
+          "content": "[Sender: type:'human'; user_id:'huangshuo02'; name:'黄硕'; permission:'restricted']\n[Message: message_id:'wm_owner_mid'; created_time:'2026.06.03 10.25.00']\n@成博 你来拍板吧"
+        }
+      ],
+      "expected": {
+        "must_call": ["infoflow_get_message_history"],
+        "must_not_call": ["map_crash_db_check"],
+        "final": "NO_REPLY"
+      }
+    },
+    {
+      "id": "watch_regex_release_readiness",
+      "description": "watch_regex with a concrete version and judgement request must read context and use the relevant skill/tool.",
+      "strategy": "watch_regex",
+      "pattern": "test-pattern",
+      "content": "看下v21.16.20的是否可以开始上架",
+      "message_id": "wr_release_mid",
+      "history": [
+        {
+          "time": "2026.06.03 10.26.00",
+          "content": "[Sender: type:'human'; user_id:'huangshuo02'; name:'黄硕'; permission:'restricted']\n[Message: message_id:'wr_release_mid'; created_time:'2026.06.03 10.26.00']\n看下v21.16.20的是否可以开始上架"
+        }
+      ],
+      "expected": {
+        "must_call": ["infoflow_get_message_history", "map_crash_db_check"],
+        "final": "answer"
+      }
+    },
+    {
+      "id": "watch_regex_no_skill_info",
+      "description": "watch_regex with an unknown object should explore context and then stay silent when no useful public info exists.",
+      "strategy": "watch_regex",
+      "pattern": "test-pattern",
+      "content": "看下abc123xyz",
+      "message_id": "wr_unknown_mid",
+      "history": [
+        {
+          "time": "2026.06.03 10.26.00",
+          "content": "[Sender: type:'human'; user_id:'huangshuo02'; name:'黄硕'; permission:'restricted']\n[Message: message_id:'wr_unknown_mid'; created_time:'2026.06.03 10.26.00']\n看下abc123xyz"
+        }
+      ],
+      "expected": {
+        "must_call": ["infoflow_get_message_history"],
+        "must_not_call": ["map_crash_db_check"],
+        "final": "NO_REPLY"
+      }
+    }
+  ],
+  "map_result": {
+    "version": "21.16.20",
+    "has_data": true,
+    "summary": "命中该版本，当前样本量偏少但未见新增高危 crash。",
+    "risk": "observe"
+  }
+}

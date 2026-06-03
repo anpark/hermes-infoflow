@@ -35,6 +35,7 @@ These are read from `~/.hermes/.env` (or your shell):
 | `test_send_via_serverapi.py` | `prepare_outbound_message` + `ServerAPI.send_group_message_intent` direct smoke. Does **not** exercise `InfoflowSendService` preview enrichment. Does **not** need hermes-agent. |
 | `test_send_intent_matrix.py` | Direct `ServerAPI.send_group_message_intent` / `send_private_message_intent` smoke matrix for Markdown, reply, links, @, and 200x200 image bytes. It verifies protocol routing, not service-level reply preview enrichment. |
 | `test_file_to_url_send_matrix.py` | Direct `ServerAPI` matrix for file-delivery/file-to-URL compatibility: non-image file link, Markdown + `image_paths` / `image_bytes`, reply + Markdown image, `format=text` native image, and plain auto native image. Prints selected payload families (`MD` / `IMAGE` / `LINK` / BOS upload/getUrl/HEAD). Use `--runtime-plugin` after deployment. |
+| `test_prompt_behavior_glm.py` | Live GLM prompt-behavior gate for `watch_mention` / `watch_regex`: verifies selected prompts read history, use relevant skills/tools, or emit `NO_REPLY` as expected. Uses `tests/fixtures/infoflow_prompt_behavior_cases.json` and the configured Hermes main model. |
 | `simulate_inbound_webhook.py` | Encrypts and posts fake Infoflow webhook messages to the local gateway. Exercises parser + adapter + Bot/LLM + tools + outbound send. Useful for prompt/tool-behavior checks after deployment. |
 | `test_send_via_standalone.py` | `standalone_send(...)` — the cron / out-of-process entry point. Does **not** need hermes-agent. |
 | `test_send_via_adapter.py`   | `InfoflowAdapter.send(...)` — the live gateway entry point. **Requires** `~/.hermes/hermes-agent` checkout. The script monkey-patches `gateway.config.Platform` to add an `INFOFLOW` member so an unpatched mainline hermes-agent still works. |
@@ -46,6 +47,14 @@ These are read from `~/.hermes/.env` (or your shell):
 | `probe_reply_preview_edges.py` | Exact-wire reply preview/content edge probes. Confirms group reply can omit/empty `preview`, group invalid `messageid` fails, and private reply omission/invalid `msgid` API behavior. Private cases require recipient-side manual validation. |
 
 The reusable pieces for the probe scripts live in `_message_format_probe.py`:
+
+Prompt behavior live checks are opt-in because they call the configured LLM:
+
+```bash
+python scripts/sim/test_prompt_behavior_glm.py
+INFOFLOW_RUN_LIVE_LLM_TESTS=1 python -m pytest -q tests/live/test_prompt_behavior_glm.py
+INFOFLOW_RUN_LIVE_LLM_TESTS=1 bash scripts/deploy.sh
+```
 
 - 200x200 pure-blue PNG generation through the production media pipeline.
 - Group webhook echo extraction from `~/.hermes/logs/gateway.log` and `agent.log`.

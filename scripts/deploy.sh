@@ -60,6 +60,20 @@ if [[ ! -f "$DEPLOY_PY" ]]; then
   exit 1
 fi
 
+if [[ "${INFOFLOW_RUN_LIVE_LLM_TESTS:-}" == "1" ]]; then
+  LIVE_LLM_PYTHON="${HERMES_INFOFLOW_LIVE_LLM_PYTHON:-${HERMES_HOME:-${HOME}/.hermes}/hermes-agent/venv/bin/python}"
+  if [[ ! -x "$LIVE_LLM_PYTHON" ]]; then
+    LIVE_LLM_PYTHON="$PYTHON_BIN"
+  fi
+  LIVE_LLM_TEST="$PROJECT_DIR/scripts/sim/test_prompt_behavior_glm.py"
+  if [[ ! -f "$LIVE_LLM_TEST" ]]; then
+    echo "✗ expected live prompt test not found: $LIVE_LLM_TEST" >&2
+    exit 1
+  fi
+  echo "$ INFOFLOW_RUN_LIVE_LLM_TESTS=1 $LIVE_LLM_PYTHON $LIVE_LLM_TEST --quiet"
+  INFOFLOW_RUN_LIVE_LLM_TESTS=1 "$LIVE_LLM_PYTHON" "$LIVE_LLM_TEST" --quiet
+fi
+
 CMD=(
   "$PYTHON_BIN"
   "$DEPLOY_PY"

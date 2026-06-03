@@ -126,4 +126,5 @@ filterwarnings = [
 ]
 markers = [
     "integration: tests that exercise deploy scripts and subprocess layout",
+    "live_llm: tests that call the configured live LLM endpoint",
 ]
