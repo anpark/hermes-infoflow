@@ -645,6 +645,131 @@ async def test_sessiontracker_history_full_user_message_requires_admin_viewer_co
         assert body["lines"][0]["text"] == "full injected message\n[Message]\nsafe message"
 
 
+async def test_sessiontracker_resolve_marks_private_admin_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+    account: InfoflowAccountAPI,
+) -> None:
+    pytest.importorskip("aiohttp")
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    monkeypatch.setenv("INFOFLOW_SESSIONTRACKER_TERMINAL_ENABLED", "true")
+    monkeypatch.setenv("INFOFLOW_ADMIN_USER", "admin")
+    monkeypatch.setattr(
+        "hermes_infoflow.sessiontracker._read_infoflow_account",
+        lambda: account,
+    )
+
+    async def _fake_get_user_info_by_code(
+        account: InfoflowAccountAPI,
+        code: str,
+        *,
+        session=None,
+    ) -> str:
+        del account, session
+        return "admin" if code == "admin-code" else "alice"
+
+    monkeypatch.setattr(
+        "hermes_infoflow.sessiontracker.get_user_info_by_code",
+        _fake_get_user_info_by_code,
+    )
+
+    tr = SessionTracker(buffer_size=50)
+    tr.bind_chat("admin", "dm-hermes")
+    tr.bind_chat("group:1", "group-hermes")
+    app = web.Application()
+    register_sessiontracker_routes(app, tr, base_path="/webhook/infoflow")
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get(
+            "/webhook/infoflow/sessiontracker/api/resolve"
+            "?chatType=7&chatId=1&code=admin-code",
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["viewer_is_admin"] is True
+        assert body["terminal_enabled"] is True
+
+        resp = await client.get(
+            "/webhook/infoflow/sessiontracker/api/resolve"
+            "?chatType=7&chatId=1&code=user-code",
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["viewer_is_admin"] is False
+        assert body["terminal_enabled"] is False
+
+        resp = await client.get(
+            "/webhook/infoflow/sessiontracker/api/resolve"
+            "?chatType=6&chatId=1&code=admin-code",
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["viewer_is_admin"] is True
+        assert body["terminal_enabled"] is False
+
+
+async def test_sessiontracker_terminal_ws_requires_private_admin(
+    monkeypatch: pytest.MonkeyPatch,
+    account: InfoflowAccountAPI,
+) -> None:
+    pytest.importorskip("aiohttp")
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    monkeypatch.setenv("INFOFLOW_SESSIONTRACKER_TERMINAL_ENABLED", "true")
+    monkeypatch.setenv("INFOFLOW_ADMIN_USER", "admin")
+    monkeypatch.setattr(
+        "hermes_infoflow.sessiontracker._read_infoflow_account",
+        lambda: account,
+    )
+
+    async def _fake_get_user_info_by_code(
+        account: InfoflowAccountAPI,
+        code: str,
+        *,
+        session=None,
+    ) -> str:
+        del account, session
+        return "admin" if code == "admin-code" else "alice"
+
+    async def _fake_terminal_ws(*args: object, **kwargs: object) -> web.Response:
+        del args, kwargs
+        return web.json_response({"ok": True})
+
+    monkeypatch.setattr(
+        "hermes_infoflow.sessiontracker.get_user_info_by_code",
+        _fake_get_user_info_by_code,
+    )
+    monkeypatch.setattr(
+        "hermes_infoflow.sessiontracker.run_terminal_websocket",
+        _fake_terminal_ws,
+    )
+
+    app = web.Application()
+    register_sessiontracker_routes(app, SessionTracker(buffer_size=50), base_path="/webhook/infoflow")
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get(
+            "/webhook/infoflow/sessiontracker/api/admin/terminal/ws"
+            "?chatType=6&chatId=1&code=admin-code",
+        )
+        assert resp.status == 403
+
+        resp = await client.get(
+            "/webhook/infoflow/sessiontracker/api/admin/terminal/ws"
+            "?chatType=7&chatId=1&code=user-code",
+        )
+        assert resp.status == 403
+
+        resp = await client.get(
+            "/webhook/infoflow/sessiontracker/api/admin/terminal/ws"
+            "?chatType=7&chatId=1&code=admin-code",
+        )
+        assert resp.status == 200
+        assert await resp.json() == {"ok": True}
+
+
 def test_sessiontracker_enabled_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("INFOFLOW_SESSIONTRACKER_ENABLED", "false")
     assert sessiontracker_enabled() is False

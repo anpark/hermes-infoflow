@@ -10,6 +10,7 @@ import os
 import re
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from .api import InfoflowAccountAPI, InfoflowAPIError, get_user_info_by_code
@@ -28,10 +29,19 @@ from .sse import (
     SSE_RESPONSE_HEADERS,
     write_sse,
 )
+from .sessiontracker_terminal import (
+    request_is_localhost,
+    run_terminal_websocket,
+    sessiontracker_terminal_cwd,
+    sessiontracker_terminal_enabled,
+    sessiontracker_terminal_idle_timeout_seconds,
+    sessiontracker_terminal_localhost_only,
+)
 
 logger = logging.getLogger(__name__)
 
 _SSE_RESPONSE_HEADERS = SSE_RESPONSE_HEADERS
+_SESSIONTRACKER_STATIC_ROOT = Path(__file__).resolve().parent / "static" / "sessiontracker"
 
 TERMINAL_EVENT_KINDS = frozenset({
     "display.user",
@@ -394,14 +404,31 @@ async def _viewer_can_see_full_user_message(
 ) -> bool:
     if not sessiontracker_full_user_message_enabled():
         return False
+    return bool(await _viewer_admin_user_id(code=code, account=account))
+
+
+async def _viewer_admin_user_id(
+    *,
+    code: str,
+    account: InfoflowAccountAPI | None,
+) -> str:
     admins = infoflow_admin_users_from_env()
     if not admins or not (code or "").strip() or account is None:
-        return False
+        return ""
     try:
         viewer_user_id = await resolve_user_id_by_code_cached(account, code)
     except (InfoflowAPIError, ValueError):
-        return False
-    return viewer_user_id.strip().lower() in admins
+        return ""
+    normalized = viewer_user_id.strip().lower()
+    return viewer_user_id if normalized in admins else ""
+
+
+async def _viewer_is_admin(
+    *,
+    code: str,
+    account: InfoflowAccountAPI | None,
+) -> bool:
+    return bool(await _viewer_admin_user_id(code=code, account=account))
 
 
 def _account_for_sessiontracker_request(
@@ -415,7 +442,10 @@ def _account_for_sessiontracker_request(
             return None, str(exc)
     if (
         (code or "").strip()
-        and sessiontracker_full_user_message_enabled()
+        and (
+            sessiontracker_full_user_message_enabled()
+            or sessiontracker_terminal_enabled()
+        )
         and infoflow_admin_users_from_env()
     ):
         try:
@@ -454,6 +484,33 @@ def _require_sessiontracker_params(handler: Callable[..., Any]) -> Callable[...,
     return wrapped
 
 
+def _static_asset_path(rel_path: str) -> Path | None:
+    root = _SESSIONTRACKER_STATIC_ROOT.resolve()
+    path = (root / rel_path).resolve()
+    if path == root or root not in path.parents or not path.is_file():
+        return None
+    return path
+
+
+async def _require_terminal_admin_user_id(
+    request: Any,
+    *,
+    chat_type: int,
+    code: str,
+    account: InfoflowAccountAPI | None,
+) -> tuple[str, str | None]:
+    if not sessiontracker_terminal_enabled():
+        return "", "terminal disabled"
+    if chat_type not in DM_CHAT_TYPES:
+        return "", "terminal is only available for private Session Tracker pages"
+    if sessiontracker_terminal_localhost_only() and not request_is_localhost(request):
+        return "", "terminal: localhost only"
+    viewer_user_id = await _viewer_admin_user_id(code=code, account=account)
+    if not viewer_user_id:
+        return "", "terminal requires admin viewer code"
+    return viewer_user_id, None
+
+
 _SESSIONTRACKER_CSS = """
 :root { --bg: #0c0c0c; --text: #d4d4d4; --muted: #6a737d; --accent: #58a6ff;
   --user: #f0b67f; --hermes-border: #3d5a80; --ok: #3dd68c; --interim: #b48ead; }
@@ -464,8 +521,15 @@ body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: 
 header { padding: 10px 14px; border-bottom: 1px solid #222; background: #111; flex-shrink: 0; }
 h1 { margin: 0; font-size: 14px; font-weight: 600; }
 #meta-line { color: var(--muted); font-size: 12px; margin-top: 4px; }
-#viewport { position: relative; flex: 1; min-height: 0; overflow: hidden; display: flex;
-  flex-direction: column; }
+.header-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.tabs { display: none; align-items: center; gap: 6px; }
+.tabs.visible { display: flex; }
+.tab-button { height: 28px; border: 1px solid #30363d; border-radius: 4px; background: #161b22;
+  color: #8b949e; padding: 0 10px; font: inherit; cursor: pointer; }
+.tab-button.active { border-color: #58a6ff; color: #fff; background: #1f6feb; }
+.panel { flex: 1; min-height: 0; display: none; }
+.panel.active { display: flex; flex-direction: column; }
+#viewport { position: relative; flex: 1; min-height: 0; overflow: hidden; flex-direction: column; }
 #terminal-wrap { flex: 1; overflow-y: auto; padding: 12px 14px 48px; }
 .user-line { color: var(--user); margin: 14px 0 6px; white-space: pre-wrap; word-break: break-word; }
 .user-line .bullet { color: var(--user); font-weight: 600; margin-right: 6px; }
@@ -496,6 +560,19 @@ h1 { margin: 0; font-size: 14px; font-weight: 600; }
 #scroll-bottom.visible { display: block; }
 .empty { color: var(--muted); padding: 24px; text-align: center; }
 body.layout-col { display: flex; flex-direction: column; height: 100vh; }
+#admin-terminal-panel { background: #0a0a0a; }
+#terminal-toolbar { display: flex; align-items: center; gap: 8px; min-height: 38px; padding: 6px 10px;
+  border-bottom: 1px solid #222; background: #101010; flex-shrink: 0; }
+#terminal-status { color: var(--muted); font-size: 12px; margin-right: auto; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.terminal-button { height: 26px; border: 1px solid #30363d; border-radius: 4px; background: #161b22;
+  color: #d4d4d4; padding: 0 9px; font: inherit; cursor: pointer; }
+.terminal-button:disabled { opacity: 0.45; cursor: default; }
+#xterm-host { flex: 1; min-height: 0; padding: 8px; }
+#terminal-fallback { flex: 1; min-height: 0; margin: 0; padding: 10px 12px; overflow: auto;
+  background: #050505; color: #d4d4d4; white-space: pre-wrap; outline: none; }
+#terminal-fallback.hidden, #xterm-host.hidden { display: none; }
+.xterm { height: 100%; }
 """
 
 _SESSIONTRACKER_HTML = """<!DOCTYPE html>
@@ -508,25 +585,54 @@ _SESSIONTRACKER_HTML = """<!DOCTYPE html>
 </head>
 <body class="layout-col">
 <header>
-  <h1 id="title">Session Tracker</h1>
-  <div id="meta-line">Resolving…</div>
+  <div class="header-row">
+    <div>
+      <h1 id="title">Session Tracker</h1>
+      <div id="meta-line">Resolving…</div>
+    </div>
+    <nav id="tabs" class="tabs" aria-label="Session Tracker tabs">
+      <button type="button" id="tab-tracker" class="tab-button active">Tracker</button>
+      <button type="button" id="tab-terminal" class="tab-button">Terminal</button>
+    </nav>
+  </div>
 </header>
-<div id="viewport">
+<div id="viewport" class="panel active">
   <div id="terminal-wrap"><p class="empty" id="empty-hint">Waiting for session activity…</p></div>
+</div>
+<div id="admin-terminal-panel" class="panel">
+  <div id="terminal-toolbar">
+    <span id="terminal-status">Terminal disabled</span>
+    <button type="button" id="terminal-connect" class="terminal-button">Connect</button>
+    <button type="button" id="terminal-disconnect" class="terminal-button" disabled>Disconnect</button>
+  </div>
+  <div id="xterm-host"></div>
+  <pre id="terminal-fallback" class="hidden" tabindex="0"></pre>
 </div>
 <button type="button" id="scroll-bottom" title="Scroll to bottom">↓</button>
 <script>
 const params = new URLSearchParams(location.search);
 const apiBase = location.pathname.replace(/\\/?$/, '') + '/api';
+const staticBase = location.pathname.replace(/\\/?$/, '') + '/static';
 const terminal = document.getElementById('terminal-wrap');
 const emptyHint = document.getElementById('empty-hint');
 const scrollBtn = document.getElementById('scroll-bottom');
+const tabs = document.getElementById('tabs');
+const trackerPanel = document.getElementById('viewport');
+const terminalPanel = document.getElementById('admin-terminal-panel');
+const tabTracker = document.getElementById('tab-tracker');
+const tabTerminal = document.getElementById('tab-terminal');
+const terminalStatus = document.getElementById('terminal-status');
+const terminalConnect = document.getElementById('terminal-connect');
+const terminalDisconnect = document.getElementById('terminal-disconnect');
+const xtermHost = document.getElementById('xterm-host');
+const terminalFallback = document.getElementById('terminal-fallback');
 let autoFollow = true;
 let sessionId = '';
 let lineCursor = 0;
 let eventSource = null;
 let pollTimer = null;
 let gotTerminalLines = false;
+let adminTerminalAvailable = false;
 const SCROLL_THRESHOLD = 48;
 
 function nearBottom() {
@@ -558,6 +664,214 @@ function esc(s) {
   d.textContent = s;
   return d.innerHTML;
 }
+
+function selectTab(name) {
+  const terminalActive = name === 'terminal' && adminTerminalAvailable;
+  trackerPanel.classList.toggle('active', !terminalActive);
+  terminalPanel.classList.toggle('active', terminalActive);
+  tabTracker.classList.toggle('active', !terminalActive);
+  tabTerminal.classList.toggle('active', terminalActive);
+  scrollBtn.style.display = terminalActive ? 'none' : '';
+  if (terminalActive) {
+    initAdminTerminal().then(() => {
+      if (!terminalWs) connectAdminTerminal();
+      resizeAdminTerminal();
+      if (xterm) xterm.focus();
+      if (usingFallback) terminalFallback.focus();
+    });
+  }
+}
+
+tabTracker.addEventListener('click', () => selectTab('tracker'));
+tabTerminal.addEventListener('click', () => selectTab('terminal'));
+
+let terminalWs = null;
+let xterm = null;
+let fitAddon = null;
+let xtermAssetsPromise = null;
+let terminalSurfaceReady = false;
+let usingFallback = false;
+
+function setTerminalStatus(text) {
+  terminalStatus.textContent = text;
+}
+
+function loadStyle(url) {
+  return new Promise((resolve, reject) => {
+    const existing = document.querySelector('link[data-sessiontracker-xterm-css]');
+    if (existing) {
+      resolve();
+      return;
+    }
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = url;
+    link.dataset.sessiontrackerXtermCss = '1';
+    link.onload = resolve;
+    link.onerror = reject;
+    document.head.appendChild(link);
+  });
+}
+
+function loadScript(url) {
+  return new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = url;
+    script.onload = resolve;
+    script.onerror = reject;
+    document.head.appendChild(script);
+  });
+}
+
+function ensureXtermAssets() {
+  if (!xtermAssetsPromise) {
+    xtermAssetsPromise = loadStyle(staticBase + '/xterm/xterm.css')
+      .then(() => loadScript(staticBase + '/xterm/xterm.js'))
+      .then(() => loadScript(staticBase + '/xterm/addon-fit.js'));
+  }
+  return xtermAssetsPromise;
+}
+
+async function initAdminTerminal() {
+  if (terminalSurfaceReady) return;
+  setTerminalStatus('Loading terminal...');
+  try {
+    await ensureXtermAssets();
+    if (!window.Terminal) throw new Error('xterm unavailable');
+    xterm = new window.Terminal({
+      cursorBlink: true,
+      convertEol: true,
+      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+      fontSize: 13,
+      scrollback: 8000,
+      theme: {
+        background: '#050505',
+        foreground: '#d4d4d4',
+        cursor: '#58a6ff',
+        selectionBackground: '#264f78'
+      }
+    });
+    if (window.FitAddon && window.FitAddon.FitAddon) {
+      fitAddon = new window.FitAddon.FitAddon();
+      xterm.loadAddon(fitAddon);
+    }
+    xterm.open(xtermHost);
+    xterm.onData(data => sendTerminalInput(data));
+    xterm.writeln('Session Tracker admin terminal');
+    terminalFallback.classList.add('hidden');
+    xtermHost.classList.remove('hidden');
+  } catch (_) {
+    usingFallback = true;
+    xtermHost.classList.add('hidden');
+    terminalFallback.classList.remove('hidden');
+    terminalFallback.textContent = 'Session Tracker admin terminal\\r\\n';
+    terminalFallback.addEventListener('keydown', handleFallbackKey);
+  }
+  terminalSurfaceReady = true;
+  setTerminalStatus(adminTerminalAvailable ? 'Ready' : 'Terminal disabled');
+  resizeAdminTerminal();
+}
+
+function terminalDimensions() {
+  if (xterm) return { cols: xterm.cols || 100, rows: xterm.rows || 30 };
+  const rect = terminalFallback.getBoundingClientRect();
+  return {
+    cols: Math.max(40, Math.floor((rect.width || 800) / 8)),
+    rows: Math.max(10, Math.floor((rect.height || 400) / 18))
+  };
+}
+
+function resizeAdminTerminal() {
+  if (!terminalSurfaceReady) return;
+  if (fitAddon) {
+    try { fitAddon.fit(); } catch (_) {}
+  }
+  const dims = terminalDimensions();
+  if (terminalWs && terminalWs.readyState === WebSocket.OPEN) {
+    terminalWs.send(JSON.stringify({ type: 'resize', cols: dims.cols, rows: dims.rows }));
+  }
+}
+
+function writeTerminal(data) {
+  if (xterm) {
+    xterm.write(data || '');
+  } else {
+    terminalFallback.textContent += data || '';
+    terminalFallback.scrollTop = terminalFallback.scrollHeight;
+  }
+}
+
+function sendTerminalInput(data) {
+  if (!terminalWs || terminalWs.readyState !== WebSocket.OPEN) return;
+  terminalWs.send(JSON.stringify({ type: 'input', data }));
+}
+
+function handleFallbackKey(ev) {
+  if (!usingFallback) return;
+  let data = '';
+  if (ev.ctrlKey && ev.key.toLowerCase() === 'c') data = '\\x03';
+  else if (ev.key === 'Enter') data = '\\r';
+  else if (ev.key === 'Backspace') data = '\\u007f';
+  else if (ev.key === 'Tab') data = '\\t';
+  else if (ev.key === 'Escape') data = '\\x1b';
+  else if (ev.key === 'ArrowUp') data = '\\x1b[A';
+  else if (ev.key === 'ArrowDown') data = '\\x1b[B';
+  else if (ev.key === 'ArrowRight') data = '\\x1b[C';
+  else if (ev.key === 'ArrowLeft') data = '\\x1b[D';
+  else if (ev.key.length === 1 && !ev.metaKey) data = ev.key;
+  if (!data) return;
+  ev.preventDefault();
+  sendTerminalInput(data);
+}
+
+async function connectAdminTerminal() {
+  if (!adminTerminalAvailable) return;
+  await initAdminTerminal();
+  if (terminalWs && terminalWs.readyState <= WebSocket.OPEN) return;
+  const dims = terminalDimensions();
+  const qs = new URLSearchParams(params);
+  qs.set('cols', String(dims.cols));
+  qs.set('rows', String(dims.rows));
+  const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const url = scheme + '//' + location.host + apiBase + '/admin/terminal/ws?' + qs.toString();
+  setTerminalStatus('Connecting...');
+  terminalConnect.disabled = true;
+  terminalWs = new WebSocket(url);
+  terminalWs.onopen = () => {
+    setTerminalStatus('Connected');
+    terminalConnect.disabled = true;
+    terminalDisconnect.disabled = false;
+    resizeAdminTerminal();
+  };
+  terminalWs.onmessage = (ev) => {
+    try {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === 'output') writeTerminal(msg.data || '');
+      if (msg.type === 'exit') {
+        setTerminalStatus(msg.reason ? ('Closed: ' + msg.reason) : 'Closed');
+        terminalConnect.disabled = false;
+        terminalDisconnect.disabled = true;
+      }
+    } catch (_) {}
+  };
+  terminalWs.onerror = () => {
+    setTerminalStatus('Connection error');
+  };
+  terminalWs.onclose = () => {
+    terminalWs = null;
+    terminalConnect.disabled = false;
+    terminalDisconnect.disabled = true;
+    if (terminalStatus.textContent === 'Connected') setTerminalStatus('Disconnected');
+  };
+}
+
+function disconnectAdminTerminal() {
+  if (terminalWs) terminalWs.close();
+}
+
+terminalConnect.addEventListener('click', connectAdminTerminal);
+terminalDisconnect.addEventListener('click', disconnectAdminTerminal);
+window.addEventListener('resize', resizeAdminTerminal);
 
 const streamBoxes = new Map();
 const thinkingBoxes = new Map();
@@ -808,11 +1122,30 @@ function updateEmptyHint(info) {
   }
 }
 
+function updateAdminTerminalAvailability(info) {
+  adminTerminalAvailable = !!(
+    info &&
+    info.viewer_is_admin &&
+    info.terminal_enabled &&
+    (info.chat_type === 1 || info.chat_type === 7)
+  );
+  tabs.classList.toggle('visible', adminTerminalAvailable);
+  terminalConnect.disabled = !adminTerminalAvailable || !!terminalWs;
+  if (!adminTerminalAvailable) {
+    setTerminalStatus('Terminal disabled');
+    if (terminalPanel.classList.contains('active')) selectTab('tracker');
+    if (terminalWs) terminalWs.close();
+  } else if (!terminalWs && terminalStatus.textContent === 'Terminal disabled') {
+    setTerminalStatus('Ready');
+  }
+}
+
 async function applyResolve(info) {
   const prev = sessionId;
   document.getElementById('title').textContent = info.label || 'Session Tracker';
   updateMetaLine(info);
   updateEmptyHint(info);
+  updateAdminTerminalAvailability(info);
   if (!info.session_id) {
     sessionId = '';
     return;
@@ -882,6 +1215,15 @@ def register_sessiontracker_routes(
         from aiohttp import web
         return web.Response(text=_SESSIONTRACKER_HTML, content_type="text/html")
 
+    async def static_asset(request: Any) -> Any:
+        from aiohttp import web
+
+        rel_path = request.match_info.get("path", "")
+        path = _static_asset_path(rel_path)
+        if path is None:
+            return web.Response(status=404, text="asset not found")
+        return web.FileResponse(path)
+
     @_require_sessiontracker_params
     async def api_resolve(request: Any, **kw: Any) -> Any:
         from aiohttp import web
@@ -904,6 +1246,13 @@ def register_sessiontracker_routes(
             return web.Response(status=403, text=str(exc))
         except ValueError as exc:
             return web.Response(status=400, text=str(exc))
+        viewer_is_admin = await _viewer_is_admin(code=code, account=account)
+        info["viewer_is_admin"] = viewer_is_admin
+        info["terminal_enabled"] = bool(
+            chat_type in DM_CHAT_TYPES
+            and viewer_is_admin
+            and sessiontracker_terminal_enabled()
+        )
         return web.json_response(info)
 
     @_require_sessiontracker_params
@@ -1067,10 +1416,39 @@ def register_sessiontracker_routes(
             ),
         })
 
+    @_require_sessiontracker_params
+    async def api_admin_terminal_ws(request: Any, **kw: Any) -> Any:
+        from aiohttp import web
+
+        chat_type = kw["chat_type"]
+        code = kw["code"]
+        account, account_error = _account_for_sessiontracker_request(chat_type, code)
+        if account_error:
+            return web.Response(status=500, text=account_error)
+        try:
+            viewer_user_id, terminal_error = await _require_terminal_admin_user_id(
+                request,
+                chat_type=chat_type,
+                code=code,
+                account=account,
+            )
+        except InfoflowAPIError as exc:
+            return web.Response(status=403, text=str(exc))
+        if terminal_error:
+            return web.Response(status=403, text=terminal_error)
+        return await run_terminal_websocket(
+            request,
+            viewer_user_id=viewer_user_id,
+            cwd=sessiontracker_terminal_cwd(),
+            idle_timeout=sessiontracker_terminal_idle_timeout_seconds(),
+        )
+
     app.router.add_get(root, page)
+    app.router.add_get(f"{root}/static/{{path:.*}}", static_asset)
     app.router.add_get(f"{root}/api/resolve", api_resolve)
     app.router.add_get(f"{root}/api/history", api_history)
     app.router.add_get(f"{root}/api/stream", api_stream)
+    app.router.add_get(f"{root}/api/admin/terminal/ws", api_admin_terminal_ws)
     logger.info("[infoflow] Session Tracker at <host>:<port>%s", root)
 
 
@@ -1085,4 +1463,5 @@ __all__ = [
     "session_matches_target",
     "register_sessiontracker_routes",
     "sessiontracker_enabled",
+    "sessiontracker_terminal_enabled",
 ]

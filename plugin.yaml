@@ -171,3 +171,19 @@ optional_env:
     description: "Allow admin Session Tracker viewers (resolved from code) to see full Hermes user messages; non-admin viewers still see only text after [Message] (default false)"
     prompt: "Admin Session Tracker full user message? (true/false)"
     password: false
+  - name: INFOFLOW_SESSIONTRACKER_TERMINAL_ENABLED
+    description: "Enable admin-only private-chat terminal tab in Session Tracker (default false)"
+    prompt: "Admin Session Tracker terminal enabled? (true/false)"
+    password: false
+  - name: INFOFLOW_SESSIONTRACKER_TERMINAL_LOCALHOST_ONLY
+    description: "Restrict Session Tracker terminal websocket to localhost/reverse-proxy-local requests (default true)"
+    prompt: "Session Tracker terminal localhost only? (true/false)"
+    password: false
+  - name: INFOFLOW_SESSIONTRACKER_TERMINAL_CWD
+    description: "Working directory for Session Tracker terminal shells (default ~/.hermes/plugins/infoflow when present)"
+    prompt: "Session Tracker terminal cwd"
+    password: false
+  - name: INFOFLOW_SESSIONTRACKER_TERMINAL_IDLE_TIMEOUT
+    description: "Idle timeout in seconds for Session Tracker terminal websocket shells (default 600)"
+    prompt: "Session Tracker terminal idle timeout seconds"
+    password: false
