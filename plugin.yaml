@@ -183,7 +183,11 @@ optional_env:
     description: "Working directory for Session Tracker terminal shells (default ~/.hermes/plugins/infoflow when present)"
     prompt: "Session Tracker terminal cwd"
     password: false
-  - name: INFOFLOW_SESSIONTRACKER_TERMINAL_IDLE_TIMEOUT
-    description: "Idle timeout in seconds for Session Tracker terminal websocket shells (default 600)"
-    prompt: "Session Tracker terminal idle timeout seconds"
+  - name: INFOFLOW_SESSIONTRACKER_TERMINAL_RETENTION_SECONDS
+    description: "Seconds to keep detached Session Tracker terminal PTYs alive after the web page disconnects (default 7200)"
+    prompt: "Session Tracker terminal retention seconds"
+    password: false
+  - name: INFOFLOW_SESSIONTRACKER_TERMINAL_MAX_PER_ADMIN
+    description: "Maximum concurrent Session Tracker terminal PTYs per admin user (default 4)"
+    prompt: "Session Tracker terminal max sessions per admin"
     password: false

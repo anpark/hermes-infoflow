@@ -30,12 +30,16 @@ from .sse import (
     write_sse,
 )
 from .sessiontracker_terminal import (
+    close_terminal_session,
+    create_terminal_session,
+    list_terminal_sessions,
     request_is_localhost,
     run_terminal_websocket,
     sessiontracker_terminal_cwd,
     sessiontracker_terminal_enabled,
-    sessiontracker_terminal_idle_timeout_seconds,
     sessiontracker_terminal_localhost_only,
+    sessiontracker_terminal_max_per_admin,
+    sessiontracker_terminal_retention_seconds,
 )
 
 logger = logging.getLogger(__name__)
@@ -380,6 +384,14 @@ def _parse_cursor(raw: str) -> int:
         raise ValueError("cursor must be a non-negative integer") from exc
 
 
+def _parse_terminal_dimension(raw: str, default: int, *, min_value: int, max_value: int) -> int:
+    try:
+        value = int(raw or default)
+    except ValueError:
+        value = default
+    return max(min_value, min(value, max_value))
+
+
 def _read_infoflow_account() -> InfoflowAccountAPI:
     api_host = os.getenv("INFOFLOW_API_HOST", "").strip() or DEFAULT_API_HOST
     app_key = os.getenv("INFOFLOW_APP_KEY", "").strip()
@@ -563,10 +575,14 @@ body.layout-col { display: flex; flex-direction: column; height: 100vh; }
 #admin-terminal-panel { background: #0a0a0a; }
 #terminal-toolbar { display: flex; align-items: center; gap: 8px; min-height: 38px; padding: 6px 10px;
   border-bottom: 1px solid #222; background: #101010; flex-shrink: 0; }
-#terminal-status { color: var(--muted); font-size: 12px; margin-right: auto; overflow: hidden;
-  text-overflow: ellipsis; white-space: nowrap; }
+#terminal-session-select { flex: 0 1 170px; min-width: 86px; max-width: 190px; height: 26px;
+  border: 1px solid #30363d; border-radius: 4px; background: #161b22; color: #d4d4d4;
+  padding: 0 6px; font: inherit; }
+#terminal-status { color: var(--muted); font-size: 12px; flex: 1 1 72px; min-width: 24px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .terminal-button { height: 26px; border: 1px solid #30363d; border-radius: 4px; background: #161b22;
   color: #d4d4d4; padding: 0 9px; font: inherit; cursor: pointer; }
+.terminal-button.icon { width: 28px; padding: 0; font-size: 14px; line-height: 1; }
 .terminal-button:disabled { opacity: 0.45; cursor: default; }
 #xterm-host { flex: 1; min-height: 0; padding: 8px; }
 #terminal-fallback { flex: 1; min-height: 0; margin: 0; padding: 10px 12px; overflow: auto;
@@ -601,9 +617,10 @@ _SESSIONTRACKER_HTML = """<!DOCTYPE html>
 </div>
 <div id="admin-terminal-panel" class="panel">
   <div id="terminal-toolbar">
+    <select id="terminal-session-select" aria-label="PTY sessions"></select>
     <span id="terminal-status">Terminal disabled</span>
-    <button type="button" id="terminal-connect" class="terminal-button">Connect</button>
-    <button type="button" id="terminal-disconnect" class="terminal-button" disabled>Disconnect</button>
+    <button type="button" id="terminal-new" class="terminal-button">New</button>
+    <button type="button" id="terminal-disconnect" class="terminal-button icon" title="Close terminal" aria-label="Close terminal" disabled>⏻</button>
   </div>
   <div id="xterm-host"></div>
   <pre id="terminal-fallback" class="hidden" tabindex="0"></pre>
@@ -621,8 +638,9 @@ const trackerPanel = document.getElementById('viewport');
 const terminalPanel = document.getElementById('admin-terminal-panel');
 const tabTracker = document.getElementById('tab-tracker');
 const tabTerminal = document.getElementById('tab-terminal');
+const terminalSessionSelect = document.getElementById('terminal-session-select');
 const terminalStatus = document.getElementById('terminal-status');
-const terminalConnect = document.getElementById('terminal-connect');
+const terminalNew = document.getElementById('terminal-new');
 const terminalDisconnect = document.getElementById('terminal-disconnect');
 const xtermHost = document.getElementById('xterm-host');
 const terminalFallback = document.getElementById('terminal-fallback');
@@ -673,12 +691,7 @@ function selectTab(name) {
   tabTerminal.classList.toggle('active', terminalActive);
   scrollBtn.style.display = terminalActive ? 'none' : '';
   if (terminalActive) {
-    initAdminTerminal().then(() => {
-      if (!terminalWs) connectAdminTerminal();
-      resizeAdminTerminal();
-      if (xterm) xterm.focus();
-      if (usingFallback) terminalFallback.focus();
-    });
+    openTerminalPanel();
   }
 }
 
@@ -691,9 +704,29 @@ let fitAddon = null;
 let xtermAssetsPromise = null;
 let terminalSurfaceReady = false;
 let usingFallback = false;
+let terminalSessions = [];
+let activeTerminalId = '';
+let maxTerminalSessions = 4;
+let terminalWsId = '';
 
 function setTerminalStatus(text) {
   terminalStatus.textContent = text;
+}
+
+function terminalApiUrl(path, extra = {}) {
+  const qs = new URLSearchParams(params);
+  Object.entries(extra).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== '') {
+      qs.set(key, String(value));
+    }
+  });
+  return apiBase + '/admin/terminal' + path + '?' + qs.toString();
+}
+
+async function terminalApi(path, { method = 'GET', extra = {} } = {}) {
+  const r = await fetch(terminalApiUrl(path, extra), { method });
+  if (!r.ok) throw new Error(await r.text());
+  return await r.json();
 }
 
 function loadStyle(url) {
@@ -772,6 +805,14 @@ async function initAdminTerminal() {
   resizeAdminTerminal();
 }
 
+function resetTerminalSurface() {
+  if (xterm) {
+    xterm.reset();
+  } else {
+    terminalFallback.textContent = '';
+  }
+}
+
 function terminalDimensions() {
   if (xterm) return { cols: xterm.cols || 100, rows: xterm.rows || 30 };
   const rect = terminalFallback.getBoundingClientRect();
@@ -824,52 +865,191 @@ function handleFallbackKey(ev) {
   sendTerminalInput(data);
 }
 
-async function connectAdminTerminal() {
+function detachCurrentTerminalWs() {
+  if (!terminalWs) return;
+  const ws = terminalWs;
+  terminalWs = null;
+  terminalWsId = '';
+  ws.onopen = null;
+  ws.onmessage = null;
+  ws.onerror = null;
+  ws.onclose = null;
+  try { ws.close(); } catch (_) {}
+}
+
+function renderTerminalSessionTabs() {
+  terminalSessionSelect.innerHTML = '';
+  if (!terminalSessions.length) {
+    const option = document.createElement('option');
+    option.value = '';
+    option.textContent = 'No terminal';
+    terminalSessionSelect.appendChild(option);
+  }
+  terminalSessions.forEach(session => {
+    const option = document.createElement('option');
+    option.value = session.id;
+    option.textContent = session.title || session.id;
+    option.title = session.cwd || session.title || session.id;
+    terminalSessionSelect.appendChild(option);
+  });
+  terminalSessionSelect.value = activeTerminalId || '';
+  terminalSessionSelect.disabled = !adminTerminalAvailable || !terminalSessions.length;
+  terminalNew.disabled = !adminTerminalAvailable || terminalSessions.length >= maxTerminalSessions;
+  terminalDisconnect.disabled = !adminTerminalAvailable || !activeTerminalId;
+}
+
+function applyTerminalSessionPayload(data) {
+  terminalSessions = data.sessions || terminalSessions || [];
+  maxTerminalSessions = data.max_sessions || maxTerminalSessions || 4;
+  if (data.terminal && data.terminal.id) {
+    activeTerminalId = data.terminal.id;
+  }
+  if (activeTerminalId && !terminalSessions.some(item => item.id === activeTerminalId)) {
+    activeTerminalId = '';
+  }
+  if (!activeTerminalId && terminalSessions.length) {
+    activeTerminalId = terminalSessions[0].id;
+  }
+  renderTerminalSessionTabs();
+}
+
+async function refreshTerminalSessions({ createIfEmpty = false, connect = false } = {}) {
   if (!adminTerminalAvailable) return;
   await initAdminTerminal();
-  if (terminalWs && terminalWs.readyState <= WebSocket.OPEN) return;
+  try {
+    const data = await terminalApi('/sessions');
+    applyTerminalSessionPayload(data);
+    if (!terminalSessions.length && createIfEmpty) {
+      await createTerminalSession({ connect });
+      return;
+    }
+    if (connect && activeTerminalId) {
+      await connectAdminTerminal(activeTerminalId);
+    } else if (!terminalSessions.length) {
+      setTerminalStatus('No terminal');
+      resetTerminalSurface();
+    } else {
+      setTerminalStatus('Ready');
+    }
+  } catch (err) {
+    setTerminalStatus('Error: ' + (err && err.message ? err.message : err));
+  }
+}
+
+async function createTerminalSession({ connect = true } = {}) {
+  if (!adminTerminalAvailable) return;
+  await initAdminTerminal();
+  const dims = terminalDimensions();
+  try {
+    const data = await terminalApi('/sessions', {
+      method: 'POST',
+      extra: { cols: dims.cols, rows: dims.rows }
+    });
+    applyTerminalSessionPayload(data);
+    if (connect && activeTerminalId) {
+      await connectAdminTerminal(activeTerminalId);
+    }
+  } catch (err) {
+    setTerminalStatus('Error: ' + (err && err.message ? err.message : err));
+  }
+}
+
+async function openTerminalPanel() {
+  await refreshTerminalSessions({ createIfEmpty: true, connect: true });
+  resizeAdminTerminal();
+  if (xterm) xterm.focus();
+  if (usingFallback) terminalFallback.focus();
+}
+
+async function connectAdminTerminal(terminalId = activeTerminalId) {
+  if (!adminTerminalAvailable || !terminalId) return;
+  await initAdminTerminal();
+  if (
+    terminalWs &&
+    terminalWsId === terminalId &&
+    terminalWs.readyState <= WebSocket.OPEN
+  ) {
+    return;
+  }
+  detachCurrentTerminalWs();
+  activeTerminalId = terminalId;
+  renderTerminalSessionTabs();
+  resetTerminalSurface();
   const dims = terminalDimensions();
   const qs = new URLSearchParams(params);
   qs.set('cols', String(dims.cols));
   qs.set('rows', String(dims.rows));
+  qs.set('terminal_id', terminalId);
   const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const url = scheme + '//' + location.host + apiBase + '/admin/terminal/ws?' + qs.toString();
   setTerminalStatus('Connecting...');
-  terminalConnect.disabled = true;
-  terminalWs = new WebSocket(url);
-  terminalWs.onopen = () => {
+  const ws = new WebSocket(url);
+  terminalWs = ws;
+  terminalWsId = terminalId;
+  ws.onopen = () => {
+    if (terminalWs !== ws) return;
     setTerminalStatus('Connected');
-    terminalConnect.disabled = true;
     terminalDisconnect.disabled = false;
     resizeAdminTerminal();
   };
-  terminalWs.onmessage = (ev) => {
+  ws.onmessage = (ev) => {
+    if (terminalWs !== ws) return;
     try {
       const msg = JSON.parse(ev.data);
+      if (msg.type === 'session' && msg.terminal) {
+        activeTerminalId = msg.terminal.id || activeTerminalId;
+        renderTerminalSessionTabs();
+      }
       if (msg.type === 'output') writeTerminal(msg.data || '');
       if (msg.type === 'exit') {
         setTerminalStatus(msg.reason ? ('Closed: ' + msg.reason) : 'Closed');
-        terminalConnect.disabled = false;
         terminalDisconnect.disabled = true;
+        refreshTerminalSessions({ createIfEmpty: false, connect: false });
       }
     } catch (_) {}
   };
-  terminalWs.onerror = () => {
+  ws.onerror = () => {
+    if (terminalWs !== ws) return;
     setTerminalStatus('Connection error');
   };
-  terminalWs.onclose = () => {
+  ws.onclose = () => {
+    if (terminalWs !== ws) return;
     terminalWs = null;
-    terminalConnect.disabled = false;
+    terminalWsId = '';
     terminalDisconnect.disabled = true;
     if (terminalStatus.textContent === 'Connected') setTerminalStatus('Disconnected');
   };
 }
 
-function disconnectAdminTerminal() {
-  if (terminalWs) terminalWs.close();
+async function disconnectAdminTerminal() {
+  if (!activeTerminalId) return;
+  const terminalId = activeTerminalId;
+  setTerminalStatus('Closing...');
+  try {
+    const data = await terminalApi(
+      '/sessions/' + encodeURIComponent(terminalId) + '/close',
+      { method: 'POST' }
+    );
+    detachCurrentTerminalWs();
+    applyTerminalSessionPayload(data);
+    resetTerminalSurface();
+    if (activeTerminalId) {
+      await connectAdminTerminal(activeTerminalId);
+    } else {
+      setTerminalStatus('No terminal');
+    }
+  } catch (err) {
+    setTerminalStatus('Error: ' + (err && err.message ? err.message : err));
+  }
 }
 
-terminalConnect.addEventListener('click', connectAdminTerminal);
+terminalNew.addEventListener('click', () => createTerminalSession({ connect: true }));
+terminalSessionSelect.addEventListener('change', () => {
+  const terminalId = terminalSessionSelect.value;
+  if (!terminalId) return;
+  activeTerminalId = terminalId;
+  connectAdminTerminal(terminalId);
+});
 terminalDisconnect.addEventListener('click', disconnectAdminTerminal);
 window.addEventListener('resize', resizeAdminTerminal);
 
@@ -1130,11 +1310,14 @@ function updateAdminTerminalAvailability(info) {
     (info.chat_type === 1 || info.chat_type === 7)
   );
   tabs.classList.toggle('visible', adminTerminalAvailable);
-  terminalConnect.disabled = !adminTerminalAvailable || !!terminalWs;
+  renderTerminalSessionTabs();
   if (!adminTerminalAvailable) {
     setTerminalStatus('Terminal disabled');
     if (terminalPanel.classList.contains('active')) selectTab('tracker');
-    if (terminalWs) terminalWs.close();
+    detachCurrentTerminalWs();
+    terminalSessions = [];
+    activeTerminalId = '';
+    renderTerminalSessionTabs();
   } else if (!terminalWs && terminalStatus.textContent === 'Terminal disabled') {
     setTerminalStatus('Ready');
   }
@@ -1417,7 +1600,7 @@ def register_sessiontracker_routes(
         })
 
     @_require_sessiontracker_params
-    async def api_admin_terminal_ws(request: Any, **kw: Any) -> Any:
+    async def api_admin_terminal_sessions(request: Any, **kw: Any) -> Any:
         from aiohttp import web
 
         chat_type = kw["chat_type"]
@@ -1436,11 +1619,125 @@ def register_sessiontracker_routes(
             return web.Response(status=403, text=str(exc))
         if terminal_error:
             return web.Response(status=403, text=terminal_error)
+        return web.json_response({
+            "sessions": await list_terminal_sessions(viewer_user_id),
+            "max_sessions": sessiontracker_terminal_max_per_admin(),
+            "retention_seconds": sessiontracker_terminal_retention_seconds(),
+        })
+
+    @_require_sessiontracker_params
+    async def api_admin_terminal_new(request: Any, **kw: Any) -> Any:
+        from aiohttp import web
+
+        chat_type = kw["chat_type"]
+        code = kw["code"]
+        account, account_error = _account_for_sessiontracker_request(chat_type, code)
+        if account_error:
+            return web.Response(status=500, text=account_error)
+        try:
+            viewer_user_id, terminal_error = await _require_terminal_admin_user_id(
+                request,
+                chat_type=chat_type,
+                code=code,
+                account=account,
+            )
+        except InfoflowAPIError as exc:
+            return web.Response(status=403, text=str(exc))
+        if terminal_error:
+            return web.Response(status=403, text=terminal_error)
+        rows = _parse_terminal_dimension(
+            request.rel_url.query.get("rows", "30"),
+            30,
+            min_value=1,
+            max_value=200,
+        )
+        cols = _parse_terminal_dimension(
+            request.rel_url.query.get("cols", "100"),
+            100,
+            min_value=2,
+            max_value=500,
+        )
+        try:
+            terminal = await create_terminal_session(
+                viewer_user_id,
+                cwd=sessiontracker_terminal_cwd(),
+                rows=rows,
+                cols=cols,
+            )
+        except RuntimeError as exc:
+            if str(exc) == "terminal_limit_reached":
+                return web.Response(status=409, text="terminal limit reached")
+            raise
+        except ValueError as exc:
+            return web.Response(status=400, text=str(exc))
+        return web.json_response({
+            "terminal": terminal,
+            "sessions": await list_terminal_sessions(viewer_user_id),
+            "max_sessions": sessiontracker_terminal_max_per_admin(),
+            "retention_seconds": sessiontracker_terminal_retention_seconds(),
+        })
+
+    @_require_sessiontracker_params
+    async def api_admin_terminal_close(request: Any, **kw: Any) -> Any:
+        from aiohttp import web
+
+        chat_type = kw["chat_type"]
+        code = kw["code"]
+        terminal_id = request.match_info.get("terminal_id", "").strip()
+        if not terminal_id:
+            return web.Response(status=400, text="terminal_id required")
+        account, account_error = _account_for_sessiontracker_request(chat_type, code)
+        if account_error:
+            return web.Response(status=500, text=account_error)
+        try:
+            viewer_user_id, terminal_error = await _require_terminal_admin_user_id(
+                request,
+                chat_type=chat_type,
+                code=code,
+                account=account,
+            )
+        except InfoflowAPIError as exc:
+            return web.Response(status=403, text=str(exc))
+        if terminal_error:
+            return web.Response(status=403, text=terminal_error)
+        closed = await close_terminal_session(viewer_user_id, terminal_id)
+        if not closed:
+            return web.Response(status=404, text="terminal not found")
+        return web.json_response({
+            "closed": True,
+            "sessions": await list_terminal_sessions(viewer_user_id),
+            "max_sessions": sessiontracker_terminal_max_per_admin(),
+            "retention_seconds": sessiontracker_terminal_retention_seconds(),
+        })
+
+    @_require_sessiontracker_params
+    async def api_admin_terminal_ws(request: Any, **kw: Any) -> Any:
+        from aiohttp import web
+
+        chat_type = kw["chat_type"]
+        code = kw["code"]
+        terminal_id = request.rel_url.query.get("terminal_id", "").strip()
+        if not terminal_id:
+            return web.Response(status=400, text="terminal_id required")
+        account, account_error = _account_for_sessiontracker_request(chat_type, code)
+        if account_error:
+            return web.Response(status=500, text=account_error)
+        try:
+            viewer_user_id, terminal_error = await _require_terminal_admin_user_id(
+                request,
+                chat_type=chat_type,
+                code=code,
+                account=account,
+            )
+        except InfoflowAPIError as exc:
+            return web.Response(status=403, text=str(exc))
+        if terminal_error:
+            return web.Response(status=403, text=terminal_error)
         return await run_terminal_websocket(
             request,
             viewer_user_id=viewer_user_id,
-            cwd=sessiontracker_terminal_cwd(),
-            idle_timeout=sessiontracker_terminal_idle_timeout_seconds(),
+            terminal_id=terminal_id,
+            retention_seconds=sessiontracker_terminal_retention_seconds(),
         )
 
     app.router.add_get(root, page)
@@ -1448,6 +1745,12 @@ def register_sessiontracker_routes(
     app.router.add_get(f"{root}/api/resolve", api_resolve)
     app.router.add_get(f"{root}/api/history", api_history)
     app.router.add_get(f"{root}/api/stream", api_stream)
+    app.router.add_get(f"{root}/api/admin/terminal/sessions", api_admin_terminal_sessions)
+    app.router.add_post(f"{root}/api/admin/terminal/sessions", api_admin_terminal_new)
+    app.router.add_post(
+        f"{root}/api/admin/terminal/sessions/{{terminal_id}}/close",
+        api_admin_terminal_close,
+    )
     app.router.add_get(f"{root}/api/admin/terminal/ws", api_admin_terminal_ws)
     logger.info("[infoflow] Session Tracker at <host>:<port>%s", root)
 

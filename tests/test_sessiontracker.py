@@ -752,22 +752,144 @@ async def test_sessiontracker_terminal_ws_requires_private_admin(
     async with TestClient(TestServer(app)) as client:
         resp = await client.get(
             "/webhook/infoflow/sessiontracker/api/admin/terminal/ws"
-            "?chatType=6&chatId=1&code=admin-code",
+            "?chatType=6&chatId=1&code=admin-code&terminal_id=t1",
         )
         assert resp.status == 403
 
         resp = await client.get(
             "/webhook/infoflow/sessiontracker/api/admin/terminal/ws"
-            "?chatType=7&chatId=1&code=user-code",
+            "?chatType=7&chatId=1&code=user-code&terminal_id=t1",
         )
         assert resp.status == 403
 
         resp = await client.get(
             "/webhook/infoflow/sessiontracker/api/admin/terminal/ws"
-            "?chatType=7&chatId=1&code=admin-code",
+            "?chatType=7&chatId=1&code=admin-code&terminal_id=t1",
         )
         assert resp.status == 200
         assert await resp.json() == {"ok": True}
+
+
+async def test_sessiontracker_terminal_session_routes(
+    monkeypatch: pytest.MonkeyPatch,
+    account: InfoflowAccountAPI,
+) -> None:
+    pytest.importorskip("aiohttp")
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    monkeypatch.setenv("INFOFLOW_SESSIONTRACKER_TERMINAL_ENABLED", "true")
+    monkeypatch.setenv("INFOFLOW_ADMIN_USER", "admin")
+    monkeypatch.setattr(
+        "hermes_infoflow.sessiontracker._read_infoflow_account",
+        lambda: account,
+    )
+
+    async def _fake_get_user_info_by_code(
+        account: InfoflowAccountAPI,
+        code: str,
+        *,
+        session=None,
+    ) -> str:
+        del account, session
+        return "admin" if code == "admin-code" else "alice"
+
+    sessions = [
+        {
+            "id": "t1",
+            "title": "Terminal 1",
+            "cwd": "/tmp",
+            "attached": False,
+        }
+    ]
+
+    async def _fake_list(viewer_user_id: str) -> list[dict[str, object]]:
+        assert viewer_user_id == "admin"
+        return list(sessions)
+
+    async def _fake_create(
+        viewer_user_id: str,
+        *,
+        cwd: str,
+        rows: int = 30,
+        cols: int = 100,
+    ) -> dict[str, object]:
+        assert viewer_user_id == "admin"
+        assert cwd
+        created = {
+            "id": "t2",
+            "title": "Terminal 2",
+            "cwd": cwd,
+            "attached": False,
+            "rows": rows,
+            "cols": cols,
+        }
+        sessions.append(created)
+        return created
+
+    async def _fake_close(viewer_user_id: str, terminal_id: str) -> bool:
+        assert viewer_user_id == "admin"
+        for i, item in enumerate(sessions):
+            if item["id"] == terminal_id:
+                sessions.pop(i)
+                return True
+        return False
+
+    monkeypatch.setattr(
+        "hermes_infoflow.sessiontracker.get_user_info_by_code",
+        _fake_get_user_info_by_code,
+    )
+    monkeypatch.setattr(
+        "hermes_infoflow.sessiontracker.list_terminal_sessions",
+        _fake_list,
+    )
+    monkeypatch.setattr(
+        "hermes_infoflow.sessiontracker.create_terminal_session",
+        _fake_create,
+    )
+    monkeypatch.setattr(
+        "hermes_infoflow.sessiontracker.close_terminal_session",
+        _fake_close,
+    )
+
+    app = web.Application()
+    register_sessiontracker_routes(app, SessionTracker(buffer_size=50), base_path="/webhook/infoflow")
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get(
+            "/webhook/infoflow/sessiontracker/api/admin/terminal/sessions"
+            "?chatType=7&chatId=1&code=admin-code",
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["sessions"][0]["id"] == "t1"
+        assert body["max_sessions"] == 4
+        assert body["retention_seconds"] == 7200
+
+        resp = await client.post(
+            "/webhook/infoflow/sessiontracker/api/admin/terminal/sessions"
+            "?chatType=7&chatId=1&code=admin-code&rows=33&cols=120",
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["terminal"]["id"] == "t2"
+        assert body["terminal"]["rows"] == 33
+        assert body["terminal"]["cols"] == 120
+
+        resp = await client.post(
+            "/webhook/infoflow/sessiontracker/api/admin/terminal/sessions/t1/close"
+            "?chatType=7&chatId=1&code=admin-code",
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["closed"] is True
+        assert [item["id"] for item in body["sessions"]] == ["t2"]
+
+        resp = await client.get(
+            "/webhook/infoflow/sessiontracker/api/admin/terminal/sessions"
+            "?chatType=6&chatId=1&code=admin-code",
+        )
+        assert resp.status == 403
 
 
 def test_sessiontracker_enabled_env(monkeypatch: pytest.MonkeyPatch) -> None:

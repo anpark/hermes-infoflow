@@ -235,7 +235,8 @@ bash scripts/deploy.sh --port 9000 # 指定 webhook 端口并写入 ~/.hermes/.e
 | `INFOFLOW_SESSIONTRACKER_TERMINAL_ENABLED` | `false` | 是否启用 Session Tracker 私聊 admin Terminal tab |
 | `INFOFLOW_SESSIONTRACKER_TERMINAL_LOCALHOST_ONLY` | `true` | Terminal WebSocket 是否仅允许 localhost / 本机反代访问 |
 | `INFOFLOW_SESSIONTRACKER_TERMINAL_CWD` | `~/.hermes/plugins/infoflow` | Terminal shell 工作目录；若该路径不存在则回退到 `~/.hermes/plugin/infoflow` 或当前工作目录 |
-| `INFOFLOW_SESSIONTRACKER_TERMINAL_IDLE_TIMEOUT` | `600` | Terminal 无输入空闲超时时间，单位秒 |
+| `INFOFLOW_SESSIONTRACKER_TERMINAL_RETENTION_SECONDS` | `7200` | 页面断开后保留 detached PTY 的时间，单位秒 |
+| `INFOFLOW_SESSIONTRACKER_TERMINAL_MAX_PER_ADMIN` | `4` | 每个 admin 同时保留的 PTY session 上限 |
 
 `INFOFLOW_WATCH_MENTIONS` 可以只写一个值，也可以用英文逗号分隔多个值：
 
@@ -383,7 +384,7 @@ https://<your-domain>/webhook/infoflow/sessiontracker?chatType=7&chatId=39500876
 
 调试注入到 Hermes 的完整 user message：`INFOFLOW_SESSIONTRACKER_FULL_USER_MESSAGE=true`。只有 Session Tracker URL 中的 `code` 解析为 `INFOFLOW_ADMIN_USER` 中任一 userid 时才展示完整内容；非 admin 或未带 `code` 的群聊页面仍只展示 `[Message]` 后正文。
 
-私聊 admin 终端：`INFOFLOW_SESSIONTRACKER_TERMINAL_ENABLED=true` 后，只有 `chatType=1|7` 且 `code` 解析为 `INFOFLOW_ADMIN_USER` 中任一 userid 的页面会显示 `Terminal` tab。该 tab 通过 WebSocket 启动一个 PTY shell，默认工作目录为运行时插件目录，连接关闭或空闲超时后会结束 shell。群聊页面不显示该 tab。
+私聊 admin 终端：`INFOFLOW_SESSIONTRACKER_TERMINAL_ENABLED=true` 后，只有 `chatType=1|7` 且 `code` 解析为 `INFOFLOW_ADMIN_USER` 中任一 userid 的页面会显示 `Terminal` tab。该 tab 可同时保留最多 4 个 PTY session；关闭页面、刷新页面、断网只会断开 WebSocket，PTY 默认继续保留 2 小时，再次打开会列出并复用已有 session。点击 `Disconnect` 会关闭当前 PTY。群聊页面不显示该 tab。
 
 关闭：`INFOFLOW_SESSIONTRACKER_ENABLED=false`。
 
