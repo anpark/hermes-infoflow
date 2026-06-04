@@ -236,6 +236,8 @@ class TerminalSession:
     last_detached_at: float = 0.0
     output_buffer: deque[str] = field(default_factory=deque)
     output_buffer_chars: int = 0
+    output_buffer_start_cursor: int = 0
+    output_cursor: int = 0
     subscribers: set[Any] = field(default_factory=set)
     reader_task: asyncio.Task[Any] | None = None
     retention_task: asyncio.Task[Any] | None = None
@@ -256,6 +258,8 @@ class TerminalSession:
             "cols": self.cols,
             "rows": self.rows,
             "exit_code": self.exit_code,
+            "output_cursor": self.output_cursor,
+            "output_buffer_start_cursor": self.output_buffer_start_cursor,
         }
 
     def buffered_output(self) -> str:
@@ -283,10 +287,37 @@ class TerminalSessionManager:
             return
         session.output_buffer.append(text)
         session.output_buffer_chars += len(text)
+        session.output_cursor += len(text)
         limit = sessiontracker_terminal_buffer_chars()
         while session.output_buffer and session.output_buffer_chars > limit:
             removed = session.output_buffer.popleft()
             session.output_buffer_chars -= len(removed)
+            session.output_buffer_start_cursor += len(removed)
+
+    def _cancel_retention_locked(self, session: TerminalSession) -> None:
+        if session.retention_task is not None:
+            session.retention_task.cancel()
+            session.retention_task = None
+
+    def _schedule_retention_locked(
+        self,
+        session: TerminalSession,
+        retention_seconds: int,
+    ) -> None:
+        if session.subscribers or session.closing or session.retention_task is not None:
+            return
+        session.last_detached_at = time.time()
+        session.retention_task = asyncio.create_task(
+            self._retention_close_after(session, retention_seconds)
+        )
+
+    def _reschedule_retention_locked(
+        self,
+        session: TerminalSession,
+        retention_seconds: int,
+    ) -> None:
+        self._cancel_retention_locked(session)
+        self._schedule_retention_locked(session, retention_seconds)
 
     async def list_sessions(self, viewer_user_id: str) -> list[dict[str, Any]]:
         user_key = _terminal_user_key(viewer_user_id)
@@ -336,6 +367,10 @@ class TerminalSessionManager:
             )
             sessions[terminal_id] = session
             session.reader_task = asyncio.create_task(self._read_loop(session))
+            self._schedule_retention_locked(
+                session,
+                sessiontracker_terminal_retention_seconds(),
+            )
 
         logger.info(
             "[infoflow] sessiontracker terminal create viewer=%s cwd=%s pid=%s id=%s",
@@ -376,9 +411,7 @@ class TerminalSessionManager:
             session = self._sessions.get(user_key, {}).get(terminal_id)
             if session is None or session.closing:
                 raise KeyError("terminal_not_found")
-            if session.retention_task is not None:
-                session.retention_task.cancel()
-                session.retention_task = None
+            self._cancel_retention_locked(session)
             session.subscribers.add(ws)
             session.last_attached_at = time.time()
             session.last_activity_at = session.last_attached_at
@@ -406,22 +439,78 @@ class TerminalSessionManager:
             session.subscribers.discard(ws)
             if session.subscribers or session.closing:
                 return
-            session.last_detached_at = time.time()
-            if session.retention_task is None:
-                session.retention_task = asyncio.create_task(
-                    self._retention_close_after(session, retention_seconds)
+            self._schedule_retention_locked(session, retention_seconds)
+
+    async def read_output(
+        self,
+        viewer_user_id: str,
+        terminal_id: str,
+        *,
+        cursor: int,
+        wait_seconds: float,
+        retention_seconds: int,
+    ) -> dict[str, Any]:
+        user_key = _terminal_user_key(viewer_user_id)
+        deadline = time.monotonic() + max(0.0, wait_seconds)
+        first_touch = True
+        while True:
+            async with self._lock:
+                session = self._sessions.get(user_key, {}).get(terminal_id)
+                if session is None or session.closing:
+                    raise KeyError("terminal_not_found")
+                if first_touch:
+                    now = time.time()
+                    session.last_attached_at = now
+                    session.last_activity_at = now
+                    self._reschedule_retention_locked(session, retention_seconds)
+                    first_touch = False
+
+                base_cursor = session.output_buffer_start_cursor
+                current_cursor = session.output_cursor
+                normalized_cursor = max(0, int(cursor or 0))
+                overflow = normalized_cursor < base_cursor
+                if overflow:
+                    normalized_cursor = base_cursor
+                buffered_output = session.buffered_output()
+                offset = normalized_cursor - base_cursor
+                data = buffered_output[offset:] if 0 <= offset <= len(buffered_output) else ""
+                snapshot = session.snapshot()
+                process_exited = session.proc.poll() is not None
+                exit_code = (
+                    session.exit_code
+                    if session.exit_code is not None
+                    else session.proc.poll()
                 )
 
-    async def write_input(self, viewer_user_id: str, terminal_id: str, data: str) -> None:
+                if data or process_exited or time.monotonic() >= deadline:
+                    self._reschedule_retention_locked(session, retention_seconds)
+                    return {
+                        "terminal": snapshot,
+                        "output": data,
+                        "cursor": current_cursor,
+                        "base_cursor": base_cursor,
+                        "overflow": overflow,
+                        "exit_code": exit_code,
+                    }
+
+            await asyncio.sleep(0.2)
+
+    async def write_input(self, viewer_user_id: str, terminal_id: str, data: str) -> bool:
         user_key = _terminal_user_key(viewer_user_id)
         async with self._lock:
             session = self._sessions.get(user_key, {}).get(terminal_id)
             if session is None or session.closing:
-                return
+                return False
             session.last_activity_at = time.time()
+            self._reschedule_retention_locked(
+                session,
+                sessiontracker_terminal_retention_seconds(),
+            )
             master_fd = session.master_fd
         with contextlib.suppress(OSError):
             os.write(master_fd, data.encode())
+            return True
+        return False
 
     async def resize(
         self,
@@ -430,18 +519,24 @@ class TerminalSessionManager:
         *,
         rows: int,
         cols: int,
-    ) -> None:
+    ) -> bool:
         user_key = _terminal_user_key(viewer_user_id)
         async with self._lock:
             session = self._sessions.get(user_key, {}).get(terminal_id)
             if session is None or session.closing:
-                return
+                return False
             session.rows = rows
             session.cols = cols
             session.last_activity_at = time.time()
+            self._reschedule_retention_locked(
+                session,
+                sessiontracker_terminal_retention_seconds(),
+            )
             master_fd = session.master_fd
         with contextlib.suppress(OSError, ValueError):
             set_pty_window_size(master_fd, rows=rows, cols=cols)
+            return True
+        return False
 
     async def _read_loop(self, session: TerminalSession) -> None:
         loop = asyncio.get_running_loop()
@@ -458,8 +553,9 @@ class TerminalSessionManager:
                     break
                 session.last_activity_at = time.time()
                 self._append_output(session, text)
+                cursor = session.output_cursor
                 subscribers = list(session.subscribers)
-            await self._broadcast_output(subscribers, text)
+            await self._broadcast_output(subscribers, text, cursor=cursor)
 
         session.exit_code = session.proc.poll()
         if session.exit_code is None:
@@ -472,12 +568,18 @@ class TerminalSessionManager:
             terminate=False,
         )
 
-    async def _broadcast_output(self, subscribers: list[Any], text: str) -> None:
+    async def _broadcast_output(
+        self,
+        subscribers: list[Any],
+        text: str,
+        *,
+        cursor: int,
+    ) -> None:
         for ws in subscribers:
             if getattr(ws, "closed", False):
                 continue
             with contextlib.suppress(ConnectionError, RuntimeError):
-                await ws.send_json({"type": "output", "data": text})
+                await ws.send_json({"type": "output", "data": text, "cursor": cursor})
 
     async def _retention_close_after(
         self,
@@ -593,6 +695,50 @@ async def close_terminal_session(viewer_user_id: str, terminal_id: str) -> bool:
     )
 
 
+async def read_terminal_output(
+    viewer_user_id: str,
+    terminal_id: str,
+    *,
+    cursor: int = 0,
+    wait_seconds: float = 20.0,
+    retention_seconds: int | None = None,
+) -> dict[str, Any]:
+    return await _terminal_manager.read_output(
+        viewer_user_id,
+        terminal_id,
+        cursor=max(0, int(cursor or 0)),
+        wait_seconds=max(0.0, min(float(wait_seconds or 0.0), 25.0)),
+        retention_seconds=(
+            sessiontracker_terminal_retention_seconds()
+            if retention_seconds is None
+            else max(60, int(retention_seconds))
+        ),
+    )
+
+
+async def write_terminal_input(
+    viewer_user_id: str,
+    terminal_id: str,
+    data: str,
+) -> bool:
+    return await _terminal_manager.write_input(viewer_user_id, terminal_id, data)
+
+
+async def resize_terminal_session(
+    viewer_user_id: str,
+    terminal_id: str,
+    *,
+    rows: int,
+    cols: int,
+) -> bool:
+    return await _terminal_manager.resize(
+        viewer_user_id,
+        terminal_id,
+        rows=_parse_dimension(rows, 30, min_value=1, max_value=200),
+        cols=_parse_dimension(cols, 100, min_value=2, max_value=500),
+    )
+
+
 async def run_terminal_websocket(
     request: Any,
     *,
@@ -616,6 +762,8 @@ async def run_terminal_websocket(
     )
     ws = web.WebSocketResponse(heartbeat=30, max_msg_size=262144)
     await ws.prepare(request)
+    remote = getattr(request, "remote", "") or ""
+    user_agent = request.headers.get("User-Agent", "")
 
     try:
         snapshot, buffered_output = await _terminal_manager.attach(
@@ -626,13 +774,39 @@ async def run_terminal_websocket(
             cols=cols,
         )
     except KeyError:
+        logger.warning(
+            "[infoflow] sessiontracker terminal ws missing viewer=%s remote=%s "
+            "id=%s user_agent=%r",
+            _terminal_user_key(viewer_user_id),
+            remote,
+            terminal_id,
+            user_agent,
+        )
         await ws.send_json({"type": "exit", "reason": "terminal_not_found"})
         await ws.close()
         return ws
 
+    logger.info(
+        "[infoflow] sessiontracker terminal ws attach viewer=%s remote=%s id=%s "
+        "pid=%s cwd=%s rows=%s cols=%s user_agent=%r",
+        _terminal_user_key(viewer_user_id),
+        remote,
+        terminal_id,
+        snapshot.get("pid"),
+        snapshot.get("cwd"),
+        snapshot.get("rows"),
+        snapshot.get("cols"),
+        user_agent,
+    )
     await ws.send_json({"type": "session", "terminal": snapshot})
     if buffered_output:
-        await ws.send_json({"type": "output", "data": buffered_output, "replay": True})
+        await ws.send_json({
+            "type": "output",
+            "data": buffered_output,
+            "replay": True,
+            "cursor": snapshot.get("output_cursor"),
+            "base_cursor": snapshot.get("output_buffer_start_cursor"),
+        })
     try:
         async for msg in ws:
             if msg.type != WSMsgType.TEXT:
@@ -681,6 +855,14 @@ async def run_terminal_websocket(
             ws,
             retention_seconds=retention_seconds,
         )
+        logger.info(
+            "[infoflow] sessiontracker terminal ws detach viewer=%s remote=%s id=%s "
+            "user_agent=%r",
+            _terminal_user_key(viewer_user_id),
+            remote,
+            terminal_id,
+            user_agent,
+        )
     return ws
 
 
@@ -692,7 +874,9 @@ __all__ = [
     "close_terminal_session",
     "create_terminal_session",
     "list_terminal_sessions",
+    "read_terminal_output",
     "request_is_localhost",
+    "resize_terminal_session",
     "run_terminal_websocket",
     "sessiontracker_terminal_cwd",
     "sessiontracker_terminal_enabled",
@@ -702,4 +886,5 @@ __all__ = [
     "sessiontracker_terminal_localhost_only",
     "set_pty_window_size",
     "spawn_terminal_process",
+    "write_terminal_input",
 ]

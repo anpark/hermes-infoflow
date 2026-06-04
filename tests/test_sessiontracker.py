@@ -659,6 +659,7 @@ async def test_sessiontracker_resolve_marks_private_admin_terminal(
     from aiohttp.test_utils import TestClient, TestServer
 
     monkeypatch.setenv("INFOFLOW_SESSIONTRACKER_TERMINAL_ENABLED", "true")
+    monkeypatch.setenv("INFOFLOW_SESSIONTRACKER_TERMINAL_LOCALHOST_ONLY", "true")
     monkeypatch.setenv("INFOFLOW_ADMIN_USER", "admin")
     monkeypatch.delenv(
         "INFOFLOW_SESSIONTRACKER_TERMINAL_RETENTION_MINUTES",
@@ -702,6 +703,7 @@ async def test_sessiontracker_resolve_marks_private_admin_terminal(
         body = await resp.json()
         assert body["viewer_is_admin"] is True
         assert body["terminal_enabled"] is True
+        assert body["terminal_block_reason"] is None
 
         resp = await client.get(
             "/webhook/infoflow/sessiontracker/api/resolve"
@@ -711,6 +713,7 @@ async def test_sessiontracker_resolve_marks_private_admin_terminal(
         body = await resp.json()
         assert body["viewer_is_admin"] is False
         assert body["terminal_enabled"] is False
+        assert body["terminal_block_reason"] == "not_admin"
 
         resp = await client.get(
             "/webhook/infoflow/sessiontracker/api/resolve"
@@ -720,6 +723,21 @@ async def test_sessiontracker_resolve_marks_private_admin_terminal(
         body = await resp.json()
         assert body["viewer_is_admin"] is True
         assert body["terminal_enabled"] is False
+        assert body["terminal_block_reason"] == "not_private_chat"
+
+        monkeypatch.setattr(
+            "hermes_infoflow.sessiontracker.request_is_localhost",
+            lambda request: False,
+        )
+        resp = await client.get(
+            "/webhook/infoflow/sessiontracker/api/resolve"
+            "?chatType=7&chatId=1&code=admin-code",
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["viewer_is_admin"] is True
+        assert body["terminal_enabled"] is False
+        assert body["terminal_block_reason"] == "localhost_only"
 
 
 async def test_sessiontracker_terminal_ws_requires_private_admin(
@@ -731,6 +749,7 @@ async def test_sessiontracker_terminal_ws_requires_private_admin(
     from aiohttp.test_utils import TestClient, TestServer
 
     monkeypatch.setenv("INFOFLOW_SESSIONTRACKER_TERMINAL_ENABLED", "true")
+    monkeypatch.setenv("INFOFLOW_SESSIONTRACKER_TERMINAL_LOCALHOST_ONLY", "true")
     monkeypatch.setenv("INFOFLOW_ADMIN_USER", "admin")
     monkeypatch.setattr(
         "hermes_infoflow.sessiontracker._read_infoflow_account",
@@ -760,7 +779,11 @@ async def test_sessiontracker_terminal_ws_requires_private_admin(
     )
 
     app = web.Application()
-    register_sessiontracker_routes(app, SessionTracker(buffer_size=50), base_path="/webhook/infoflow")
+    register_sessiontracker_routes(
+        app,
+        SessionTracker(buffer_size=50),
+        base_path="/webhook/infoflow",
+    )
 
     async with TestClient(TestServer(app)) as client:
         resp = await client.get(
@@ -783,6 +806,177 @@ async def test_sessiontracker_terminal_ws_requires_private_admin(
         assert await resp.json() == {"ok": True}
 
 
+async def test_sessiontracker_terminal_routes_respect_localhost_only(
+    monkeypatch: pytest.MonkeyPatch,
+    account: InfoflowAccountAPI,
+) -> None:
+    pytest.importorskip("aiohttp")
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    monkeypatch.setenv("INFOFLOW_SESSIONTRACKER_TERMINAL_ENABLED", "true")
+    monkeypatch.setenv("INFOFLOW_SESSIONTRACKER_TERMINAL_LOCALHOST_ONLY", "true")
+    monkeypatch.setenv("INFOFLOW_ADMIN_USER", "admin")
+    monkeypatch.setattr(
+        "hermes_infoflow.sessiontracker._read_infoflow_account",
+        lambda: account,
+    )
+    monkeypatch.setattr(
+        "hermes_infoflow.sessiontracker.request_is_localhost",
+        lambda request: False,
+    )
+
+    async def _fake_get_user_info_by_code(
+        account: InfoflowAccountAPI,
+        code: str,
+        *,
+        session=None,
+    ) -> str:
+        del account, code, session
+        return "admin"
+
+    monkeypatch.setattr(
+        "hermes_infoflow.sessiontracker.get_user_info_by_code",
+        _fake_get_user_info_by_code,
+    )
+
+    app = web.Application()
+    register_sessiontracker_routes(
+        app,
+        SessionTracker(buffer_size=50),
+        base_path="/webhook/infoflow",
+    )
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get(
+            "/webhook/infoflow/sessiontracker/api/admin/terminal/sessions"
+            "?chatType=7&chatId=1&code=admin-code",
+        )
+        assert resp.status == 403
+        assert await resp.text() == "terminal: localhost only"
+
+
+async def test_sessiontracker_terminal_http_fallback_routes(
+    monkeypatch: pytest.MonkeyPatch,
+    account: InfoflowAccountAPI,
+) -> None:
+    pytest.importorskip("aiohttp")
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    monkeypatch.setenv("INFOFLOW_SESSIONTRACKER_TERMINAL_ENABLED", "true")
+    monkeypatch.setenv("INFOFLOW_SESSIONTRACKER_TERMINAL_LOCALHOST_ONLY", "true")
+    monkeypatch.setenv("INFOFLOW_ADMIN_USER", "admin")
+    monkeypatch.setattr(
+        "hermes_infoflow.sessiontracker._read_infoflow_account",
+        lambda: account,
+    )
+
+    async def _fake_get_user_info_by_code(
+        account: InfoflowAccountAPI,
+        code: str,
+        *,
+        session=None,
+    ) -> str:
+        del account, code, session
+        return "admin"
+
+    async def _fake_read_output(
+        viewer_user_id: str,
+        terminal_id: str,
+        *,
+        cursor: int,
+        wait_seconds: float,
+        retention_seconds: int,
+    ) -> dict[str, object]:
+        assert viewer_user_id == "admin"
+        assert terminal_id == "t1"
+        assert cursor == 3
+        assert wait_seconds == 0
+        assert retention_seconds == 172800
+        return {
+            "terminal": {"id": "t1"},
+            "output": "ok",
+            "cursor": 5,
+            "base_cursor": 0,
+            "overflow": False,
+            "exit_code": None,
+        }
+
+    async def _fake_write_input(
+        viewer_user_id: str,
+        terminal_id: str,
+        data: str,
+    ) -> bool:
+        assert viewer_user_id == "admin"
+        assert terminal_id == "t1"
+        assert data == "ls\r"
+        return True
+
+    async def _fake_resize(
+        viewer_user_id: str,
+        terminal_id: str,
+        *,
+        rows: int,
+        cols: int,
+    ) -> bool:
+        assert viewer_user_id == "admin"
+        assert terminal_id == "t1"
+        assert rows == 33
+        assert cols == 120
+        return True
+
+    monkeypatch.setattr(
+        "hermes_infoflow.sessiontracker.get_user_info_by_code",
+        _fake_get_user_info_by_code,
+    )
+    monkeypatch.setattr(
+        "hermes_infoflow.sessiontracker.read_terminal_output",
+        _fake_read_output,
+    )
+    monkeypatch.setattr(
+        "hermes_infoflow.sessiontracker.write_terminal_input",
+        _fake_write_input,
+    )
+    monkeypatch.setattr(
+        "hermes_infoflow.sessiontracker.resize_terminal_session",
+        _fake_resize,
+    )
+
+    app = web.Application()
+    register_sessiontracker_routes(
+        app,
+        SessionTracker(buffer_size=50),
+        base_path="/webhook/infoflow",
+    )
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get(
+            "/webhook/infoflow/sessiontracker/api/admin/terminal/sessions/t1/output"
+            "?chatType=7&chatId=1&code=admin-code&cursor=3&wait=0",
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["output"] == "ok"
+        assert body["cursor"] == 5
+
+        resp = await client.post(
+            "/webhook/infoflow/sessiontracker/api/admin/terminal/sessions/t1/input"
+            "?chatType=7&chatId=1&code=admin-code",
+            json={"data": "ls\r"},
+        )
+        assert resp.status == 200
+        assert await resp.json() == {"ok": True}
+
+        resp = await client.post(
+            "/webhook/infoflow/sessiontracker/api/admin/terminal/sessions/t1/resize"
+            "?chatType=7&chatId=1&code=admin-code",
+            json={"rows": 33, "cols": 120},
+        )
+        assert resp.status == 200
+        assert await resp.json() == {"ok": True, "rows": 33, "cols": 120}
+
+
 async def test_sessiontracker_terminal_session_routes(
     monkeypatch: pytest.MonkeyPatch,
     account: InfoflowAccountAPI,
@@ -792,6 +986,7 @@ async def test_sessiontracker_terminal_session_routes(
     from aiohttp.test_utils import TestClient, TestServer
 
     monkeypatch.setenv("INFOFLOW_SESSIONTRACKER_TERMINAL_ENABLED", "true")
+    monkeypatch.setenv("INFOFLOW_SESSIONTRACKER_TERMINAL_LOCALHOST_ONLY", "true")
     monkeypatch.setenv("INFOFLOW_ADMIN_USER", "admin")
     monkeypatch.setattr(
         "hermes_infoflow.sessiontracker._read_infoflow_account",
@@ -866,7 +1061,11 @@ async def test_sessiontracker_terminal_session_routes(
     )
 
     app = web.Application()
-    register_sessiontracker_routes(app, SessionTracker(buffer_size=50), base_path="/webhook/infoflow")
+    register_sessiontracker_routes(
+        app,
+        SessionTracker(buffer_size=50),
+        base_path="/webhook/infoflow",
+    )
 
     async with TestClient(TestServer(app)) as client:
         resp = await client.get(

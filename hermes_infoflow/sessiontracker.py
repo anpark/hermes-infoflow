@@ -33,13 +33,16 @@ from .sessiontracker_terminal import (
     close_terminal_session,
     create_terminal_session,
     list_terminal_sessions,
+    read_terminal_output,
     request_is_localhost,
+    resize_terminal_session,
     run_terminal_websocket,
     sessiontracker_terminal_cwd,
     sessiontracker_terminal_enabled,
     sessiontracker_terminal_localhost_only,
     sessiontracker_terminal_max_per_admin,
     sessiontracker_terminal_retention_seconds,
+    write_terminal_input,
 )
 
 logger = logging.getLogger(__name__)
@@ -392,6 +395,14 @@ def _parse_terminal_dimension(raw: str, default: int, *, min_value: int, max_val
     return max(min_value, min(value, max_value))
 
 
+def _parse_terminal_wait(raw: str) -> float:
+    try:
+        value = float(raw or "20")
+    except ValueError:
+        value = 20.0
+    return max(0.0, min(value, 25.0))
+
+
 def _read_infoflow_account() -> InfoflowAccountAPI:
     api_host = os.getenv("INFOFLOW_API_HOST", "").strip() or DEFAULT_API_HOST
     app_key = os.getenv("INFOFLOW_APP_KEY", "").strip()
@@ -441,6 +452,60 @@ async def _viewer_is_admin(
     account: InfoflowAccountAPI | None,
 ) -> bool:
     return bool(await _viewer_admin_user_id(code=code, account=account))
+
+
+def _terminal_block_reason(
+    request: Any,
+    *,
+    chat_type: int,
+    viewer_is_admin: bool,
+) -> str | None:
+    if not sessiontracker_terminal_enabled():
+        return "disabled"
+    if chat_type not in DM_CHAT_TYPES:
+        return "not_private_chat"
+    if not viewer_is_admin:
+        return "not_admin"
+    if sessiontracker_terminal_localhost_only() and not request_is_localhost(request):
+        return "localhost_only"
+    return None
+
+
+def _terminal_log_context(request: Any, *, chat_type: int) -> dict[str, Any]:
+    return {
+        "remote": getattr(request, "remote", "") or "",
+        "chat_type": chat_type,
+        "user_agent": request.headers.get("User-Agent", ""),
+    }
+
+
+def _log_terminal_denied(
+    request: Any,
+    *,
+    action: str,
+    chat_type: int,
+    reason: str,
+) -> None:
+    ctx = _terminal_log_context(request, chat_type=chat_type)
+    logger.warning(
+        "[infoflow] sessiontracker terminal deny action=%s reason=%s remote=%s "
+        "chat_type=%s user_agent=%r",
+        action,
+        reason,
+        ctx["remote"],
+        ctx["chat_type"],
+        ctx["user_agent"],
+    )
+
+
+def _terminal_error_text(reason: str) -> str:
+    if reason == "disabled":
+        return "terminal disabled"
+    if reason == "not_private_chat":
+        return "terminal is only available for private Session Tracker pages"
+    if reason == "localhost_only":
+        return "terminal: localhost only"
+    return "terminal requires admin viewer code"
 
 
 def _account_for_sessiontracker_request(
@@ -511,15 +576,21 @@ async def _require_terminal_admin_user_id(
     code: str,
     account: InfoflowAccountAPI | None,
 ) -> tuple[str, str | None]:
-    if not sessiontracker_terminal_enabled():
-        return "", "terminal disabled"
-    if chat_type not in DM_CHAT_TYPES:
-        return "", "terminal is only available for private Session Tracker pages"
-    if sessiontracker_terminal_localhost_only() and not request_is_localhost(request):
-        return "", "terminal: localhost only"
     viewer_user_id = await _viewer_admin_user_id(code=code, account=account)
     if not viewer_user_id:
-        return "", "terminal requires admin viewer code"
+        reason = _terminal_block_reason(
+            request,
+            chat_type=chat_type,
+            viewer_is_admin=False,
+        )
+        return "", _terminal_error_text(reason or "not_admin")
+    reason = _terminal_block_reason(
+        request,
+        chat_type=chat_type,
+        viewer_is_admin=True,
+    )
+    if reason:
+        return "", _terminal_error_text(reason)
     return viewer_user_id, None
 
 
@@ -708,9 +779,26 @@ let terminalSessions = [];
 let activeTerminalId = '';
 let maxTerminalSessions = 4;
 let terminalWsId = '';
+let terminalConnectTimer = null;
+let terminalTransport = '';
+let terminalHttpPollToken = 0;
+let terminalHttpPolling = false;
+let terminalOutputCursor = 0;
 
 function setTerminalStatus(text) {
   terminalStatus.textContent = text;
+}
+
+function clearTerminalConnectTimer() {
+  if (terminalConnectTimer) {
+    clearTimeout(terminalConnectTimer);
+    terminalConnectTimer = null;
+  }
+}
+
+function isMobileTerminalClient() {
+  const ua = navigator.userAgent || '';
+  return /iPhone|iPad|iPod|Android|Mobile|baiduhi_ios/i.test(ua);
 }
 
 function terminalApiUrl(path, extra = {}) {
@@ -723,8 +811,13 @@ function terminalApiUrl(path, extra = {}) {
   return apiBase + '/admin/terminal' + path + '?' + qs.toString();
 }
 
-async function terminalApi(path, { method = 'GET', extra = {} } = {}) {
-  const r = await fetch(terminalApiUrl(path, extra), { method });
+async function terminalApi(path, { method = 'GET', extra = {}, body = null } = {}) {
+  const options = { method };
+  if (body !== null) {
+    options.headers = { 'Content-Type': 'application/json' };
+    options.body = JSON.stringify(body);
+  }
+  const r = await fetch(terminalApiUrl(path, extra), options);
   if (!r.ok) throw new Error(await r.text());
   return await r.json();
 }
@@ -830,6 +923,11 @@ function resizeAdminTerminal() {
   const dims = terminalDimensions();
   if (terminalWs && terminalWs.readyState === WebSocket.OPEN) {
     terminalWs.send(JSON.stringify({ type: 'resize', cols: dims.cols, rows: dims.rows }));
+  } else if (terminalTransport === 'http' && activeTerminalId) {
+    terminalApi(
+      '/sessions/' + encodeURIComponent(activeTerminalId) + '/resize',
+      { method: 'POST', body: dims }
+    ).catch(() => {});
   }
 }
 
@@ -843,8 +941,17 @@ function writeTerminal(data) {
 }
 
 function sendTerminalInput(data) {
-  if (!terminalWs || terminalWs.readyState !== WebSocket.OPEN) return;
-  terminalWs.send(JSON.stringify({ type: 'input', data }));
+  if (terminalWs && terminalWs.readyState === WebSocket.OPEN) {
+    terminalWs.send(JSON.stringify({ type: 'input', data }));
+    return;
+  }
+  if (terminalTransport !== 'http' || !activeTerminalId) return;
+  terminalApi(
+    '/sessions/' + encodeURIComponent(activeTerminalId) + '/input',
+    { method: 'POST', body: { data } }
+  ).catch(err => {
+    setTerminalStatus('Input error: ' + (err && err.message ? err.message : err));
+  });
 }
 
 function handleFallbackKey(ev) {
@@ -866,6 +973,8 @@ function handleFallbackKey(ev) {
 }
 
 function detachCurrentTerminalWs() {
+  stopTerminalHttpPolling();
+  clearTerminalConnectTimer();
   if (!terminalWs) return;
   const ws = terminalWs;
   terminalWs = null;
@@ -875,6 +984,112 @@ function detachCurrentTerminalWs() {
   ws.onerror = null;
   ws.onclose = null;
   try { ws.close(); } catch (_) {}
+}
+
+function stopTerminalHttpPolling() {
+  terminalHttpPollToken += 1;
+  terminalHttpPolling = false;
+  if (terminalTransport === 'http') terminalTransport = '';
+}
+
+function waitForNextPoll(delayMs) {
+  return new Promise(resolve => setTimeout(resolve, delayMs));
+}
+
+async function startTerminalHttpFallback(terminalId) {
+  if (!adminTerminalAvailable || !terminalId) return;
+  const token = ++terminalHttpPollToken;
+  terminalHttpPolling = true;
+  terminalTransport = 'http';
+  terminalDisconnect.disabled = false;
+  setTerminalStatus('Connected (HTTP)');
+  try {
+    await terminalApi(
+      '/sessions/' + encodeURIComponent(terminalId) + '/resize',
+      { method: 'POST', body: terminalDimensions() }
+    );
+  } catch (_) {}
+  while (
+    terminalHttpPolling &&
+    token === terminalHttpPollToken &&
+    activeTerminalId === terminalId
+  ) {
+    try {
+      const data = await terminalApi(
+        '/sessions/' + encodeURIComponent(terminalId) + '/output',
+        { extra: { cursor: terminalOutputCursor, wait: 20 } }
+      );
+      if (
+        !terminalHttpPolling ||
+        token !== terminalHttpPollToken ||
+        activeTerminalId !== terminalId
+      ) {
+        break;
+      }
+      if (data.terminal && data.terminal.id) {
+        activeTerminalId = data.terminal.id;
+        renderTerminalSessionTabs();
+      }
+      if (data.overflow) {
+        resetTerminalSurface();
+      }
+      if (data.output) {
+        writeTerminal(data.output);
+      }
+      if (typeof data.cursor === 'number') {
+        terminalOutputCursor = data.cursor;
+      }
+      if (data.exit_code !== null && data.exit_code !== undefined) {
+        setTerminalStatus('Closed');
+        terminalDisconnect.disabled = true;
+        await refreshTerminalSessions({ createIfEmpty: false, connect: false });
+        break;
+      }
+      setTerminalStatus('Connected (HTTP)');
+    } catch (err) {
+      if (
+        !terminalHttpPolling ||
+        token !== terminalHttpPollToken ||
+        activeTerminalId !== terminalId
+      ) {
+        break;
+      }
+      if (err && String(err.message || err).includes('terminal not found')) {
+        setTerminalStatus('Closed');
+        terminalDisconnect.disabled = true;
+        await refreshTerminalSessions({ createIfEmpty: false, connect: false });
+        break;
+      }
+      setTerminalStatus('HTTP reconnecting...');
+      await waitForNextPoll(1000);
+    }
+  }
+}
+
+function fallbackTerminalFromWs(ws, terminalId, label) {
+  if (terminalWs !== ws) return;
+  clearTerminalConnectTimer();
+  ws.onopen = null;
+  ws.onmessage = null;
+  ws.onerror = null;
+  ws.onclose = null;
+  try { ws.close(); } catch (_) {}
+  terminalWs = null;
+  terminalWsId = '';
+  setTerminalStatus(label || 'Connecting via HTTP...');
+  startTerminalHttpFallback(terminalId);
+}
+
+function abandonTerminalWs(ws) {
+  if (terminalWs !== ws) return;
+  clearTerminalConnectTimer();
+  ws.onopen = null;
+  ws.onmessage = null;
+  ws.onerror = null;
+  ws.onclose = null;
+  try { ws.close(); } catch (_) {}
+  terminalWs = null;
+  terminalWsId = '';
 }
 
 function renderTerminalSessionTabs() {
@@ -975,6 +1190,16 @@ async function connectAdminTerminal(terminalId = activeTerminalId) {
   activeTerminalId = terminalId;
   renderTerminalSessionTabs();
   resetTerminalSurface();
+  terminalOutputCursor = 0;
+  if (isMobileTerminalClient()) {
+    startTerminalHttpFallback(terminalId);
+    connectTerminalWs(terminalId, { background: true });
+    return;
+  }
+  connectTerminalWs(terminalId, { background: false });
+}
+
+function connectTerminalWs(terminalId, { background = false } = {}) {
   const dims = terminalDimensions();
   const qs = new URLSearchParams(params);
   qs.set('cols', String(dims.cols));
@@ -982,12 +1207,27 @@ async function connectAdminTerminal(terminalId = activeTerminalId) {
   qs.set('terminal_id', terminalId);
   const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const url = scheme + '//' + location.host + apiBase + '/admin/terminal/ws?' + qs.toString();
-  setTerminalStatus('Connecting...');
-  const ws = new WebSocket(url);
+  if (!background) setTerminalStatus('Connecting...');
+  let ws = null;
+  try {
+    ws = new WebSocket(url);
+  } catch (_) {
+    if (!background) startTerminalHttpFallback(terminalId);
+    return;
+  }
   terminalWs = ws;
   terminalWsId = terminalId;
+  clearTerminalConnectTimer();
+  terminalConnectTimer = setTimeout(() => {
+    if (terminalWs !== ws || ws.readyState !== WebSocket.CONNECTING) return;
+    if (background) abandonTerminalWs(ws);
+    else fallbackTerminalFromWs(ws, terminalId, 'Connecting via HTTP...');
+  }, 5000);
   ws.onopen = () => {
     if (terminalWs !== ws) return;
+    clearTerminalConnectTimer();
+    stopTerminalHttpPolling();
+    terminalTransport = 'ws';
     setTerminalStatus('Connected');
     terminalDisconnect.disabled = false;
     resizeAdminTerminal();
@@ -1000,7 +1240,21 @@ async function connectAdminTerminal(terminalId = activeTerminalId) {
         activeTerminalId = msg.terminal.id || activeTerminalId;
         renderTerminalSessionTabs();
       }
-      if (msg.type === 'output') writeTerminal(msg.data || '');
+      if (msg.type === 'output') {
+        const output = msg.data || '';
+        if (msg.replay) {
+          const base = Number(msg.base_cursor || 0);
+          const offset = Math.max(0, terminalOutputCursor - base);
+          if (offset < output.length) writeTerminal(output.slice(offset));
+        } else {
+          writeTerminal(output);
+        }
+        if (typeof msg.cursor === 'number') {
+          terminalOutputCursor = Math.max(terminalOutputCursor, msg.cursor);
+        } else {
+          terminalOutputCursor += output.length;
+        }
+      }
       if (msg.type === 'exit') {
         setTerminalStatus(msg.reason ? ('Closed: ' + msg.reason) : 'Closed');
         terminalDisconnect.disabled = true;
@@ -1010,14 +1264,22 @@ async function connectAdminTerminal(terminalId = activeTerminalId) {
   };
   ws.onerror = () => {
     if (terminalWs !== ws) return;
-    setTerminalStatus('Connection error');
+    if (background) abandonTerminalWs(ws);
+    else fallbackTerminalFromWs(ws, terminalId, 'Connecting via HTTP...');
   };
   ws.onclose = () => {
     if (terminalWs !== ws) return;
+    clearTerminalConnectTimer();
     terminalWs = null;
     terminalWsId = '';
-    terminalDisconnect.disabled = true;
-    if (terminalStatus.textContent === 'Connected') setTerminalStatus('Disconnected');
+    if (!terminalHttpPolling) terminalDisconnect.disabled = true;
+    if (background && terminalHttpPolling) return;
+    if (terminalStatus.textContent === 'Connected') {
+      setTerminalStatus('Reconnecting via HTTP...');
+      startTerminalHttpFallback(terminalId);
+    } else if (terminalStatus.textContent === 'Connecting...') {
+      startTerminalHttpFallback(terminalId);
+    }
   };
 }
 
@@ -1429,13 +1691,16 @@ def register_sessiontracker_routes(
             return web.Response(status=403, text=str(exc))
         except ValueError as exc:
             return web.Response(status=400, text=str(exc))
-        viewer_is_admin = await _viewer_is_admin(code=code, account=account)
-        info["viewer_is_admin"] = viewer_is_admin
-        info["terminal_enabled"] = bool(
-            chat_type in DM_CHAT_TYPES
-            and viewer_is_admin
-            and sessiontracker_terminal_enabled()
+        viewer_user_id = await _viewer_admin_user_id(code=code, account=account)
+        viewer_is_admin = bool(viewer_user_id)
+        terminal_block_reason = _terminal_block_reason(
+            request,
+            chat_type=chat_type,
+            viewer_is_admin=viewer_is_admin,
         )
+        info["viewer_is_admin"] = viewer_is_admin
+        info["terminal_enabled"] = terminal_block_reason is None
+        info["terminal_block_reason"] = terminal_block_reason
         return web.json_response(info)
 
     @_require_sessiontracker_params
@@ -1618,9 +1883,26 @@ def register_sessiontracker_routes(
         except InfoflowAPIError as exc:
             return web.Response(status=403, text=str(exc))
         if terminal_error:
+            _log_terminal_denied(
+                request,
+                action="list",
+                chat_type=chat_type,
+                reason=terminal_error,
+            )
             return web.Response(status=403, text=terminal_error)
+        sessions = await list_terminal_sessions(viewer_user_id)
+        ctx = _terminal_log_context(request, chat_type=chat_type)
+        logger.info(
+            "[infoflow] sessiontracker terminal list viewer=%s remote=%s "
+            "chat_type=%s count=%s user_agent=%r",
+            viewer_user_id,
+            ctx["remote"],
+            ctx["chat_type"],
+            len(sessions),
+            ctx["user_agent"],
+        )
         return web.json_response({
-            "sessions": await list_terminal_sessions(viewer_user_id),
+            "sessions": sessions,
             "max_sessions": sessiontracker_terminal_max_per_admin(),
             "retention_seconds": sessiontracker_terminal_retention_seconds(),
         })
@@ -1644,6 +1926,12 @@ def register_sessiontracker_routes(
         except InfoflowAPIError as exc:
             return web.Response(status=403, text=str(exc))
         if terminal_error:
+            _log_terminal_denied(
+                request,
+                action="create",
+                chat_type=chat_type,
+                reason=terminal_error,
+            )
             return web.Response(status=403, text=terminal_error)
         rows = _parse_terminal_dimension(
             request.rel_url.query.get("rows", "30"),
@@ -1670,9 +1958,23 @@ def register_sessiontracker_routes(
             raise
         except ValueError as exc:
             return web.Response(status=400, text=str(exc))
+        sessions = await list_terminal_sessions(viewer_user_id)
+        ctx = _terminal_log_context(request, chat_type=chat_type)
+        logger.info(
+            "[infoflow] sessiontracker terminal create request viewer=%s remote=%s "
+            "chat_type=%s id=%s cwd=%s rows=%s cols=%s user_agent=%r",
+            viewer_user_id,
+            ctx["remote"],
+            ctx["chat_type"],
+            terminal.get("id"),
+            terminal.get("cwd"),
+            terminal.get("rows"),
+            terminal.get("cols"),
+            ctx["user_agent"],
+        )
         return web.json_response({
             "terminal": terminal,
-            "sessions": await list_terminal_sessions(viewer_user_id),
+            "sessions": sessions,
             "max_sessions": sessiontracker_terminal_max_per_admin(),
             "retention_seconds": sessiontracker_terminal_retention_seconds(),
         })
@@ -1699,16 +2001,210 @@ def register_sessiontracker_routes(
         except InfoflowAPIError as exc:
             return web.Response(status=403, text=str(exc))
         if terminal_error:
+            _log_terminal_denied(
+                request,
+                action="close",
+                chat_type=chat_type,
+                reason=terminal_error,
+            )
             return web.Response(status=403, text=terminal_error)
         closed = await close_terminal_session(viewer_user_id, terminal_id)
         if not closed:
             return web.Response(status=404, text="terminal not found")
+        sessions = await list_terminal_sessions(viewer_user_id)
+        ctx = _terminal_log_context(request, chat_type=chat_type)
+        logger.info(
+            "[infoflow] sessiontracker terminal close request viewer=%s remote=%s "
+            "chat_type=%s id=%s user_agent=%r",
+            viewer_user_id,
+            ctx["remote"],
+            ctx["chat_type"],
+            terminal_id,
+            ctx["user_agent"],
+        )
         return web.json_response({
             "closed": True,
-            "sessions": await list_terminal_sessions(viewer_user_id),
+            "sessions": sessions,
             "max_sessions": sessiontracker_terminal_max_per_admin(),
             "retention_seconds": sessiontracker_terminal_retention_seconds(),
         })
+
+    @_require_sessiontracker_params
+    async def api_admin_terminal_output(request: Any, **kw: Any) -> Any:
+        from aiohttp import web
+
+        chat_type = kw["chat_type"]
+        code = kw["code"]
+        terminal_id = request.match_info.get("terminal_id", "").strip()
+        if not terminal_id:
+            return web.Response(status=400, text="terminal_id required")
+        account, account_error = _account_for_sessiontracker_request(chat_type, code)
+        if account_error:
+            return web.Response(status=500, text=account_error)
+        try:
+            viewer_user_id, terminal_error = await _require_terminal_admin_user_id(
+                request,
+                chat_type=chat_type,
+                code=code,
+                account=account,
+            )
+        except InfoflowAPIError as exc:
+            return web.Response(status=403, text=str(exc))
+        if terminal_error:
+            _log_terminal_denied(
+                request,
+                action="output",
+                chat_type=chat_type,
+                reason=terminal_error,
+            )
+            return web.Response(status=403, text=terminal_error)
+        try:
+            cursor = _parse_cursor(request.rel_url.query.get("cursor", "0"))
+        except ValueError as exc:
+            return web.Response(status=400, text=str(exc))
+        wait_seconds = _parse_terminal_wait(request.rel_url.query.get("wait", "20"))
+        try:
+            result = await read_terminal_output(
+                viewer_user_id,
+                terminal_id,
+                cursor=cursor,
+                wait_seconds=wait_seconds,
+                retention_seconds=sessiontracker_terminal_retention_seconds(),
+            )
+        except KeyError:
+            return web.Response(status=404, text="terminal not found")
+        ctx = _terminal_log_context(request, chat_type=chat_type)
+        logger.info(
+            "[infoflow] sessiontracker terminal output viewer=%s remote=%s "
+            "chat_type=%s id=%s bytes=%s cursor=%s user_agent=%r",
+            viewer_user_id,
+            ctx["remote"],
+            ctx["chat_type"],
+            terminal_id,
+            len(str(result.get("output") or "")),
+            result.get("cursor"),
+            ctx["user_agent"],
+        )
+        return web.json_response(result)
+
+    @_require_sessiontracker_params
+    async def api_admin_terminal_input(request: Any, **kw: Any) -> Any:
+        from aiohttp import web
+
+        chat_type = kw["chat_type"]
+        code = kw["code"]
+        terminal_id = request.match_info.get("terminal_id", "").strip()
+        if not terminal_id:
+            return web.Response(status=400, text="terminal_id required")
+        account, account_error = _account_for_sessiontracker_request(chat_type, code)
+        if account_error:
+            return web.Response(status=500, text=account_error)
+        try:
+            viewer_user_id, terminal_error = await _require_terminal_admin_user_id(
+                request,
+                chat_type=chat_type,
+                code=code,
+                account=account,
+            )
+        except InfoflowAPIError as exc:
+            return web.Response(status=403, text=str(exc))
+        if terminal_error:
+            _log_terminal_denied(
+                request,
+                action="input",
+                chat_type=chat_type,
+                reason=terminal_error,
+            )
+            return web.Response(status=403, text=terminal_error)
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, ValueError):
+            return web.Response(status=400, text="json body required")
+        data = str(payload.get("data") or "")
+        if not data:
+            return web.Response(status=400, text="data required")
+        ok = await write_terminal_input(viewer_user_id, terminal_id, data)
+        if not ok:
+            return web.Response(status=404, text="terminal not found")
+        ctx = _terminal_log_context(request, chat_type=chat_type)
+        logger.info(
+            "[infoflow] sessiontracker terminal input viewer=%s remote=%s "
+            "chat_type=%s id=%s bytes=%s user_agent=%r",
+            viewer_user_id,
+            ctx["remote"],
+            ctx["chat_type"],
+            terminal_id,
+            len(data),
+            ctx["user_agent"],
+        )
+        return web.json_response({"ok": True})
+
+    @_require_sessiontracker_params
+    async def api_admin_terminal_resize(request: Any, **kw: Any) -> Any:
+        from aiohttp import web
+
+        chat_type = kw["chat_type"]
+        code = kw["code"]
+        terminal_id = request.match_info.get("terminal_id", "").strip()
+        if not terminal_id:
+            return web.Response(status=400, text="terminal_id required")
+        account, account_error = _account_for_sessiontracker_request(chat_type, code)
+        if account_error:
+            return web.Response(status=500, text=account_error)
+        try:
+            viewer_user_id, terminal_error = await _require_terminal_admin_user_id(
+                request,
+                chat_type=chat_type,
+                code=code,
+                account=account,
+            )
+        except InfoflowAPIError as exc:
+            return web.Response(status=403, text=str(exc))
+        if terminal_error:
+            _log_terminal_denied(
+                request,
+                action="resize",
+                chat_type=chat_type,
+                reason=terminal_error,
+            )
+            return web.Response(status=403, text=terminal_error)
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, ValueError):
+            return web.Response(status=400, text="json body required")
+        rows = _parse_terminal_dimension(
+            str(payload.get("rows", "30")),
+            30,
+            min_value=1,
+            max_value=200,
+        )
+        cols = _parse_terminal_dimension(
+            str(payload.get("cols", "100")),
+            100,
+            min_value=2,
+            max_value=500,
+        )
+        ok = await resize_terminal_session(
+            viewer_user_id,
+            terminal_id,
+            rows=rows,
+            cols=cols,
+        )
+        if not ok:
+            return web.Response(status=404, text="terminal not found")
+        ctx = _terminal_log_context(request, chat_type=chat_type)
+        logger.info(
+            "[infoflow] sessiontracker terminal resize viewer=%s remote=%s "
+            "chat_type=%s id=%s rows=%s cols=%s user_agent=%r",
+            viewer_user_id,
+            ctx["remote"],
+            ctx["chat_type"],
+            terminal_id,
+            rows,
+            cols,
+            ctx["user_agent"],
+        )
+        return web.json_response({"ok": True, "rows": rows, "cols": cols})
 
     @_require_sessiontracker_params
     async def api_admin_terminal_ws(request: Any, **kw: Any) -> Any:
@@ -1732,7 +2228,23 @@ def register_sessiontracker_routes(
         except InfoflowAPIError as exc:
             return web.Response(status=403, text=str(exc))
         if terminal_error:
+            _log_terminal_denied(
+                request,
+                action="ws",
+                chat_type=chat_type,
+                reason=terminal_error,
+            )
             return web.Response(status=403, text=terminal_error)
+        ctx = _terminal_log_context(request, chat_type=chat_type)
+        logger.info(
+            "[infoflow] sessiontracker terminal ws request viewer=%s remote=%s "
+            "chat_type=%s id=%s user_agent=%r",
+            viewer_user_id,
+            ctx["remote"],
+            ctx["chat_type"],
+            terminal_id,
+            ctx["user_agent"],
+        )
         return await run_terminal_websocket(
             request,
             viewer_user_id=viewer_user_id,
@@ -1750,6 +2262,18 @@ def register_sessiontracker_routes(
     app.router.add_post(
         f"{root}/api/admin/terminal/sessions/{{terminal_id}}/close",
         api_admin_terminal_close,
+    )
+    app.router.add_get(
+        f"{root}/api/admin/terminal/sessions/{{terminal_id}}/output",
+        api_admin_terminal_output,
+    )
+    app.router.add_post(
+        f"{root}/api/admin/terminal/sessions/{{terminal_id}}/input",
+        api_admin_terminal_input,
+    )
+    app.router.add_post(
+        f"{root}/api/admin/terminal/sessions/{{terminal_id}}/resize",
+        api_admin_terminal_resize,
     )
     app.router.add_get(f"{root}/api/admin/terminal/ws", api_admin_terminal_ws)
     logger.info("[infoflow] Session Tracker at <host>:<port>%s", root)
