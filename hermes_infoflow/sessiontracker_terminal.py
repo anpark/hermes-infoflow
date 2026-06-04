@@ -23,7 +23,9 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 LOCALHOST_ADDRS = frozenset({"127.0.0.1", "::1"})
-DEFAULT_TERMINAL_RETENTION_SECONDS = 7200
+MAX_TERMINAL_RETENTION_MINUTES = 48 * 60
+MAX_TERMINAL_RETENTION_SECONDS = MAX_TERMINAL_RETENTION_MINUTES * 60
+DEFAULT_TERMINAL_RETENTION_SECONDS = MAX_TERMINAL_RETENTION_SECONDS
 DEFAULT_TERMINAL_MAX_PER_ADMIN = 4
 DEFAULT_TERMINAL_BUFFER_CHARS = 262144
 
@@ -47,12 +49,22 @@ def sessiontracker_terminal_localhost_only() -> bool:
 
 
 def sessiontracker_terminal_retention_seconds() -> int:
-    raw = os.getenv(
-        "INFOFLOW_SESSIONTRACKER_TERMINAL_RETENTION_SECONDS",
-        str(DEFAULT_TERMINAL_RETENTION_SECONDS),
+    raw_minutes = os.getenv(
+        "INFOFLOW_SESSIONTRACKER_TERMINAL_RETENTION_MINUTES",
+        "",
     ).strip()
+    if raw_minutes:
+        try:
+            minutes = max(1, min(int(raw_minutes), MAX_TERMINAL_RETENTION_MINUTES))
+            return minutes * 60
+        except ValueError:
+            return DEFAULT_TERMINAL_RETENTION_SECONDS
+
+    raw = os.getenv("INFOFLOW_SESSIONTRACKER_TERMINAL_RETENTION_SECONDS", "").strip()
+    if not raw:
+        return DEFAULT_TERMINAL_RETENTION_SECONDS
     try:
-        return max(60, int(raw))
+        return max(60, min(int(raw), MAX_TERMINAL_RETENTION_SECONDS))
     except ValueError:
         return DEFAULT_TERMINAL_RETENTION_SECONDS
 
@@ -674,6 +686,8 @@ async def run_terminal_websocket(
 
 __all__ = [
     "LOCALHOST_ADDRS",
+    "MAX_TERMINAL_RETENTION_MINUTES",
+    "MAX_TERMINAL_RETENTION_SECONDS",
     "TerminalSessionManager",
     "close_terminal_session",
     "create_terminal_session",

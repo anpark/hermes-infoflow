@@ -25,6 +25,11 @@ from hermes_infoflow.sessiontracker import (
     resolve_target,
     session_matches_target,
 )
+from hermes_infoflow.sessiontracker_terminal import (
+    MAX_TERMINAL_RETENTION_MINUTES,
+    MAX_TERMINAL_RETENTION_SECONDS,
+    sessiontracker_terminal_retention_seconds,
+)
 
 
 @pytest.fixture
@@ -655,6 +660,14 @@ async def test_sessiontracker_resolve_marks_private_admin_terminal(
 
     monkeypatch.setenv("INFOFLOW_SESSIONTRACKER_TERMINAL_ENABLED", "true")
     monkeypatch.setenv("INFOFLOW_ADMIN_USER", "admin")
+    monkeypatch.delenv(
+        "INFOFLOW_SESSIONTRACKER_TERMINAL_RETENTION_MINUTES",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "INFOFLOW_SESSIONTRACKER_TERMINAL_RETENTION_SECONDS",
+        raising=False,
+    )
     monkeypatch.setattr(
         "hermes_infoflow.sessiontracker._read_infoflow_account",
         lambda: account,
@@ -864,7 +877,7 @@ async def test_sessiontracker_terminal_session_routes(
         body = await resp.json()
         assert body["sessions"][0]["id"] == "t1"
         assert body["max_sessions"] == 4
-        assert body["retention_seconds"] == 7200
+        assert body["retention_seconds"] == 172800
 
         resp = await client.post(
             "/webhook/infoflow/sessiontracker/api/admin/terminal/sessions"
@@ -897,3 +910,34 @@ def test_sessiontracker_enabled_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert sessiontracker_enabled() is False
     monkeypatch.setenv("INFOFLOW_SESSIONTRACKER_ENABLED", "true")
     assert sessiontracker_enabled() is True
+
+
+def test_sessiontracker_terminal_retention_defaults_to_48h(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(
+        "INFOFLOW_SESSIONTRACKER_TERMINAL_RETENTION_MINUTES",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "INFOFLOW_SESSIONTRACKER_TERMINAL_RETENTION_SECONDS",
+        raising=False,
+    )
+    assert sessiontracker_terminal_retention_seconds() == 172800
+
+
+def test_sessiontracker_terminal_retention_accepts_minutes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("INFOFLOW_SESSIONTRACKER_TERMINAL_RETENTION_MINUTES", "15")
+    assert sessiontracker_terminal_retention_seconds() == 900
+
+
+def test_sessiontracker_terminal_retention_clamps_minutes_to_48h(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "INFOFLOW_SESSIONTRACKER_TERMINAL_RETENTION_MINUTES",
+        str(MAX_TERMINAL_RETENTION_MINUTES + 1),
+    )
+    assert sessiontracker_terminal_retention_seconds() == MAX_TERMINAL_RETENTION_SECONDS

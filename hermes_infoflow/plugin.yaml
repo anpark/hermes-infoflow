@@ -183,9 +183,9 @@ optional_env:
     description: "Working directory for Session Tracker terminal shells (default ~/.hermes/plugins/infoflow when present)"
     prompt: "Session Tracker terminal cwd"
     password: false
-  - name: INFOFLOW_SESSIONTRACKER_TERMINAL_RETENTION_SECONDS
-    description: "Seconds to keep detached Session Tracker terminal PTYs alive after the web page disconnects (default 7200)"
-    prompt: "Session Tracker terminal retention seconds"
+  - name: INFOFLOW_SESSIONTRACKER_TERMINAL_RETENTION_MINUTES
+    description: "Minutes to keep detached Session Tracker terminal PTYs alive after the web page disconnects (default 2880, max 48h)"
+    prompt: "Session Tracker terminal retention minutes"
     password: false
   - name: INFOFLOW_SESSIONTRACKER_TERMINAL_MAX_PER_ADMIN
     description: "Maximum concurrent Session Tracker terminal PTYs per admin user (default 4)"

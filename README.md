@@ -235,7 +235,7 @@ bash scripts/deploy.sh --port 9000 # 指定 webhook 端口并写入 ~/.hermes/.e
 | `INFOFLOW_SESSIONTRACKER_TERMINAL_ENABLED` | `false` | 是否启用 Session Tracker 私聊 admin Terminal tab |
 | `INFOFLOW_SESSIONTRACKER_TERMINAL_LOCALHOST_ONLY` | `true` | Terminal WebSocket 是否仅允许 localhost / 本机反代访问 |
 | `INFOFLOW_SESSIONTRACKER_TERMINAL_CWD` | `~/.hermes/plugins/infoflow` | Terminal shell 工作目录；若该路径不存在则回退到 `~/.hermes/plugin/infoflow` 或当前工作目录 |
-| `INFOFLOW_SESSIONTRACKER_TERMINAL_RETENTION_SECONDS` | `7200` | 页面断开后保留 detached PTY 的时间，单位秒 |
+| `INFOFLOW_SESSIONTRACKER_TERMINAL_RETENTION_MINUTES` | `2880` | 页面断开后保留 detached PTY 的时间，单位分钟；不配置默认 48 小时，最大 48 小时 |
 | `INFOFLOW_SESSIONTRACKER_TERMINAL_MAX_PER_ADMIN` | `4` | 每个 admin 同时保留的 PTY session 上限 |
 
 `INFOFLOW_WATCH_MENTIONS` 可以只写一个值，也可以用英文逗号分隔多个值：
