@@ -26,6 +26,8 @@ def main(argv: list[str] | None = None) -> int:
         help="Run only a specific case id. Can be repeated.",
     )
     parser.add_argument("--model", default="", help="Override model name.")
+    parser.add_argument("--provider", default="", help="Override provider name.")
+    parser.add_argument("--api-mode", default="", help="Override API transport mode.")
     parser.add_argument("--json", action="store_true", help="Emit JSON lines only.")
     parser.add_argument("--quiet", action="store_true", help="Suppress passing final text.")
     args = parser.parse_args(argv)
@@ -34,6 +36,8 @@ def main(argv: list[str] | None = None) -> int:
         cases_file=args.cases_file,
         case_ids=set(args.case) or None,
         model_override=args.model,
+        provider_override=args.provider,
+        api_mode_override=args.api_mode,
     )
     ok = all(result.passed for result in results)
     if args.json:

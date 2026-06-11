@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,6 +51,7 @@ def _bootstrap_paths() -> None:
 _bootstrap_paths()
 
 from agent.auxiliary_client import _openai_with_configured_headers  # noqa: E402
+from agent.auxiliary_client import resolve_provider_client  # noqa: E402
 from hermes_cli.config import load_config  # noqa: E402
 from hermes_cli.runtime_provider import resolve_runtime_provider  # noqa: E402
 from hermes_infoflow.adapter import register  # noqa: E402
@@ -63,6 +65,7 @@ from hermes_infoflow.policy import (  # noqa: E402
     _GROUP_MENTION_RULES_DOC,
     _INFOFLOW_GROUP_REPLY_STRATEGY_DOC,
     _INFOFLOW_GROUP_SECURITY_DOC,
+    _INFOFLOW_GROUP_VISIBLE_OUTPUT_DOC,
     _INFOFLOW_SKILL_DISCLOSURE_RESTRICTED_DOC,
     _WATCH_MENTION_PROMPT,
     _WATCH_REGEX_PROMPT,
@@ -81,6 +84,7 @@ class PromptBehaviorResult:
     tool_sequence: list[str]
     final: str
     failures: list[str]
+    tool_call_contents: list[str]
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -89,6 +93,7 @@ class PromptBehaviorResult:
             "tool_sequence": self.tool_sequence,
             "final": self.final[:500],
             "failures": self.failures,
+            "tool_call_contents": self.tool_call_contents,
         }
 
 
@@ -128,6 +133,7 @@ def _channel_prompt() -> str:
             identity,
             _INFOFLOW_GROUP_SECURITY_DOC,
             _INFOFLOW_GROUP_REPLY_STRATEGY_DOC,
+            _INFOFLOW_GROUP_VISIBLE_OUTPUT_DOC,
             _INFOFLOW_SKILL_DISCLOSURE_RESTRICTED_DOC,
             _GROUP_MENTION_RULES_DOC,
         ]
@@ -249,7 +255,30 @@ def _assistant_message_to_dict(message: Any) -> dict[str, Any]:
     return data
 
 
-def resolve_glm_runtime(model_override: str = "") -> tuple[Any, str, dict[str, Any]]:
+def resolve_glm_runtime(
+    model_override: str = "",
+    provider_override: str = "",
+    api_mode_override: str = "",
+) -> tuple[Any, str, dict[str, Any]]:
+    if provider_override:
+        cfg = load_config()
+        provider_cfg = (cfg.get("providers") or {}).get(provider_override) or {}
+        client, resolved_model = resolve_provider_client(
+            provider_override,
+            model=model_override or None,
+            api_mode=api_mode_override or provider_cfg.get("transport") or None,
+        )
+        if client is None:
+            raise RuntimeError(f"No usable client resolved for provider {provider_override!r}")
+        model = str(resolved_model or model_override or "")
+        runtime = {
+            "provider": provider_override,
+            "model": model,
+            "api_mode": api_mode_override or provider_cfg.get("transport") or "auto",
+            "base_url": provider_cfg.get("base_url") or "",
+        }
+        return client, model, runtime
+
     runtime = resolve_runtime_provider()
     cfg_model = (load_config().get("model") or {}).get("default")
     model = str(model_override or runtime.get("model") or cfg_model or "GLM-5-Turbo")
@@ -298,9 +327,24 @@ def _contains_in_order(sequence: list[str], expected: Iterable[str]) -> bool:
     return False
 
 
-def _evaluate(case: dict[str, Any], tool_sequence: list[str], final: str) -> list[str]:
+_PROCESS_TEXT_RE = re.compile(
+    r"(先读|先看|读一下群历史|看一下上下文|查一下|稍等|我去查|让我查|我帮你看看|"
+    r"补上下文|读取历史|调用工具|检查\s*skills?|tool_call)",
+    re.IGNORECASE,
+)
+
+
+def _evaluate(
+    case: dict[str, Any],
+    tool_sequence: list[str],
+    final: str,
+    tool_call_contents: list[str],
+) -> list[str]:
     expected = case.get("expected") or {}
     failures: list[str] = []
+    for content in tool_call_contents:
+        if _PROCESS_TEXT_RE.search(content):
+            failures.append(f"assistant content during tool call: {content!r}")
     must_call = list(expected.get("must_call") or [])
     if must_call and not _contains_in_order(tool_sequence, must_call):
         failures.append(f"expected tool order containing {must_call}, got {tool_sequence}")
@@ -323,6 +367,7 @@ def run_case(client: Any, model: str, dataset: dict[str, Any], case: dict[str, A
         {"role": "user", "content": _envelope(case)},
     ]
     tool_sequence: list[str] = []
+    tool_call_contents: list[str] = []
     final = ""
     for _ in range(4):
         message = _call_model(client, model, messages)
@@ -330,6 +375,9 @@ def run_case(client: Any, model: str, dataset: dict[str, Any], case: dict[str, A
         if not tool_calls:
             final = (getattr(message, "content", "") or "").strip()
             break
+        content = (getattr(message, "content", "") or "").strip()
+        if content:
+            tool_call_contents.append(content)
         messages.append(_assistant_message_to_dict(message))
         for tc in tool_calls:
             name = tc.function.name
@@ -342,13 +390,14 @@ def run_case(client: Any, model: str, dataset: dict[str, Any], case: dict[str, A
                     "content": _tool_result(case, dataset, name),
                 }
             )
-    failures = _evaluate(case, tool_sequence, final)
+    failures = _evaluate(case, tool_sequence, final, tool_call_contents)
     return PromptBehaviorResult(
         case_id=str(case["id"]),
         passed=not failures,
         tool_sequence=tool_sequence,
         final=final,
         failures=failures,
+        tool_call_contents=tool_call_contents,
     )
 
 
@@ -357,9 +406,15 @@ def run_cases(
     cases_file: Path = DEFAULT_CASES_FILE,
     case_ids: set[str] | None = None,
     model_override: str = "",
+    provider_override: str = "",
+    api_mode_override: str = "",
 ) -> tuple[dict[str, Any], list[PromptBehaviorResult]]:
     dataset = load_cases(cases_file)
-    client, model, runtime = resolve_glm_runtime(model_override=model_override)
+    client, model, runtime = resolve_glm_runtime(
+        model_override=model_override,
+        provider_override=provider_override,
+        api_mode_override=api_mode_override,
+    )
     selected = [
         case for case in dataset.get("cases", [])
         if not case_ids or str(case.get("id")) in case_ids

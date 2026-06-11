@@ -425,6 +425,8 @@ def test_channel_prompt_keeps_only_chat_specific_sections(
     assert "permission:'...'" in group_prompt
     assert "对超过5人的群修改群聊资料" in group_prompt
     assert "## 群聊回复策略" in group_prompt
+    assert "## 群聊可见输出硬约束" in group_prompt
+    assert "assistant content 必须留空" in group_prompt
     assert "闭嘴" in group_prompt
     assert "## Skill 内容披露" in group_prompt
     assert "## 群聊 @ 规则" in group_prompt
@@ -435,6 +437,7 @@ def test_channel_prompt_keeps_only_chat_specific_sections(
     assert "私聊没有群聊 @ 语义" in dm_prompt
     assert "## Skill 内容披露" in dm_prompt
     assert "## 群聊安全边界" not in dm_prompt
+    assert "## 群聊可见输出硬约束" not in dm_prompt
     assert "## 群聊 @ 规则" not in dm_prompt
 
 
@@ -2600,8 +2603,56 @@ def test_send_records_bot_reply_for_follow_up(configured_env, monkeypatch) -> No
         "⚠️ custom stream drop (RemoteProtocolError) after 81.5s — reconnecting, retry 2/3",
         "⚠️ No activity for 15 min. Send any message to keep working.",
         "⚠️ No response from provider for 180s (stale stream detected, reconnecting)",
+        (
+            "⚠️ No reply: the model returned empty content after retries and any fallback "
+            "providers. Try `continue`, switch model/provider, or inspect the tool output above."
+        ),
+        (
+            "@zhujingsi ⚠️ No reply: the model returned empty content after retries and any "
+            "fallback providers. Try `continue`, switch model/provider, or inspect the tool output above."
+        ),
+        "⚠️ Empty/malformed response — switching to fallback...",
+        "⚠️ Provider authentication failed: invalid credentials",
+        "⚠️ The model provider rejected the request. I kept the raw provider details out of chat.",
+        "⚠️ The model provider failed after retries. I kept raw provider details out of chat.",
+        "⚠️ The model returned no response after processing tool calls.",
+        "⚠️ Processing stopped: upstream failure. Try again.",
+        "⚠️ Processing completed but no response was generated. Try again.",
+        "⚠️ Session too large for the model's context window.\nStart a new session.",
+        "⚠️ Billing or credits exhausted — switching to fallback provider...",
+        "⚠️ Rate limited — switching to fallback provider...",
+        "⏱️ Rate limited. Waiting 5.0s (attempt 2/3)...",
+        "⏱️ The model provider is rate-limiting requests. Please wait a moment and try again.",
+        "⏳ Retrying in 2.5s (attempt 1/3)...",
+        "⏳ Nous Portal rate limit active — resets in 8m.",
+        "⚠️ Provider safety filter blocked this request — trying fallback...",
+        "⚠️ Non-retryable error (HTTP 405) — trying fallback...",
+        "⚠️ Max retries (3) for invalid responses — trying fallback...",
+        "⚠️ Max retries (3) exhausted — trying fallback...",
+        "⚠️  Request payload too large (413) — compression attempt 1/2...",
+        "⚠️ Tool guardrail halted terminal: denied",
+        "⚠️ Model returned empty after tool calls — nudging to continue",
+        "⚠️ Model produced reasoning but no visible response after all retries. Returning empty.",
+        "⚠️ Empty response from model — retrying (2/3)",
+        "⚠️ Model returning empty responses — switching to fallback provider...",
+        "⚠ Auxiliary title_generation failed: invalid response",
+        "��� Non-retryable error (HTTP 405) — trying fallback...",
+        "❌ Billing or credits exhausted — quota exceeded",
+        "❌ Rate limited after 3 retries — too many requests",
+        "❌ API failed after 3 retries — upstream unavailable",
+        "❌ Max retries (3) exceeded for invalid responses. Giving up.",
+        "❌ Non-retryable error (HTTP 401): unauthorized",
+        "❌ Provider safety filter blocked this request: blocked",
+        "❌ Model returned no content after all retries and fallback attempts.",
+        "❌ Ollama runtime context is too small for Hermes tool use",
+        "↻ Switched to fallback: Claude Sonnet 4.6 (bdllm-anthropic)",
+        "↻ Stream interrupted — using delivered content as final response",
+        "↻ Empty response after tool calls — using earlier content as final answer",
+        "↻ Thinking-only response — prefilling to continue (1/2)",
+        "⚠️ Iteration budget exhausted (90/90) — asking model to summarise",
         "⚡ Interrupting current task. I'll respond to your message shortly.",
         "⚠️ Gateway shutting down — Your current task will be interrupted.",
+        "🔄 Primary model failed — switching to fallback: Claude Sonnet 4.6 via bdllm-anthropic",
         (
             "⚠️ Gateway restarting — Your current task will be interrupted. "
             "Send any message after restart and I'll try to resume where you left off."
@@ -2648,6 +2699,107 @@ def test_group_runtime_status_is_suppressed_and_broadcast_to_ops(
         and item["extra"]["redirected_to_ops"] is True
         for item in pushed
     )
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "先读一下群历史，看看上下文。",
+        "我先看一下上下文。",
+        "让我先查一下历史消息再回复。",
+        (
+            "历史信息有限，当前消息是黄硕在询问一个崩溃条目"
+            "（BeiZiSDKHTTPRequest asyncSplashHTTPRequest，387次），"
+            "可以用 map-crash-db 查一下这个崩溃的详情。"
+        ),
+    ],
+)
+def test_group_interim_history_narration_is_suppressed(
+    configured_env, monkeypatch, content
+) -> None:
+    monkeypatch.setenv("INFOFLOW_OP_CHANNEL", "ops01")
+    adapter = InfoflowAdapter(_make_config())
+    adapter._bot.send_message = AsyncMock()
+    adapter._push_infoflow_event = MagicMock()
+
+    adapter._serverapi.send_group_message_intent = AsyncMock(
+        side_effect=AssertionError("group send must not be called for interim narration")
+    )
+
+    async def _go():
+        return await adapter.send("group:42", content)
+
+    result = asyncio.run(_go())
+
+    assert result.success is True
+    adapter._bot.send_message.assert_not_awaited()
+    pushed = [call.kwargs for call in adapter._push_infoflow_event.call_args_list]
+    assert any(
+        item["chat_id"] == "group:42"
+        and item["extra"]["suppressed_group_interim_narration"] is True
+        and item["extra"]["interim_narration_kind"] == "history_context_preface"
+        and item["extra"]["preview"] == content[:200]
+        for item in pushed
+    )
+
+
+def test_group_history_based_final_answer_is_not_suppressed(
+    configured_env, monkeypatch
+) -> None:
+    content = "根据群历史，结论是现在应先修改出站过滤，再重启 gateway。"
+    monkeypatch.setenv("INFOFLOW_OP_CHANNEL", "ops01")
+    adapter = InfoflowAdapter(_make_config())
+    adapter._bot.send_message = AsyncMock(
+        return_value=SentResult(success=True, message_id="G-1")
+    )
+    adapter._push_infoflow_event = MagicMock()
+
+    async def _go():
+        return await adapter.send("group:42", content)
+
+    result = asyncio.run(_go())
+
+    assert result.success is True
+    adapter._bot.send_message.assert_awaited_once()
+    kwargs = adapter._bot.send_message.await_args.kwargs
+    assert kwargs["group_id"] == "42"
+    assert kwargs["dm_user_id"] is None
+    assert kwargs["text"] == content
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Rate limited APIs need exponential backoff in the client.",
+        "Non-retryable error handling should be documented clearly.",
+        "Switched to fallback providers can change output style.",
+        "Retrying in distributed systems should be bounded.",
+        "Auxiliary services can fail independently.",
+        "Iteration budget exhausted is a phrase in our incident notes.",
+        "@zhujingsi Non-retryable error handling should be documented clearly.",
+    ],
+)
+def test_group_plain_text_status_words_are_not_suppressed(
+    configured_env, monkeypatch, content
+) -> None:
+    monkeypatch.setenv("INFOFLOW_OP_CHANNEL", "ops01")
+    adapter = InfoflowAdapter(_make_config())
+    adapter._bot.send_message = AsyncMock(
+        return_value=SentResult(success=True, message_id="G-1")
+    )
+    adapter._push_infoflow_event = MagicMock()
+
+    async def _go():
+        return await adapter.send("group:42", content)
+
+    result = asyncio.run(_go())
+
+    assert result.success is True
+    adapter._bot.send_message.assert_awaited_once()
+    kwargs = adapter._bot.send_message.await_args.kwargs
+    assert kwargs["group_id"] == "42"
+    assert kwargs["dm_user_id"] is None
+    assert kwargs["text"] == content
 
 
 def test_group_runtime_status_can_send_to_numeric_ops_group(
@@ -2757,6 +2909,14 @@ def test_group_runtime_status_does_not_fallback_to_admin(
         "🗜️ Compacting context — summarizing earlier conversation so I can continue...",
         "���️ Compacting context — summarizing earlier conversation so I can continue...",
         "⚠ Compression summary failed: <!doctype html>",
+        "⚠ Configured auxiliary compression provider missing credentials",
+        "⚠ No auxiliary LLM provider configured — context compression skipped",
+        "⚠ Compression model aux-model context is too small",
+        "⚠ Skipping concurrent compression — another path is active",
+        "ℹ️ Configured compression model `aux-model` failed; using main model",
+        "🗜️ Context reduced to 100,000 tokens (was 200,000), retrying...",
+        "🗜️ Context too large (~130,000 tokens) — compressing (1/2)...",
+        "🗜️ Compressed 100 → 40 messages, retrying...",
     ],
 )
 def test_group_compression_status_is_suppressed_without_admin_redirect(

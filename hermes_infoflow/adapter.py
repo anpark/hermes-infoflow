@@ -48,11 +48,86 @@ _GROUP_STATUS_REDIRECT_PREFIXES = (
     "⚡ Interrupting current task",
     "⚠️ No activity",
     "⚠️ No response from provider",
+    "⚠️ No reply:",
+    "⚠️ Empty/malformed response",
+    "⚠️ Provider authentication failed",
+    "⚠️ The model provider rejected the request",
+    "⚠️ The model provider failed after retries",
+    "⚠️ The model returned no response after processing tool",
+    "⚠️ Processing stopped:",
+    "⚠️ Processing completed but no response was generated",
+    "⚠️ Session too large for the model's context window",
+    "⚠️ Billing or credits exhausted",
+    "⚠️ Rate limited",
+    "⏱️ Rate limited",
+    "⏱️ The model provider is rate-limiting requests",
+    "⏳ Retrying in",
+    "⏳ Nous Portal rate limit active",
+    "⚠️ Provider safety filter blocked this request",
+    "⚠️ Non-retryable error",
+    "⚠️ Max retries",
+    "⚠️  Request payload too large",
+    "⚠️ Tool guardrail halted",
+    "⚠️ Model returned empty after tool calls",
+    "⚠️ Model produced reasoning but no visible",
+    "⚠️ Empty response from model",
+    "⚠️ Model returning empty responses",
+    "⚠ Auxiliary",
     "⚠️ Gateway shutting down",
     "⚠️ Gateway restarting",
     "Gateway shutting down",
     "Gateway restarting",
+    "❌ Billing or credits exhausted",
+    "❌ Rate limited after",
+    "❌ API failed after",
+    "❌ Max retries",
+    "❌ Non-retryable error",
+    "❌ Provider safety filter blocked this request",
+    "❌ Model returned no content after all retries",
+    "❌ Ollama runtime context is too small",
+    "🔄 Primary model failed",
+    "↻ Switched to fallback",
+    "↻ Stream interrupted",
+    "↻ Empty response after tool calls",
+    "↻ Thinking-only response",
+    "⚠️ Iteration budget exhausted",
     "💾 Self-improvement review:",
+)
+_GROUP_STATUS_REDIRECT_TEXT_PREFIXES = (
+    "No activity",
+    "No response from provider",
+    "No reply:",
+    "Empty/malformed response",
+    "Provider authentication failed",
+    "The model provider rejected the request",
+    "The model provider is rate-limiting requests",
+    "The model provider failed after retries",
+    "The model returned no response after processing tool",
+    "Processing stopped:",
+    "Processing completed but no response was generated",
+    "Session too large for the model's context window",
+    "Billing or credits exhausted",
+    "Rate limited",
+    "Retrying in",
+    "Nous Portal rate limit active",
+    "Provider safety filter blocked this request",
+    "Non-retryable error",
+    "Max retries",
+    "Request payload too large",
+    "Tool guardrail halted",
+    "Model returned empty after tool calls",
+    "Model produced reasoning but no visible",
+    "Empty response from model",
+    "Model returning empty responses",
+    "Auxiliary",
+    "API failed after",
+    "Ollama runtime context is too small",
+    "Primary model failed",
+    "Switched to fallback",
+    "Stream interrupted",
+    "Thinking-only response",
+    "Iteration budget exhausted",
+    "Response formatting failed",
 )
 _GROUP_STATUS_REDIRECT_PATTERNS = (
     re.compile(r"^⚠️\s+.+\sstream\s+drop\b", re.IGNORECASE),
@@ -62,14 +137,43 @@ _GROUP_STATUS_TRACKER_ONLY_PREFIXES = (
     "🗜️ Compacting context",
     "⚠ Compression summary failed:",
     "⚠ Compression aborted:",
+    "⚠ Configured auxiliary compression provider",
+    "⚠ No auxiliary LLM provider configured",
+    "⚠ Compression model",
+    "⚠ Skipping concurrent compression",
     "ℹ Configured compression model",
+    "ℹ️ Configured compression model",
+    "🗜️ Context reduced",
+    "🗜️ Context too large",
+    "🗜️ Compressed",
 )
 _GROUP_STATUS_TRACKER_ONLY_TEXT_PREFIXES = (
     "Preflight compression:",
     "Compacting context",
     "Compression summary failed:",
     "Compression aborted:",
+    "Configured auxiliary compression provider",
+    "No auxiliary LLM provider configured",
+    "Compression model",
+    "Skipping concurrent compression",
     "Configured compression model",
+    "Context reduced",
+    "Context too large",
+    "Compressed",
+)
+_GROUP_INTERIM_NARRATION_MAX_CHARS = 180
+_GROUP_INTERIM_NARRATION_PATTERNS = (
+    re.compile(
+        r"^(?:我先|我先去|我来先|让我先|先)"
+        r"(?:读|看|查|查询|拉取|获取|翻看|翻一下)"
+        r".{0,18}(?:群历史|历史消息|聊天记录|上下文|上文|前文|历史)"
+        r".{0,20}$"
+    ),
+    re.compile(
+        r"^(?:历史信息有限|当前(?:消息|上下文)|从(?:群历史|历史消息|上下文)看)"
+        r".{0,120}(?:可以用|需要用|调用|用).{0,40}(?:查一下|查询|看看|查)"
+        r".{0,40}$"
+    ),
 )
 
 
@@ -97,6 +201,21 @@ def _group_status_redirect_kind(text: str) -> str:
     for prefix in _GROUP_STATUS_REDIRECT_PREFIXES:
         if t.startswith(prefix):
             return prefix
+    normalized = _drop_leading_status_glyphs(t)
+    if normalized != t:
+        for prefix in _GROUP_STATUS_REDIRECT_TEXT_PREFIXES:
+            if normalized.startswith(prefix):
+                return prefix
+    mentionless = _drop_leading_at_mentions(t)
+    if mentionless != t:
+        for prefix in _GROUP_STATUS_REDIRECT_PREFIXES:
+            if mentionless.startswith(prefix):
+                return prefix
+        normalized_mentionless = _drop_leading_status_glyphs(mentionless)
+        if normalized_mentionless != mentionless:
+            for prefix in _GROUP_STATUS_REDIRECT_TEXT_PREFIXES:
+                if normalized_mentionless.startswith(prefix):
+                    return prefix
     for pattern in _GROUP_STATUS_REDIRECT_PATTERNS:
         if pattern.search(t):
             return "stream drop"
@@ -120,6 +239,26 @@ def _drop_leading_status_glyphs(text: str) -> str:
     while t and not t[0].isalnum():
         t = t[1:].lstrip()
     return t
+
+
+def _drop_leading_at_mentions(text: str) -> str:
+    t = str(text or "").lstrip()
+    while True:
+        match = re.match(r"^@\S+\s+", t)
+        if not match:
+            return t
+        t = t[match.end() :].lstrip()
+
+
+def _group_interim_narration_kind(text: str) -> str:
+    t = str(text or "").strip()
+    if not t or len(t) > _GROUP_INTERIM_NARRATION_MAX_CHARS or "\n" in t:
+        return ""
+    compact = re.sub(r"\s+", "", t)
+    for pattern in _GROUP_INTERIM_NARRATION_PATTERNS:
+        if pattern.search(compact):
+            return "history_context_preface"
+    return ""
 
 
 def _format_group_status_ops_notice(
@@ -330,6 +469,7 @@ from .policy import (
     _GROUP_MENTION_RULES_DOC,
     _INFOFLOW_GROUP_REPLY_STRATEGY_DOC,
     _INFOFLOW_GROUP_SECURITY_DOC,
+    _INFOFLOW_GROUP_VISIBLE_OUTPUT_DOC,
     _INFOFLOW_SKILL_DISCLOSURE_ADMIN_DOC,
     _INFOFLOW_SKILL_DISCLOSURE_RESTRICTED_DOC,
     GroupConfigOverride,
@@ -1480,6 +1620,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     identity,
                     _INFOFLOW_GROUP_SECURITY_DOC,
                     _INFOFLOW_GROUP_REPLY_STRATEGY_DOC,
+                    _INFOFLOW_GROUP_VISIBLE_OUTPUT_DOC,
                     _INFOFLOW_SKILL_DISCLOSURE_RESTRICTED_DOC,
                     _GROUP_MENTION_RULES_DOC,
                     group_behavior,
@@ -2326,6 +2467,34 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     "suppressed_group_status": True,
                     "sessiontracker_only_status": bool(tracker_only_status_kind),
                     "redirected_to_ops": redirected,
+                    "preview": (content or "")[:200],
+                },
+            )
+            return SendResult(success=True)
+
+        interim_narration_kind = (
+            _group_interim_narration_kind(content)
+            if kind == "group" and group_id is not None
+            else ""
+        )
+        if interim_narration_kind:
+            gw_log().info(
+                "[iflow:send] suppressed group interim narration target=%s kind=%s",
+                chat_id,
+                interim_narration_kind,
+            )
+            self._push_infoflow_event(
+                None,
+                kind="outbound.infoflow",
+                chat_id=chat_id,
+                extra={
+                    "type": "text",
+                    "chars": len(content or ""),
+                    "success": True,
+                    "message_id": "",
+                    "error": "",
+                    "suppressed_group_interim_narration": True,
+                    "interim_narration_kind": interim_narration_kind,
                     "preview": (content or "")[:200],
                 },
             )

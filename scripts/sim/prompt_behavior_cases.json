@@ -90,6 +90,29 @@
         "must_call": ["infoflow_get_message_history"],
         "final": "NO_REPLY"
       }
+    },
+    {
+      "id": "watch_mention_crash_signature_no_public_answer",
+      "description": "watch_mention with a crash-looking signature but no stable query parameters should read context and stay silent without visible process text.",
+      "strategy": "watch_mention",
+      "who": "chengbo05",
+      "content": "@成博 (user_id:chengbo05) @刘雅琴 (user_id:liuyaqin) 3. BeiZiSDKHTTPRequest asyncSplashHTTPRequest（387次）",
+      "message_id": "wm_crash_unknown_mid",
+      "history": [
+        {
+          "time": "2026.06.03 10.25.00",
+          "content": "[Sender: type:'human'; user_id:'huangshuo02'; name:'黄硕'; permission:'restricted']\n[Message: message_id:'wm_crash_unknown_mid'; created_time:'2026.06.03 10.25.00']\n@成博 @刘雅琴 3. BeiZiSDKHTTPRequest asyncSplashHTTPRequest（387次）"
+        }
+      ],
+      "map_result": {
+        "has_data": false,
+        "summary": "缺少版本和 crashkey，无法查询到稳定性数据。",
+        "risk": "unknown"
+      },
+      "expected": {
+        "must_call": ["infoflow_get_message_history"],
+        "final": "NO_REPLY"
+      }
     }
   ],
   "map_result": {

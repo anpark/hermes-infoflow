@@ -716,6 +716,11 @@ def test_parse_infoflow_target_thread_always_none() -> None:
         "Gateway shutting down — Your current task will be interrupted.",
         "Gateway restarting — Your current task will be interrupted.",
         "  💾 Self-improvement review: Memory updated",
+        "🔄 Primary model failed — switching to fallback: Claude Sonnet 4.6 via bdllm-anthropic",
+        (
+            "@zhujingsi ⚠️ No reply: the model returned empty content after retries "
+            "and any fallback providers."
+        ),
     ],
 )
 def test_group_status_redirect_kind_matches_hermes_runtime_messages(text: str) -> None:
@@ -724,6 +729,12 @@ def test_group_status_redirect_kind_matches_hermes_runtime_messages(text: str) -
 
 def test_group_status_redirect_kind_does_not_match_normal_text() -> None:
     assert _group_status_redirect_kind("用户正常问：Memory updated 是什么意思？") == ""
+    assert (
+        _group_status_redirect_kind(
+            "@zhujingsi Non-retryable error handling should be documented clearly."
+        )
+        == ""
+    )
 
 
 def test_format_group_status_ops_notice_identifies_group() -> None:

@@ -23,6 +23,7 @@ from hermes_infoflow.policy import (
     _INFOFLOW_FIELD_DOC,
     _INFOFLOW_GROUP_REPLY_STRATEGY_DOC,
     _INFOFLOW_GROUP_SECURITY_DOC,
+    _INFOFLOW_GROUP_VISIBLE_OUTPUT_DOC,
     _INFOFLOW_MESSAGE_FORMAT_DOC,
     _INFOFLOW_PERMISSION_SECURITY_DOC,
     _INFOFLOW_SESSION_HISTORY_DOC,
@@ -102,13 +103,21 @@ def test_watch_mention_requires_skill_check_before_no_reply() -> None:
     assert "查看、判断、确认、评估、给建议" in text
     assert "视为需要先探索的任务" in text
     assert "被 @ 的人不是你" in text
-    assert "旁听助手身份查可用信息" in text
+    assert "旁听助手身份补充可公开信息" in text
     assert "先读最近群历史补上下文" in text
+    assert "读历史是内部动作" in text
     assert "检查已有 skills" in text
     assert "相关就用 skill" in text
     assert "不能替代 skills 检查" in text
     assert "不替人做最终决定" in text
     assert "skills/tools 能提供依据" in text
+    assert "明确可查对象" in text
+    assert "版本号" in text
+    assert "崩溃签名/稳定性标识" in text
+    assert "不要为了满足\"检查 tools\"而反复调用同类领域工具" in text
+    assert "任何一轮只要发起 tool_call" in text
+    assert "assistant content 必须是空字符串" in text
+    assert "历史信息有限" in text
     assert "完成上述检查后仍无公开有用信息" in text
     assert "单独一行 `NO_REPLY`" in text
     assert "不要把拒绝/转述当作答案" in text
@@ -137,6 +146,12 @@ def test_watch_regex_requires_strict_no_reply_output() -> None:
     assert "sender 是 bot" in text
     assert "不替人做最终决定" in text
     assert "skills/tools 能提供依据" in text
+    assert "明确可查对象" in text
+    assert "崩溃签名/稳定性标识" in text
+    assert "不要反复调用同类工具" in text
+    assert "任何一轮只要发起 tool_call" in text
+    assert "assistant content 必须是空字符串" in text
+    assert "历史信息有限" in text
     assert "完成必要上下文和相关 skills/tools 检查后仍无公开有用信息" in text
     assert "不要把拒绝/转述当作答案" in text
     assert "不发中间消息" in text
@@ -286,6 +301,20 @@ def test_group_reply_strategy_honors_explicit_no_reply() -> None:
     assert "很久没有发言" in _INFOFLOW_GROUP_REPLY_STRATEGY_DOC
     assert "闭嘴" in _INFOFLOW_GROUP_REPLY_STRATEGY_DOC
     assert "NO_REPLY" in _INFOFLOW_GROUP_REPLY_STRATEGY_DOC
+
+
+def test_group_visible_output_doc_blocks_intermediate_status_text() -> None:
+    text = _INFOFLOW_GROUP_VISIBLE_OUTPUT_DOC
+    assert "群聊可见输出硬约束" in text
+    assert "最终结论正文" in text
+    assert "单独一行 `NO_REPLY`" in text
+    assert "模型/供应商状态" in text
+    assert "失败兜底" in text
+    assert "先读/先看/查一下/稍等/我去查/让我查/我帮你看看" in text
+    assert "历史信息有限" in text
+    assert "这个约束适用于每一轮 assistant 消息" in text
+    assert "assistant content 必须留空" in text
+    assert "tool_call" in text
 
 
 def test_passive_template_keeps_recipient_gate() -> None:
