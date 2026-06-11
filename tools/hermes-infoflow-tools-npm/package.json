@@ -1,0 +1,31 @@
+{
+  "name": "@chbo297/hermes-infoflow-tools",
+  "version": "2026.6.11",
+  "description": "npx launcher for installing/updating the hermes-infoflow plugin into a Hermes Agent home directory. Requires Python 3.11+ and pip.",
+  "type": "module",
+  "bin": {
+    "hermes-infoflow-tools": "bin/cli.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/chbo297/hermes-infoflow",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/chbo297/hermes-infoflow.git",
+    "directory": "tools/hermes-infoflow-tools-npm"
+  },
+  "keywords": [
+    "hermes",
+    "hermes-agent",
+    "infoflow",
+    "baidu",
+    "plugin",
+    "installer"
+  ],
+  "files": [
+    "bin/**",
+    "README.md"
+  ]
+}

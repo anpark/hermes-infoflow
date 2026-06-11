@@ -77,7 +77,10 @@ include = [
 [tool.hatch.build.targets.wheel.force-include]
 "scripts" = "hermes_infoflow/_deploy_scripts"
 "docs" = "hermes_infoflow/docs"
-"hermes_infoflow/static" = "hermes_infoflow/static"
+# NOTE: do NOT force-include "hermes_infoflow/static" here. It already ships as
+# part of packages = ["hermes_infoflow"], and force-including the same path
+# makes hatchling add each static file twice ("A second file is being added to
+# the wheel archive at the same path"), breaking the wheel build.
 
 [tool.hatch.build.targets.sdist]
 include = [
