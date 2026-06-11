@@ -72,9 +72,9 @@ pipx run hermes-infoflow-tools normalize --port 9000
 <!-- sync:hermes-infoflow-version:latest -->
 ```bash
 # 二选一：extract 模式
-pipx run --no-cache --spec hermes-infoflow-tools==2026.5.26 hermes-infoflow-tools update --version 2026.5.26 --mode extract --port 9000
+pipx run --no-cache --spec hermes-infoflow-tools==2026.6.11 hermes-infoflow-tools update --version 2026.6.11 --mode extract --port 9000
 # 二选一：pip 兼容别名
-pipx run --no-cache --spec hermes-infoflow-tools==2026.5.26 hermes-infoflow-tools update --version 2026.5.26 --mode pip --port 9000
+pipx run --no-cache --spec hermes-infoflow-tools==2026.6.11 hermes-infoflow-tools update --version 2026.6.11 --mode pip --port 9000
 ```
 <!-- /sync:hermes-infoflow-version:latest -->
 
@@ -124,7 +124,7 @@ pipx run hermes-infoflow-tools normalize --port 9000
 
 <!-- sync:hermes-infoflow-version:latest -->
 ```bash
-python -m pip install --upgrade 'hermes-infoflow==2026.5.26'
+python -m pip install --upgrade 'hermes-infoflow==2026.6.11'
 hermes-infoflow-deploy --port 9000
 ```
 <!-- /sync:hermes-infoflow-version:latest -->
@@ -142,7 +142,7 @@ hermes-infoflow-deploy --port 9000
 
 <!-- sync:hermes-infoflow-version:latest -->
 ```bash
-pipx run --no-cache --spec hermes-infoflow==2026.5.26 hermes-infoflow-deploy --port 9000
+pipx run --no-cache --spec hermes-infoflow==2026.6.11 hermes-infoflow-deploy --port 9000
 ```
 <!-- /sync:hermes-infoflow-version:latest -->
 
@@ -530,9 +530,9 @@ pip install hermes-infoflow==<X.Y.ZbN>           # 显式锁定
 
 <!-- sync:hermes-infoflow-version -->
 ```bash
-hatch version 2026.5.26
-git tag 2026.5.26
-git push origin 2026.5.26
+hatch version 2026.6.11
+git tag 2026.6.11
+git push origin 2026.6.11
 ```
 <!-- /sync:hermes-infoflow-version -->
 

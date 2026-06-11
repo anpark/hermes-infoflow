@@ -19,7 +19,7 @@ newly published versions, `--no-cache` avoids stale pipx/uv resolver cache:
 
 <!-- sync:hermes-infoflow-version:latest -->
 ```bash
-pipx run --no-cache --spec hermes-infoflow-tools==2026.5.26 hermes-infoflow-tools update --version 2026.5.26 --mode extract --port 9000
+pipx run --no-cache --spec hermes-infoflow-tools==2026.6.11 hermes-infoflow-tools update --version 2026.6.11 --mode extract --port 9000
 ```
 <!-- /sync:hermes-infoflow-version:latest -->
 

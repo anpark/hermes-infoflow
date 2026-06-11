@@ -8,6 +8,21 @@ versioning (with prerelease suffixes such as `0.1.0b1` for betas).
 
 ## [Unreleased]
 
+## [2026.6.11] - 2026-06-11
+
+### Added
+
+- Admin-only private-chat terminal tab in Session Tracker, with persisted PTY
+  sessions, configurable retention (in minutes) and per-admin session limits,
+  and an improved transport.
+- Infoflow websocket receive transport as an alternative to the webhook
+  connection mode.
+- Inbound Infoflow file handling and an outbound file delivery pipeline
+  (including file-to-URL delivery and BOS API helpers).
+- `infoflow_send_message` and `infoflow_create_group` agent tools, and split
+  admin vs. operation channels.
+- Support for prefixed `INFOFLOW_WATCH_REGEX_*` env vars.
+
 ### Changed
 
 - Register Infoflow-specific agent tools under the `infoflow` plugin toolset
@@ -15,6 +30,16 @@ versioning (with prerelease suffixes such as `0.1.0b1` for betas).
 - Clarify `infoflow_reply` cron usage and make cron runs without an explicit
   `reply_to` skip the tool call instead of failing or sending a duplicate
   ordinary message.
+- Refactor Infoflow send-message routing and SessionTracker chat aggregation;
+  refine watch mention/regex skill exploration prompts and busy-text steer
+  handling. Reset stale Infoflow sessions automatically.
+
+### Fixed
+
+- Recover mentioned turns that previously produced no reply, and make watch
+  regex check skills before deciding not to reply.
+- Fix Infoflow markdown reply routing, busy steer reply anchors, and busy steer
+  reaction lifecycle. Sanitize nested quote previews.
 
 ## [2026.5.26] - 2026-05-25
 
