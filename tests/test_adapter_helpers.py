@@ -610,6 +610,62 @@ def test_read_settings_parses_named_regex_skill_hint(monkeypatch) -> None:
     ]
 
 
+def test_read_settings_parses_named_regex_skill_hint_from_config(monkeypatch) -> None:
+    _clear_watch_regex_env(monkeypatch)
+    s = _read_account_settings(
+        _cfg(
+            {
+                "watchRegexRules": {
+                    "C1": {
+                        "pattern": "iphone.*crash",
+                        "skill": "map-stability-analysis",
+                    }
+                },
+                "watch_regex": ["iphone.*crash", "deploy"],
+            }
+        )
+    )
+
+    assert s["watch_regex"] == ["iphone.*crash", "deploy"]
+    assert s["watch_regex_rules"] == [
+        {
+            "key": "C1",
+            "pattern": "iphone.*crash",
+            "skill": "map-stability-analysis",
+        },
+        {"key": "", "pattern": "deploy", "skill": ""},
+    ]
+
+
+def test_read_settings_regex_env_overrides_config_rules(monkeypatch) -> None:
+    _clear_watch_regex_env(monkeypatch)
+    monkeypatch.setenv("INFOFLOW_REGEX_WATCH_C1", "iphone.*crash")
+    monkeypatch.setenv("INFOFLOW_REGEX_SKILL_C1", "map-stability-analysis")
+
+    s = _read_account_settings(
+        _cfg(
+            {
+                "watch_regex_rules": [
+                    {
+                        "key": "CONFIG",
+                        "pattern": "deploy",
+                        "skill": "deploy-skill",
+                    }
+                ],
+            }
+        )
+    )
+
+    assert s["watch_regex"] == ["iphone.*crash"]
+    assert s["watch_regex_rules"] == [
+        {
+            "key": "C1",
+            "pattern": "iphone.*crash",
+            "skill": "map-stability-analysis",
+        }
+    ]
+
+
 def test_read_settings_named_regex_dedupes_legacy_pattern(monkeypatch) -> None:
     _clear_watch_regex_env(monkeypatch)
     monkeypatch.setenv("INFOFLOW_REGEX_WATCH_C1", "iphone.*crash")

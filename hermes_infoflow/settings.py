@@ -140,6 +140,44 @@ def _coerce_regex_patterns(raw: Any) -> list[str]:
     return [regex_text] if regex_text else []
 
 
+def _coerce_regex_watch_rules(raw: Any) -> list[dict[str, str]]:
+    if raw in (None, ""):
+        return []
+    if isinstance(raw, dict):
+        if "pattern" in raw:
+            items: list[Any] = [raw]
+        else:
+            items = []
+            for key, value in raw.items():
+                if isinstance(value, dict):
+                    item = dict(value)
+                    item.setdefault("key", key)
+                else:
+                    item = {"key": key, "pattern": value}
+                items.append(item)
+    elif isinstance(raw, (list, tuple)):
+        items = list(raw)
+    else:
+        return []
+
+    rules: list[dict[str, str]] = []
+    for item in items:
+        if isinstance(item, dict):
+            pattern = str(item.get("pattern") or "").strip()
+            if not pattern:
+                continue
+            rules.append({
+                "key": str(item.get("key") or "").strip(),
+                "pattern": pattern,
+                "skill": str(item.get("skill") or "").strip(),
+            })
+        else:
+            pattern = str(item or "").strip()
+            if pattern:
+                rules.append({"key": "", "pattern": pattern, "skill": ""})
+    return rules
+
+
 def _merge_regex_watch_rules(
     named_rules: list[dict[str, str]],
     legacy_patterns: list[str],
@@ -150,10 +188,18 @@ def _merge_regex_watch_rules(
         pattern = str(rule.get("pattern") or "").strip()
         if not pattern or pattern in seen_patterns:
             continue
+        key = str(rule.get("key") or "").strip()
+        if key and not _valid_regex_rule_key(key):
+            logger.warning("Ignoring invalid regex watch rule key: %r", key)
+            key = ""
+        skill = str(rule.get("skill") or "").strip()
+        if skill and not _valid_skill_name(skill):
+            logger.warning("Ignoring invalid regex watch rule skill: %r", skill)
+            skill = ""
         rules.append({
-            "key": str(rule.get("key") or "").strip(),
+            "key": key,
             "pattern": pattern,
-            "skill": str(rule.get("skill") or "").strip(),
+            "skill": skill,
         })
         seen_patterns.add(pattern)
     for pattern in legacy_patterns:
@@ -281,6 +327,11 @@ def _read_account_settings(config: Any) -> dict[str, Any]:
         extra = dict(getattr(config, "extra", None) or {})
     named_regex_env_rules = _regex_watch_env_rules()
     legacy_regex_env = _watch_regex_env_values()
+    regex_env_present = bool(named_regex_env_rules or legacy_regex_env)
+    config_regex_rules_raw = extra.get("watch_regex_rules")
+    if config_regex_rules_raw in (None, ""):
+        config_regex_rules_raw = extra.get("watchRegexRules")
+    config_regex_rules = _coerce_regex_watch_rules(config_regex_rules_raw)
 
     def pick(env_name: str, key: str, default: Any = None, *aliases: str) -> Any:
         env_val = os.getenv(env_name)
@@ -333,10 +384,10 @@ def _read_account_settings(config: Any) -> dict[str, Any]:
         "watch_mentions_raw": pick("INFOFLOW_WATCH_MENTIONS", "watch_mentions", ""),
         "watch_regex_raw": (
             legacy_regex_env
-            if named_regex_env_rules or legacy_regex_env
+            if regex_env_present
             else pick(WATCH_REGEX_ENV, "watch_regex", "")
         ),
-        "watch_regex_rules_raw": named_regex_env_rules,
+        "watch_regex_rules_raw": named_regex_env_rules if regex_env_present else config_regex_rules,
         "follow_up_raw": pick("INFOFLOW_FOLLOW_UP", "follow_up", "true"),
         "busy_text_steer_enabled_raw": pick(
             "INFOFLOW_BUSY_TEXT_STEER_ENABLED",
