@@ -6,12 +6,22 @@ import pytest
 from PIL import Image
 
 from hermes_infoflow.media import INFOFLOW_IMAGE_MAX_BYTES, prepare_infoflow_image_bytes
-from hermes_infoflow.utils import _ImageLoadError
+from hermes_infoflow.utils import (
+    _ImageLoadError,
+    _downloaded_image_ext,
+    _image_download_urls_from_raw_json,
+)
 
 
 def _png_bytes(width: int = 1, height: int = 1) -> bytes:
     out = io.BytesIO()
     Image.new("RGB", (width, height), (200, 20, 20)).save(out, format="PNG")
+    return out.getvalue()
+
+
+def _jpeg_bytes(width: int = 1, height: int = 1) -> bytes:
+    out = io.BytesIO()
+    Image.new("RGB", (width, height), (20, 120, 200)).save(out, format="JPEG")
     return out.getvalue()
 
 
@@ -24,6 +34,22 @@ def test_prepare_infoflow_image_keeps_small_native_image() -> None:
     assert prepared.mime_type == "image/png"
     assert prepared.final_size == len(data)
     assert prepared.compressed is False
+
+
+def test_downloaded_image_ext_sniffs_octet_stream_jpeg() -> None:
+    assert _downloaded_image_ext("application/octet-stream", _jpeg_bytes()) == ".jpg"
+
+
+def test_image_download_urls_extract_private_pic_url() -> None:
+    raw = (
+        '{"FromUserId":"chengbo05","MsgType":"image",'
+        '"PicUrl":"http://xp2.im.baidu.com/dev/getImg?fileid=abc",'
+        '"MsgId":"1867772059026843836"}'
+    )
+
+    assert _image_download_urls_from_raw_json(raw) == [
+        "http://xp2.im.baidu.com/dev/getImg?fileid=abc"
+    ]
 
 
 def test_prepare_infoflow_image_rejects_non_image_payload() -> None:

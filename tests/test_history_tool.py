@@ -242,6 +242,127 @@ def test_download_attachment_tool_downloads_and_persists_group_file(
     assert stored_raw["_hermes_infoflow_files"][0]["local_path"] == str(tmp_path / "sample.csv")
 
 
+def test_download_image_tool_downloads_and_persists_group_image(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ms, "_STATE_BASE_DIR", tmp_path)
+    store = MessageStore(account_id="test-acct")
+    image_url = "http://e4hi.im.baidu.com/proxy/download?taskId=T&agentId=6471"
+    store.persist_group(
+        message_id="image-msg",
+        group_id="4507088",
+        sender="user:chengbo05",
+        content="<media:image>",
+        created_time=_ms(_today_at(21, 14, 25)),
+        raw_json=json.dumps({
+            "groupid": 4507088,
+            "message": {
+                "body": [{
+                    "type": "IMAGE",
+                    "downloadurl": image_url,
+                }],
+            },
+        }),
+    )
+    store.persist_group(
+        message_id="current",
+        group_id="4507088",
+        sender="user:chengbo05",
+        content="@bot 看看历史图片",
+        created_time=_ms(_today_at(21, 14, 33)),
+    )
+
+    class FakeServerAPI:
+        async def get_access_token(self):
+            return "TOKEN"
+
+    async def fake_download(url, *, token_provider, session=None, max_bytes=0):
+        assert url == image_url
+        assert await token_provider() == "TOKEN"
+        assert session is None
+        return b"\xff\xd8\xfffake-jpeg", ".jpg"
+
+    cached_path = tmp_path / "cached.jpg"
+
+    def fake_cache(data: bytes, ext: str) -> str:
+        assert data.startswith(b"\xff\xd8\xff")
+        assert ext == ".jpg"
+        cached_path.write_bytes(data)
+        return str(cached_path)
+
+    adapter = _adapter_for(store)
+    adapter._serverapi = FakeServerAPI()
+    monkeypatch.setattr(tools, "_get_live_adapter", lambda: adapter)
+    monkeypatch.setattr(tools, "_download_inbound_image", fake_download)
+    monkeypatch.setattr(tools, "_cache_image_bytes_for_vision", fake_cache)
+
+    handler = tools.make_download_image_handler()
+    with recall_inbound_message_id_hint_scope("current"):
+        result = asyncio.run(handler({
+            "message_id": "image-msg",
+            "image_index": 0,
+        }))
+
+    parsed = json.loads(result)
+    assert parsed["success"] is True
+    assert parsed["status"] == "downloaded"
+    assert parsed["path"] == str(cached_path)
+    assert parsed["mime_type"] == "image/jpeg"
+    assert "vision_analyze" in parsed["next_step"]
+
+    stored_raw = json.loads(
+        store.find_any("image-msg").raw_json  # type: ignore[union-attr]
+    )
+    stored_image = stored_raw["_hermes_infoflow_images"][0]
+    assert stored_image["status"] == "downloaded"
+    assert stored_image["path"] == str(cached_path)
+    assert stored_image["mime_type"] == "image/jpeg"
+
+
+def test_analyze_image_tool_downloads_then_runs_vision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_download_image_for_tool(*, message_id, image_index, force=False):
+        assert message_id == "image-msg"
+        assert image_index == 1
+        assert force is False
+        return {
+            "success": True,
+            "message_id": message_id,
+            "image_index": image_index,
+            "status": "downloaded",
+            "path": "/tmp/hermes-image.jpg",
+            "mime_type": "image/jpeg",
+            "size": 123,
+        }
+
+    async def fake_vision(path: str, user_prompt: str):
+        assert path == "/tmp/hermes-image.jpg"
+        assert user_prompt == "识别水果成熟度"
+        return {"success": True, "analysis": "图中是苹果，接近成熟。"}
+
+    monkeypatch.setattr(tools, "_download_image_for_tool", fake_download_image_for_tool)
+    monkeypatch.setattr(tools, "_vision_analyze_image_path", fake_vision)
+
+    handler = tools.make_analyze_image_handler()
+    result = asyncio.run(handler({
+        "message_id": "image-msg",
+        "image_index": 1,
+        "user_prompt": "识别水果成熟度",
+    }))
+
+    parsed = json.loads(result)
+    assert parsed == {
+        "success": True,
+        "message_id": "image-msg",
+        "image_index": 1,
+        "status": "analyzed",
+        "analysis": "图中是苹果，接近成熟。",
+        "mime_type": "image/jpeg",
+        "size": 123,
+    }
+
+
 def test_download_attachment_tool_rejects_invalid_file_index(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

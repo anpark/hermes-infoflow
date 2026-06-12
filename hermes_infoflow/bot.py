@@ -25,12 +25,14 @@ from typing import TYPE_CHECKING, Any
 from .identity import bot_key, private_peer_key, self_key, sender_key, user_key
 from .inbound_files import inbound_file_to_raw_dict
 from .itypes import (
+    ImageRef,
     IncomingMessage,
     ProcessResult,
     RecallResult,
     ReplyInfo,
     SendOptions,
     SentResult,
+    coerce_image_ref,
     coerce_reply_target,
     reply_target_to_dict,
 )
@@ -58,7 +60,7 @@ from .recall import (
 from .send_service import InfoflowSendService
 from .sent_store import SentMessageStore
 from .settings import infoflow_op_channel_from_env, parse_infoflow_admin_users
-from .utils import gw_log
+from .utils import _image_download_urls_from_raw_json, gw_log
 
 if TYPE_CHECKING:  # pragma: no cover — avoid circular import at runtime
     from .adapter import InfoflowAdapter
@@ -448,6 +450,7 @@ class Bot:
             _persist_robot_id(self._robot_id)
         self._normalize_mention_targets_from_participants(msg)
         self._normalize_reply_targets_from_message_store(msg)
+        self._enrich_quoted_image_refs_from_message_store(msg)
 
         # --- [iflow:event] — enriched message event fields ---
         try:
@@ -861,6 +864,57 @@ class Bot:
                 message_id=first_bot_target.message_id,
                 preview=first_bot_target.preview,
                 sender_imid=first_bot_target.sender_imid,
+            )
+
+    def _enrich_quoted_image_refs_from_message_store(self, msg: IncomingMessage) -> None:
+        """Attach quoted IMAGE references to reply targets.
+
+        Infoflow quote payloads only carry ``replyData`` / ``replyImages``
+        metadata.  The actual downloadable URL is present on the original IMAGE
+        message, which we already persist in MessageStore from
+        ALL_MESSAGE_FORWARD callbacks.  Keep the URL out of the current message
+        media list so Hermes does not auto-run vision; instead expose
+        ``message_id`` + ``image_index`` markers for explicit tool use.
+        """
+        if not msg.reply_targets:
+            return
+
+        reply_targets = [coerce_reply_target(t) for t in msg.reply_targets]
+        added = 0
+        for target in reply_targets:
+            rec = self._message_record_in_chat(msg, target.message_id)
+            if rec is None:
+                continue
+            urls = _image_download_urls_from_raw_json(
+                str(getattr(rec, "raw_json", "") or "")
+            )
+            if not urls:
+                continue
+            existing = {
+                (str(normalized.message_id), int(normalized.image_index))
+                for ref in target.image_refs
+                for normalized in [coerce_image_ref(ref)]
+            }
+            for index, _url in enumerate(urls):
+                key = (str(target.message_id), index)
+                if key in existing:
+                    continue
+                target.image_refs.append(
+                    ImageRef(
+                        message_id=target.message_id,
+                        image_index=index,
+                        source="quoted_message",
+                    )
+                )
+                existing.add(key)
+                added += 1
+
+        if added:
+            msg.reply_targets = reply_targets
+            gw_log().info(
+                "[infoflow] enriched quoted image refs mid=%s added=%d",
+                msg.message_id or "-",
+                added,
             )
 
     def _message_record_in_chat(

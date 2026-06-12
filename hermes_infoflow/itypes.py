@@ -34,6 +34,15 @@ class ReplyInfo:
 
 
 @dataclass
+class ImageRef:
+    """LLM-visible reference to an inbound Infoflow IMAGE body."""
+
+    message_id: str = ""
+    image_index: int = 0
+    source: str = "current_message"
+
+
+@dataclass
 class ReplyTarget:
     """Normalized quoted/replied message target used below serverapi."""
 
@@ -43,6 +52,47 @@ class ReplyTarget:
     is_bot_message: bool = False
     platform_is_bot_message: bool = False
     sender_imid: str = ""
+    image_refs: list[ImageRef] = field(default_factory=list)
+
+
+def coerce_image_ref(value: Any) -> ImageRef:
+    """Accept transitional raw image refs and return ``ImageRef``."""
+    if isinstance(value, ImageRef):
+        return value
+    if isinstance(value, dict):
+        raw_index = first_present(value, "image_index", "imageIndex", "index")
+        try:
+            index = int(raw_index if raw_index not in (None, "") else 0)
+        except (TypeError, ValueError):
+            index = 0
+        return ImageRef(
+            message_id=str(value.get("message_id") or value.get("messageid") or ""),
+            image_index=max(0, index),
+            source=str(value.get("source") or "current_message"),
+        )
+    raw_index = (
+        getattr(value, "image_index", None)
+        if getattr(value, "image_index", None) not in (None, "")
+        else getattr(value, "index", 0)
+    )
+    try:
+        index = int(raw_index if raw_index not in (None, "") else 0)
+    except (TypeError, ValueError):
+        index = 0
+    return ImageRef(
+        message_id=str(getattr(value, "message_id", "") or ""),
+        image_index=max(0, index),
+        source=str(getattr(value, "source", "") or "current_message"),
+    )
+
+
+def image_ref_to_dict(value: Any) -> dict[str, Any]:
+    ref = coerce_image_ref(value)
+    return {
+        "message_id": ref.message_id,
+        "image_index": ref.image_index,
+        "source": ref.source,
+    }
 
 
 @dataclass
@@ -95,6 +145,12 @@ def coerce_reply_target(value: Any) -> ReplyTarget:
     if isinstance(value, ReplyTarget):
         return value
     if isinstance(value, dict):
+        image_refs_raw = (
+            value.get("image_refs")
+            or value.get("imageRefs")
+            or value.get("images")
+            or []
+        )
         return ReplyTarget(
             message_id=str(value.get("message_id") or value.get("messageid") or ""),
             preview=str(value.get("preview") or ""),
@@ -111,6 +167,11 @@ def coerce_reply_target(value: Any) -> ReplyTarget:
                 first_present(value, "platform_is_bot_message", "platformIsBotMessage")
             ),
             sender_imid=str(value.get("sender_imid") or ""),
+            image_refs=[
+                coerce_image_ref(ref)
+                for ref in image_refs_raw
+                if ref is not None
+            ],
         )
     return ReplyTarget(
         message_id=str(getattr(value, "message_id", "") or ""),
@@ -125,6 +186,11 @@ def coerce_reply_target(value: Any) -> ReplyTarget:
             getattr(value, "platform_is_bot_message", False)
         ),
         sender_imid=str(getattr(value, "sender_imid", "") or ""),
+        image_refs=[
+            coerce_image_ref(ref)
+            for ref in list(getattr(value, "image_refs", None) or [])
+            if ref is not None
+        ],
     )
 
 
@@ -138,6 +204,7 @@ def reply_target_to_dict(value: Any) -> dict[str, Any]:
         "is_bot_message": target.is_bot_message,
         "platform_is_bot_message": target.platform_is_bot_message,
         "sender_imid": target.sender_imid,
+        "image_refs": [image_ref_to_dict(ref) for ref in target.image_refs],
     }
 
 

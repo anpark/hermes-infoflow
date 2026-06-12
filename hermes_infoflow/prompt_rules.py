@@ -25,6 +25,7 @@ INFOFLOW_INBOUND_FILE_RULES = """\
 ## 入站文件处理规则
 
 - 当前 user message 或历史消息的 `[Attachments]` 中，`files[].status` 为 `not_downloaded` 表示只收到了文件元数据，尚未下载；需要读取文件内容时，先调用 `infoflow_download_attachment(message_id, file_index)`。
+- 当前 user message、历史消息或 `<Quote>` 内的 `<media:image ...>` 表示如流 IMAGE 图片消息；需要查看图片细节时，优先调用 `infoflow_analyze_image(message_id, image_index, user_prompt)`。低层兜底才使用 `infoflow_download_image(message_id, image_index)` 下载后再用返回的本地 `path` 调用 `vision_analyze`。不要用 `infoflow_download_attachment` 下载图片。
 - 只有 `files[].status` 为 `downloaded` 且带 `files[].path` 的附件可以为完成当前消息读取。
 - `files[].status` 为 `failed` 的附件没有可读本地文件，不要假装已经读取文件内容。
 - `files[].path` 是本地输入文件路径，不是可分享 URL；发给用户前必须先调用 `file_delivery(source_path)` 获取 URL。

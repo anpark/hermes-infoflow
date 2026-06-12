@@ -31,6 +31,7 @@ import contextlib
 import contextvars
 import ipaddress as _ipaddress
 import logging
+import mimetypes
 import os
 import re
 import socket as _socket
@@ -175,6 +176,25 @@ _GROUP_INTERIM_NARRATION_PATTERNS = (
         r".{0,40}$"
     ),
 )
+_MEDIA_IMAGE_MARKER_RE = re.compile(r"<media:image(?:\s|>)")
+_IMAGE_DEICTIC_RE = re.compile(
+    r"(这张图|那张图|这个图|那个图|图里|图片|截图|照片|看下图|看下这张|看一下这张)"
+)
+_IMAGE_MARKER_HANDLING_PROMPT = (
+    "当前消息包含 `<media:image ...>` 图片引用。"
+    "如果用户请求涉及识别、描述、读取或分析图片内容（例如图片/照片/截图/"
+    "这张图/图里什么内容），必须先调用 `infoflow_analyze_image`，"
+    "使用 marker 中的 `message_id` 和 `index`；不要根据上下文或文件名猜测图片内容。"
+)
+_IMAGE_DEICTIC_HISTORY_PROMPT = (
+    "当前消息疑似指代前文图片，但当前正文没有 `<media:image ...>` 图片 marker。"
+    "如果用户请求涉及识别、描述、读取或分析图片内容（例如这张图/那张图/截图/照片/图片），"
+    "必须先调用 `infoflow_get_message_history`，使用当前 `[Message]` 标签中的 `message_id` "
+    "作为锚点查找最近相关历史；在历史或 `<Quote>` 中找到 `<media:image ...>` 后，"
+    "再用该 marker 的 `message_id` 和 `index` 调用 `infoflow_analyze_image`。"
+    "如果找不到图片、图片不可读或图片内容不足，也要简短回复请对方补发/引用清楚的图片；"
+    "直接 @ 场景不得因此输出 `NO_REPLY`。"
+)
 
 
 @dataclass(frozen=True)
@@ -261,6 +281,14 @@ def _group_interim_narration_kind(text: str) -> str:
     return ""
 
 
+def _contains_infoflow_image_marker(text: str) -> bool:
+    return bool(_MEDIA_IMAGE_MARKER_RE.search(str(text or "")))
+
+
+def _contains_image_deictic_reference(text: str) -> bool:
+    return bool(_IMAGE_DEICTIC_RE.search(str(text or "")))
+
+
 def _format_group_status_ops_notice(
     *,
     group_id: str,
@@ -273,6 +301,13 @@ def _format_group_status_ops_notice(
         f"类型：{status_kind}\n\n"
         f"{content}"
     )
+
+
+def _image_mime_for_ext(ext: str) -> str:
+    suffix = ext if str(ext or "").startswith(".") else f".{ext}"
+    mime, _ = mimetypes.guess_type(f"image{suffix}")
+    return mime if mime and mime.startswith("image/") else "image/jpeg"
+
 
 import aiohttp
 
@@ -431,15 +466,19 @@ from .bot import Bot  # noqa: E402
 from .dashboard import get_tracker, normalize_chat_id
 from .identity import private_peer_key, raw_id_from_key, sender_key
 from .iftools import (
+    ANALYZE_IMAGE_TOOL_SCHEMA,
     CREATE_GROUP_TOOL_SCHEMA,
     DOWNLOAD_ATTACHMENT_TOOL_SCHEMA,
+    DOWNLOAD_IMAGE_TOOL_SCHEMA,
     FILE_DELIVERY_TOOL_SCHEMA,
     GROUP_MEMBERS_TOOL_SCHEMA,
     HISTORY_TOOL_SCHEMA,
     RECALL_TOOL_SCHEMA,
     SEND_MESSAGE_TOOL_SCHEMA,
+    make_analyze_image_handler,
     make_create_group_handler,
     make_download_attachment_handler,
+    make_download_image_handler,
     make_file_delivery_handler,
     make_group_members_handler,
     make_history_handler,
@@ -1714,10 +1753,14 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
         decision: PolicyDecision | None = None,
     ) -> Any:
         """Translate ``types.IncomingMessage`` → Hermes ``MessageEvent``."""
-        # Cache inbound images via gateway media helper
+        # Infoflow images are exposed as LLM-visible markers and read on demand
+        # through infoflow_analyze_image. Keep the legacy auto-media path behind
+        # an opt-in switch because non-native vision routing prepends a verbose
+        # generic image description to the user message.
         local_media: list[str] = []
         media_types: list[str] = []
-        if msg.image_urls and cache_image_from_bytes is not None:
+        auto_image_media = _truthy_metadata_flag(os.getenv("INFOFLOW_AUTO_IMAGE_MEDIA"))
+        if auto_image_media and msg.image_urls and cache_image_from_bytes is not None:
             for url in msg.image_urls:
                 downloaded = await _download_inbound_image(
                     url,
@@ -1733,7 +1776,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     gw_log().warning("[infoflow] cache_image_from_bytes failed: %s", exc)
                     continue
                 local_media.append(cached)
-                media_types.append(f"image/{ext.lstrip('.')}")
+                media_types.append(_image_mime_for_ext(ext))
 
         chat_id = f"group:{msg.group_id}" if msg.is_group else (msg.dm_user_id or "")
         chat_type = "group" if msg.is_group else "dm"
@@ -1866,6 +1909,18 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     "[iflow:dispatch] mid=%s per_message_prompt_len=%d",
                     msg.message_id or "-", len(_per_msg),
                 )
+
+        image_prompts: list[str] = []
+        if _contains_infoflow_image_marker(text_for_agent):
+            image_prompts.append(_IMAGE_MARKER_HANDLING_PROMPT)
+        elif _contains_image_deictic_reference(text_for_agent):
+            image_prompts.append(_IMAGE_DEICTIC_HISTORY_PROMPT)
+        if image_prompts:
+            _handling_strategy = "\n\n".join(
+                part
+                for part in (*image_prompts, _handling_strategy)
+                if part
+            )
 
         text_for_agent = self._format_current_message_for_llm(
             msg,
@@ -3175,6 +3230,34 @@ def register(ctx: Any) -> None:
         except Exception as exc:
             gw_log().warning(
                 "[infoflow] failed to register download attachment tool: %s", exc,
+            )
+        try:
+            register_tool(
+                name="infoflow_download_image",
+                toolset="infoflow",
+                schema=DOWNLOAD_IMAGE_TOOL_SCHEMA,
+                handler=make_download_image_handler(),
+                is_async=True,
+                description="Download an inbound Infoflow image on demand.",
+                emoji="🖼️",
+            )
+        except Exception as exc:
+            gw_log().warning(
+                "[infoflow] failed to register download image tool: %s", exc,
+            )
+        try:
+            register_tool(
+                name="infoflow_analyze_image",
+                toolset="infoflow",
+                schema=ANALYZE_IMAGE_TOOL_SCHEMA,
+                handler=make_analyze_image_handler(),
+                is_async=True,
+                description="Analyze an inbound Infoflow image on demand.",
+                emoji="🖼️",
+            )
+        except Exception as exc:
+            gw_log().warning(
+                "[infoflow] failed to register analyze image tool: %s", exc,
             )
 
     from .dashboard import make_plugin_hooks

@@ -10,6 +10,7 @@ import json
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -54,7 +55,11 @@ from agent.auxiliary_client import _openai_with_configured_headers  # noqa: E402
 from agent.auxiliary_client import resolve_provider_client  # noqa: E402
 from hermes_cli.config import load_config  # noqa: E402
 from hermes_cli.runtime_provider import resolve_runtime_provider  # noqa: E402
-from hermes_infoflow.adapter import register  # noqa: E402
+from hermes_infoflow.adapter import (  # noqa: E402
+    _IMAGE_DEICTIC_HISTORY_PROMPT,
+    _IMAGE_MARKER_HANDLING_PROMPT,
+    register,
+)
 from hermes_infoflow.llm_format import (  # noqa: E402
     GroupAttention,
     format_message_envelope,
@@ -67,6 +72,7 @@ from hermes_infoflow.policy import (  # noqa: E402
     _INFOFLOW_GROUP_SECURITY_DOC,
     _INFOFLOW_GROUP_VISIBLE_OUTPUT_DOC,
     _INFOFLOW_SKILL_DISCLOSURE_RESTRICTED_DOC,
+    _MENTION_PROMPT,
     _WATCH_MENTION_PROMPT,
     _WATCH_REGEX_PROMPT,
 )
@@ -194,6 +200,23 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "infoflow_analyze_image",
+            "description": "Analyze an inbound Infoflow image by message_id and image_index.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message_id": {"type": "string"},
+                    "image_index": {"type": "integer"},
+                    "user_prompt": {"type": "string"},
+                },
+                "required": ["message_id", "image_index", "user_prompt"],
+                "additionalProperties": False,
+            },
+        },
+    },
 ]
 
 
@@ -203,15 +226,27 @@ def load_cases(path: Path = DEFAULT_CASES_FILE) -> dict[str, Any]:
 
 def _handling_strategy(case: dict[str, Any]) -> str:
     strategy = str(case["strategy"])
-    if strategy == "watch_mention":
-        return _WATCH_MENTION_PROMPT.format(who=case.get("who") or "chengbo05")
-    if strategy == "watch_regex":
-        return _WATCH_REGEX_PROMPT.format(pattern=case.get("pattern") or "test-pattern")
-    raise ValueError(f"unsupported strategy: {strategy}")
+    if strategy == "mention":
+        prompt = _MENTION_PROMPT
+    elif strategy == "watch_mention":
+        prompt = _WATCH_MENTION_PROMPT.format(who=case.get("who") or "chengbo05")
+    elif strategy == "watch_regex":
+        prompt = _WATCH_REGEX_PROMPT.format(pattern=case.get("pattern") or "test-pattern")
+    else:
+        raise ValueError(f"unsupported strategy: {strategy}")
+
+    image_prompt = str(case.get("image_prompt") or "")
+    if image_prompt == "deictic":
+        prompt = f"{_IMAGE_DEICTIC_HISTORY_PROMPT}\n\n{prompt}"
+    elif image_prompt == "marker":
+        prompt = f"{_IMAGE_MARKER_HANDLING_PROMPT}\n\n{prompt}"
+    return prompt
 
 
 def _attention_line(case: dict[str, Any]) -> str:
-    if case["strategy"] == "watch_mention":
+    if case["strategy"] == "mention":
+        attention = GroupAttention(mentions_you=True)
+    elif case["strategy"] == "watch_mention":
         attention = GroupAttention(mentions_you=False, mentions_other_people=True)
     else:
         attention = GroupAttention(matched_regex_pattern=case.get("pattern") or "test-pattern")
@@ -235,7 +270,7 @@ def _envelope(case: dict[str, Any]) -> str:
 
 
 def _assistant_message_to_dict(message: Any) -> dict[str, Any]:
-    data: dict[str, Any] = {"role": "assistant"}
+    data: dict[str, Any] = {"role": "assistant", "content": ""}
     content = getattr(message, "content", None)
     if content:
         data["content"] = content
@@ -306,11 +341,28 @@ def _call_model(client: Any, model: str, messages: list[dict[str, Any]]) -> Any:
     ).choices[0].message
 
 
+def _call_model_with_retry(client: Any, model: str, messages: list[dict[str, Any]]) -> Any:
+    last_exc: Exception | None = None
+    for attempt in range(5):
+        try:
+            return _call_model(client, model, messages)
+        except Exception as exc:
+            last_exc = exc
+            text = str(exc)
+            if "upstream_error" not in text and "bad_response_status_code" not in text:
+                break
+            time.sleep(1.5 * (attempt + 1))
+    assert last_exc is not None
+    raise last_exc
+
+
 def _tool_result(case: dict[str, Any], dataset: dict[str, Any], tool_name: str) -> str:
     if tool_name == "infoflow_get_message_history":
         return json.dumps(case.get("history") or [], ensure_ascii=False)
     if tool_name == "map_crash_db_check":
         return json.dumps(case.get("map_result") or dataset.get("map_result") or {}, ensure_ascii=False)
+    if tool_name == "infoflow_analyze_image":
+        return json.dumps(case.get("image_result") or dataset.get("image_result") or {}, ensure_ascii=False)
     return "{}"
 
 
@@ -343,7 +395,7 @@ def _evaluate(
     expected = case.get("expected") or {}
     failures: list[str] = []
     for content in tool_call_contents:
-        if _PROCESS_TEXT_RE.search(content):
+        if content.strip():
             failures.append(f"assistant content during tool call: {content!r}")
     must_call = list(expected.get("must_call") or [])
     if must_call and not _contains_in_order(tool_sequence, must_call):
@@ -351,6 +403,10 @@ def _evaluate(
     for name in expected.get("must_not_call") or []:
         if name in tool_sequence:
             failures.append(f"unexpected tool call {name}")
+    for name, max_count in (expected.get("max_call_count") or {}).items():
+        actual = tool_sequence.count(str(name))
+        if actual > int(max_count):
+            failures.append(f"expected {name} at most {max_count} times, got {actual}")
     expected_final = expected.get("final")
     final_clean = final.strip()
     if expected_final == "NO_REPLY" and final_clean != "NO_REPLY":
@@ -370,7 +426,17 @@ def run_case(client: Any, model: str, dataset: dict[str, Any], case: dict[str, A
     tool_call_contents: list[str] = []
     final = ""
     for _ in range(4):
-        message = _call_model(client, model, messages)
+        try:
+            message = _call_model_with_retry(client, model, messages)
+        except Exception as exc:
+            return PromptBehaviorResult(
+                case_id=str(case["id"]),
+                passed=False,
+                tool_sequence=tool_sequence,
+                final=f"ERROR: {type(exc).__name__}: {exc}",
+                failures=[f"model call failed: {type(exc).__name__}: {exc}"],
+                tool_call_contents=tool_call_contents,
+            )
         tool_calls = getattr(message, "tool_calls", None) or []
         if not tool_calls:
             final = (getattr(message, "content", "") or "").strip()

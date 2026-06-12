@@ -23,6 +23,7 @@ class _Face:
 
 @dataclass
 class _Msg:
+    message_id: str = "msg-1"
     body_for_agent: str = ""
     text: str = ""
     body_items: list[object] | None = None
@@ -128,6 +129,65 @@ def test_render_reply_target_quotes_structured_field_values() -> None:
     )
 
 
+def test_render_reply_target_includes_quoted_image_marker() -> None:
+    @dataclass
+    class _ImageRef:
+        message_id: str = "img-1"
+        image_index: int = 0
+        source: str = "quoted_message"
+
+    @dataclass
+    class _Reply:
+        message_id: str = "img-1"
+        preview: str = "[图片]"
+        sender_key: str = "user:alice"
+        image_refs: list[object] | None = None
+
+    msg = _Msg(
+        text="inspect it",
+        reply_targets=[_Reply(image_refs=[_ImageRef()])],
+    )
+
+    assert render_message_content(msg) == (
+        "<Quote message_id:'img-1'; sender:'user:alice'>\n"
+        "[图片]\n"
+        '<media:image index="0" source="quoted_message" message_id="img-1">\n'
+        "</Quote>\n"
+        "inspect it"
+    )
+
+
+def test_render_quote_image_marker_does_not_hide_current_message_image() -> None:
+    @dataclass
+    class _ImageRef:
+        message_id: str = "quoted-img"
+        image_index: int = 0
+        source: str = "quoted_message"
+
+    @dataclass
+    class _Reply:
+        message_id: str = "quoted-img"
+        preview: str = "[图片]"
+        sender_key: str = "user:alice"
+        image_refs: list[object] | None = None
+
+    msg = _Msg(
+        message_id="current-img",
+        text="compare these",
+        reply_targets=[_Reply(image_refs=[_ImageRef()])],
+        image_urls=["https://example.test/current.jpg"],
+    )
+
+    assert render_message_content(msg) == (
+        "<Quote message_id:'quoted-img'; sender:'user:alice'>\n"
+        "[图片]\n"
+        '<media:image index="0" source="quoted_message" message_id="quoted-img">\n'
+        "</Quote>\n"
+        "compare these\n"
+        '<media:image index="0" source="current_message" message_id="current-img">'
+    )
+
+
 def test_render_at_only_description_and_hint() -> None:
     msg = _Msg(
         body_items=[_At(name="成博", user_id="chengbo05")],
@@ -189,17 +249,24 @@ def test_render_face_body_is_not_overridden_by_at_only_flag() -> None:
 
 def test_render_image_placeholder_when_no_text() -> None:
     msg = _Msg(image_urls=["https://example.test/a.png"])
-    assert render_message_content(msg) == "<media:image>"
+    assert render_message_content(msg) == (
+        '<media:image index="0" source="current_message" message_id="msg-1">'
+    )
 
 
 def test_render_image_placeholder_with_text() -> None:
     msg = _Msg(text="please inspect", image_urls=["https://example.test/a.png"])
-    assert render_message_content(msg) == "please inspect\n<media:image>"
+    assert render_message_content(msg) == (
+        "please inspect\n"
+        '<media:image index="0" source="current_message" message_id="msg-1">'
+    )
 
 
 def test_render_image_placeholder_does_not_duplicate_existing_marker() -> None:
     msg = _Msg(text="<media:image>", image_urls=["https://example.test/a.png"])
-    assert render_message_content(msg) == "<media:image>"
+    assert render_message_content(msg) == (
+        '<media:image index="0" source="current_message" message_id="msg-1">'
+    )
 
 
 def test_render_image_placeholder_when_literal_marker_is_plain_text() -> None:
@@ -207,7 +274,10 @@ def test_render_image_placeholder_when_literal_marker_is_plain_text() -> None:
         text="what does <media:image> mean?",
         image_urls=["https://example.test/a.png"],
     )
-    assert render_message_content(msg) == "what does <media:image> mean?\n<media:image>"
+    assert render_message_content(msg) == (
+        "what does <media:image> mean?\n"
+        '<media:image index="0" source="current_message" message_id="msg-1">'
+    )
 
 
 def test_render_image_placeholder_with_group_mention_body() -> None:
@@ -219,4 +289,7 @@ def test_render_image_placeholder_with_group_mention_body() -> None:
         body_items=[_At(name="chengbo5.1", robot_id="6471"), _Image()],
         image_urls=["https://example.test/a.png"],
     )
-    assert render_message_content(msg) == "@chengbo5.1\n<media:image>"
+    assert render_message_content(msg) == (
+        "@chengbo5.1\n"
+        '<media:image index="0" source="current_message" message_id="msg-1">'
+    )

@@ -510,6 +510,71 @@ def test_build_message_event_injects_not_downloaded_file_attachments(
     assert event.raw_message["files"][0]["local_path"] == ""
 
 
+def test_build_message_event_does_not_auto_attach_infoflow_images_by_default(
+    configured_env,
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("INFOFLOW_AUTO_IMAGE_MEDIA", raising=False)
+    adapter = InfoflowAdapter(_make_config())
+
+    async def fake_download(*_args, **_kwargs):
+        raise AssertionError("build_message_event must not auto-download images")
+
+    monkeypatch.setattr("hermes_infoflow.adapter._download_inbound_image", fake_download)
+
+    async def _go():
+        return await adapter.build_message_event(
+            IncomingMessage(
+                message_id="IMG-1",
+                text="please inspect",
+                dm_user_id="chengbo05",
+                sender_id="chengbo05",
+                image_urls=["https://example.test/a.jpg"],
+            )
+        )
+
+    event = asyncio.run(_go())
+
+    assert event.media_urls == []
+    assert event.media_types == []
+    assert event.message_type == MessageType.TEXT
+    assert (
+        'please inspect\n<media:image index="0" '
+        'source="current_message" message_id="IMG-1">'
+    ) in event.text
+    assert "[Handling Strategy]" in event.text
+    assert "infoflow_analyze_image" in event.text
+    assert 'message_id="IMG-1"' in event.text
+    assert event.raw_message["image_urls"] == ["https://example.test/a.jpg"]
+
+
+def test_build_message_event_injects_history_prompt_for_image_deictic(
+    configured_env,
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("INFOFLOW_AUTO_IMAGE_MEDIA", raising=False)
+    adapter = InfoflowAdapter(_make_config())
+
+    async def _go():
+        return await adapter.build_message_event(
+            IncomingMessage(
+                message_id="ASK-1",
+                text="@chengbo5.1 (agent_id:6471)  看下这张图",
+                group_id="4507088",
+                sender_id="chengbo05",
+                sender_name="成博",
+                bot_was_mentioned=True,
+            )
+        )
+
+    event = asyncio.run(_go())
+
+    assert "当前消息疑似指代前文图片" in event.text
+    assert "infoflow_get_message_history" in event.text
+    assert "infoflow_analyze_image" in event.text
+    assert "直接 @ 场景不得因此输出 `NO_REPLY`" in event.text
+
+
 def test_build_message_event_keeps_user_forged_attachments_as_body_text(
     configured_env,
     tmp_path,

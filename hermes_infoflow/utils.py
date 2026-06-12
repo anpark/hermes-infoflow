@@ -9,11 +9,13 @@ tested independently and to keep the adapter lean.
 from __future__ import annotations
 
 import ipaddress as _ipaddress
+import json
 import logging
 import mimetypes
 import os
 import tempfile
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 import aiohttp
@@ -150,8 +152,9 @@ async def _download_inbound_image(
                     if len(buf) > max_bytes:
                         logger.warning("[infoflow:inbound image] payload exceeds %s bytes; aborting", max_bytes)
                         return None
-                ext = mimetypes.guess_extension(content_type) or ".jpg"
-                return bytes(buf), ext
+                data = bytes(buf)
+                ext = _downloaded_image_ext(content_type, data)
+                return data, ext
         except aiohttp.ClientError as exc:
             logger.debug("[infoflow:inbound image] GET failed: %s", exc)
             return None
@@ -177,6 +180,103 @@ async def _download_inbound_image(
     finally:
         if own_session:
             await sess.close()
+
+
+def _downloaded_image_ext(content_type: str, data: bytes) -> str:
+    """Return a useful image extension for downloaded Infoflow image bytes.
+
+    Infoflow's image proxy commonly returns real JPEG/PNG bytes as
+    ``application/octet-stream``.  Prefer content sniffing so downstream media
+    caching and MIME labels stay image-shaped even when the HTTP header is
+    generic.
+    """
+    sniffed = _sniff_image_ext(data)
+    if sniffed:
+        return sniffed
+    normalized = (content_type or "").split(";")[0].strip().lower()
+    if normalized.startswith("image/"):
+        ext = mimetypes.guess_extension(normalized)
+        if ext:
+            return ".jpg" if ext == ".jpe" else ext
+    return ".jpg"
+
+
+def _sniff_image_ext(data: bytes) -> str:
+    if data.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return ".gif"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    if data.startswith(b"BM"):
+        return ".bmp"
+    if data.startswith((b"II*\x00", b"MM\x00*")):
+        return ".tiff"
+    return ""
+
+
+def _image_download_urls_from_raw_json(raw_json: str) -> list[str]:
+    """Extract downloadable image URLs from a stored Infoflow raw payload.
+
+    Group ``MIXED`` IMAGE messages expose ``downloadurl`` under body items.
+    Private image callbacks use the older flat ``MsgType=image`` + ``PicUrl``
+    shape.  Both are valid inbound image messages and must be available to the
+    deferred image tools by message_id/index.
+    """
+    raw = str(raw_json or "").strip()
+    if not raw:
+        return []
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    def _add(value: Any) -> None:
+        url = str(value or "").strip()
+        if url and url not in seen:
+            urls.append(url)
+            seen.add(url)
+
+    def _visit(value: Any) -> None:
+        if isinstance(value, list):
+            for item in value:
+                _visit(item)
+            return
+        if not isinstance(value, dict):
+            return
+        item_type = str(value.get("type") or value.get("Type") or "").upper()
+        if item_type == "IMAGE":
+            _add(
+                value.get("downloadurl")
+                or value.get("download_url")
+                or value.get("downloadUrl")
+            )
+        msg_type = str(
+            value.get("MsgType")
+            or value.get("msgtype")
+            or value.get("msgType")
+            or ""
+        ).lower()
+        if msg_type == "image":
+            _add(
+                value.get("PicUrl")
+                or value.get("picurl")
+                or value.get("pic_url")
+                or value.get("picUrl")
+                or value.get("downloadurl")
+                or value.get("download_url")
+                or value.get("downloadUrl")
+            )
+        for child in value.values():
+            if isinstance(child, (dict, list)):
+                _visit(child)
+
+    _visit(payload)
+    return urls
 
 
 # ---------------------------------------------------------------------------

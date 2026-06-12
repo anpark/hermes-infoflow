@@ -181,6 +181,31 @@ def test_register_registers_platform_and_tool() -> None:
     assert "file_index" in download_props
     assert "force" in download_props
 
+    assert any(t["name"] == "infoflow_download_image" for t in ctx.tools)
+    download_image_tool = next(
+        t for t in ctx.tools if t["name"] == "infoflow_download_image"
+    )
+    assert download_image_tool["toolset"] == "infoflow"
+    assert download_image_tool["is_async"] is True
+    assert download_image_tool["schema"]["parameters"]["required"] == ["message_id"]
+    download_image_props = download_image_tool["schema"]["parameters"]["properties"]
+    assert "image_index" in download_image_props
+    assert "force" in download_image_props
+
+    assert any(t["name"] == "infoflow_analyze_image" for t in ctx.tools)
+    analyze_image_tool = next(
+        t for t in ctx.tools if t["name"] == "infoflow_analyze_image"
+    )
+    assert analyze_image_tool["toolset"] == "infoflow"
+    assert analyze_image_tool["is_async"] is True
+    assert analyze_image_tool["schema"]["parameters"]["required"] == [
+        "message_id",
+        "user_prompt",
+    ]
+    analyze_image_props = analyze_image_tool["schema"]["parameters"]["properties"]
+    assert "image_index" in analyze_image_props
+    assert "user_prompt" in analyze_image_props
+
 
 def test_plugin_name_consistency() -> None:
     """plugin.yaml.name, register(name=...), and entry-point key must align."""

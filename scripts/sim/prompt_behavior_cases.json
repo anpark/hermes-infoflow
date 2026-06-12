@@ -1,6 +1,65 @@
 {
   "cases": [
     {
+      "id": "direct_mention_image_deictic_unclear_must_reply",
+      "description": "direct @ with 'this image' but no current marker must read history, analyze the previous image, and ask for the missing detail instead of NO_REPLY.",
+      "strategy": "mention",
+      "image_prompt": "deictic",
+      "content": "@chengbo5.1 (agent_id:6471)  看下这张图",
+      "message_id": "direct_img_task_mid",
+      "history": [
+        {
+          "time": "2026.06.12 14.47.47",
+          "content": "[Sender: type:'human'; user_id:'chengbo05'; name:'成博'; permission:'admin']\n[Message: message_id:'direct_img_source_mid'; created_time:'2026.06.12 14.47.47']\n<media:image index=\"0\" source=\"current_message\" message_id=\"direct_img_source_mid\">"
+        },
+        {
+          "time": "2026.06.12 14.47.53",
+          "content": "[Sender: type:'human'; user_id:'chengbo05'; name:'成博'; permission:'admin']\n[Message: message_id:'direct_img_task_mid'; created_time:'2026.06.12 14.47.53']\n@chengbo5.1 看下这张图"
+        }
+      ],
+      "image_result": {
+        "success": true,
+        "message_id": "direct_img_source_mid",
+        "image_index": 0,
+        "analysis": "图片是一张如流会话列表截图，只能看到群名“iOS 小分队”和一条消息预览“[Picture] 端午值班表 @王志一…”，没有看到具体报警详情、crashkey、堆栈或风险指标。"
+      },
+      "expected": {
+        "must_call": ["infoflow_get_message_history", "infoflow_analyze_image"],
+        "final": "answer"
+      }
+    },
+    {
+      "id": "direct_mention_image_deictic_missing_history_must_clarify",
+      "description": "direct @ with an image deictic but no image in history must ask for the image instead of NO_REPLY.",
+      "strategy": "mention",
+      "image_prompt": "deictic",
+      "content": "@chengbo5.1 (agent_id:6471)  看下这张图",
+      "message_id": "direct_img_missing_mid",
+      "history": [
+        {
+          "time": "2026.06.12 14.47.53",
+          "content": "[Sender: type:'human'; user_id:'chengbo05'; name:'成博'; permission:'admin']\n[Message: message_id:'direct_img_missing_mid'; created_time:'2026.06.12 14.47.53']\n@chengbo5.1 看下这张图"
+        }
+      ],
+      "expected": {
+        "must_call": ["infoflow_get_message_history"],
+        "must_not_call": ["infoflow_analyze_image", "map_crash_db_check"],
+        "final": "answer"
+      }
+    },
+    {
+      "id": "direct_mention_closing_stays_no_reply",
+      "description": "direct @ with only a closing signal should still be allowed to stay silent.",
+      "strategy": "mention",
+      "content": "@chengbo5.1 (agent_id:6471)  好的谢谢",
+      "message_id": "direct_closing_mid",
+      "history": [],
+      "expected": {
+        "must_not_call": ["infoflow_get_message_history", "infoflow_analyze_image", "map_crash_db_check"],
+        "final": "NO_REPLY"
+      }
+    },
+    {
       "id": "watch_mention_release_readiness",
       "description": "watch_mention with a concrete version and judgement request must read history and use the relevant skill/tool.",
       "strategy": "watch_mention",
@@ -23,6 +82,7 @@
       ],
       "expected": {
         "must_call": ["infoflow_get_message_history", "map_crash_db_check"],
+        "max_call_count": {"map_crash_db_check": 1},
         "final": "answer"
       }
     },
@@ -64,6 +124,7 @@
       ],
       "expected": {
         "must_call": ["infoflow_get_message_history", "map_crash_db_check"],
+        "max_call_count": {"map_crash_db_check": 1},
         "final": "answer"
       }
     },
@@ -120,5 +181,9 @@
     "has_data": true,
     "summary": "命中该版本，当前样本量偏少但未见新增高危 crash。",
     "risk": "observe"
+  },
+  "image_result": {
+    "success": true,
+    "analysis": "图片内容可见，但没有更多可操作数据。"
   }
 }

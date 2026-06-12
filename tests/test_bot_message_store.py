@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -444,6 +445,80 @@ async def test_group_reply_to_persisted_human_message_keeps_sender_without_bot_q
     assert found.content.startswith(
         "<Quote message_id:'human-group-previous'; sender:'user:bob'>"
     )
+
+
+@pytest.mark.asyncio
+async def test_group_reply_to_persisted_image_message_enriches_quote_image_refs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot, store, _sent_store = _bot(tmp_path, monkeypatch)
+    image_url = (
+        "http://e4hi.im.baidu.com/proxy/download?"
+        "taskId=8c650ebc-16dc-4072-857a-415d3aceb7f5&agentId=6471"
+    )
+    store.persist_group(
+        message_id="image-message",
+        group_id="1",
+        self_id="bot:6471",
+        sender="user:bob",
+        is_outgoing=False,
+        content="<media:image>",
+        raw_json=json.dumps({
+            "eventtype": "ALL_MESSAGE_FORWARD",
+            "groupid": 1,
+            "message": {
+                "body": [{
+                    "type": "IMAGE",
+                    "downloadurl": image_url,
+                }],
+            },
+        }),
+    )
+    msg = IncomingMessage(
+        message_id="human-group-next",
+        dedupe_key="human-group-next",
+        text="@helper inspect this fruit",
+        group_id="1",
+        sender_id="alice",
+        bot_was_mentioned=True,
+        reply_targets=[
+            ReplyTarget(message_id="image-message", preview="[图片]")
+        ],
+        body_items=[
+            BodyItem(type="AT", name="helper", robot_id="999"),
+            BodyItem(type="TEXT", content=" inspect this fruit"),
+        ],
+        raw_data={
+            "message": {
+                "body": [{
+                    "type": "replyData",
+                    "sBasemsgId": "image-message",
+                    "replyImages": [{
+                        "type": "jpeg",
+                        "width": 1512,
+                        "height": 2016,
+                    }],
+                }],
+            },
+        },
+    )
+
+    await bot.process_inbound(msg)
+
+    assert msg.image_urls == []
+    assert len(msg.reply_targets) == 1
+    assert len(msg.reply_targets[0].image_refs) == 1
+    assert msg.reply_targets[0].image_refs[0].message_id == "image-message"
+    assert msg.reply_targets[0].image_refs[0].image_index == 0
+    assert msg.reply_targets[0].image_refs[0].source == "quoted_message"
+    found = store.find_group("human-group-next")
+    assert found is not None
+    assert (
+        "<Quote message_id:'image-message'; sender:'user:bob'>\n"
+        "[图片]\n"
+        '<media:image index="0" source="quoted_message" message_id="image-message">\n'
+        "</Quote>"
+    ) in found.content
 
 
 @pytest.mark.asyncio

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from typing import Any
 
 from .coerce import coerce_bool
+from .itypes import coerce_image_ref
 from .llm_tags import string_field
 
 _AT_ONLY_HINT = (
@@ -32,6 +34,59 @@ def _bool_attr(obj: Any, *names: str) -> bool:
         if coerce_bool(value):
             return True
     return False
+
+
+def _xml_attr(value: object) -> str:
+    text = " ".join(str(value or "").split())
+    return (
+        text.replace("&", "&amp;")
+        .replace('"', "&quot;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def _render_media_image_marker(
+    *,
+    message_id: str,
+    image_index: int,
+    source: str,
+) -> str:
+    return (
+        f'<media:image index="{max(0, int(image_index))}" '
+        f'source="{_xml_attr(source)}" '
+        f'message_id="{_xml_attr(message_id or "unknown")}">'
+    )
+
+
+def _image_refs_from_target(target: Any) -> list[Any]:
+    raw = (
+        target.get("image_refs")
+        if isinstance(target, dict)
+        else getattr(target, "image_refs", None)
+    )
+    return list(raw or [])
+
+
+def _render_image_ref_marker(ref: Any) -> str:
+    normalized = coerce_image_ref(ref)
+    return _render_media_image_marker(
+        message_id=normalized.message_id,
+        image_index=normalized.image_index,
+        source=normalized.source or "quoted_message",
+    )
+
+
+def _render_current_image_markers(msg: Any, image_urls: list[Any]) -> list[str]:
+    message_id = _first_attr(msg, "message_id", "messageid")
+    return [
+        _render_media_image_marker(
+            message_id=message_id,
+            image_index=index,
+            source="current_message",
+        )
+        for index, _url in enumerate(image_urls)
+    ]
 
 
 def _format_at(item: Any, robot_agent_id_lookup: RobotAgentLookup | None) -> str:
@@ -68,6 +123,12 @@ def _render_reply_target(target: Any) -> str:
     fields = [string_field("message_id", message_id)]
     if sender:
         fields.append(string_field("sender", sender))
+    markers = [_render_image_ref_marker(ref) for ref in _image_refs_from_target(target)]
+    if markers:
+        body_lines = [preview] if preview else []
+        body_lines.extend(markers)
+        body = "\n".join(body_lines)
+        return f"<Quote {'; '.join(fields)}>\n{body}\n</Quote>"
     return f"<Quote {'; '.join(fields)}>{preview}</Quote>"
 
 
@@ -79,7 +140,20 @@ def _body_has_reply_item(body_items: list[Any]) -> bool:
 
 
 def _has_media_image_marker(text: str) -> bool:
-    return any(line.strip().startswith("<media:image>") for line in text.splitlines())
+    return any(line.strip().startswith("<media:image") for line in text.splitlines())
+
+
+def _has_current_message_image_marker(text: str) -> bool:
+    return any(
+        line.strip().startswith("<media:image")
+        and 'source="current_message"' in line
+        for line in text.splitlines()
+    )
+
+
+def _is_legacy_media_only(text: str) -> bool:
+    stripped = str(text or "").strip()
+    return bool(re.fullmatch(r"<media:image>(?:\s+\(\d+\s+images\))?", stripped))
 
 
 def _body_items_are_at_only(body_items: list[Any]) -> bool:
@@ -188,6 +262,9 @@ def render_message_content(
     else:
         text = getattr(msg, "text", "") or ""
 
+    if image_urls and _is_legacy_media_only(text):
+        text = "\n".join(_render_current_image_markers(msg, image_urls))
+
     if reply_targets and not _body_has_reply_item(body_items):
         prefix_parts = [
             rendered for target in reply_targets
@@ -208,7 +285,7 @@ def render_message_content(
         )
     elif not text.strip():
         if image_urls:
-            text = "<media:image>" if len(image_urls) == 1 else f"<media:image> ({len(image_urls)} images)"
+            text = "\n".join(_render_current_image_markers(msg, image_urls))
         elif files:
             text = ""
         else:
@@ -216,9 +293,9 @@ def render_message_content(
                 body_items,
                 robot_agent_id_lookup=robot_agent_id_lookup,
             )
-    elif image_urls and not _has_media_image_marker(text):
-        marker = "<media:image>" if len(image_urls) == 1 else f"<media:image> ({len(image_urls)} images)"
-        text = f"{text}\n{marker}"
+    elif image_urls and not _has_current_message_image_marker(text):
+        markers = "\n".join(_render_current_image_markers(msg, image_urls))
+        text = f"{text}\n{markers}"
     if is_at_only:
         text = (text or "") + _AT_ONLY_HINT
     return text

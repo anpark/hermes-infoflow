@@ -7,6 +7,7 @@ import base64
 import contextlib
 import json
 import logging
+import mimetypes
 import os
 import re
 from collections.abc import Callable
@@ -23,7 +24,11 @@ from .media import prepare_infoflow_image_bytes
 from .prompt_rules import INFOFLOW_DELIVERY_TOOL_RULES
 from .send_service import InfoflowSendService
 from .settings import parse_infoflow_admin_users
-from .utils import _ImageLoadError
+from .utils import (
+    _ImageLoadError,
+    _download_inbound_image,
+    _image_download_urls_from_raw_json,
+)
 
 if TYPE_CHECKING:
     pass
@@ -629,6 +634,75 @@ DOWNLOAD_ATTACHMENT_TOOL_SCHEMA = {
 }
 
 
+DOWNLOAD_IMAGE_TOOL_SCHEMA = {
+    "name": "infoflow_download_image",
+    "description": (
+        "低层兜底：按需下载当前如流会话或已授权历史消息中的入站图片。"
+        "通常应优先用 `infoflow_analyze_image` 直接分析图片；只有确实需要"
+        "本地图片 `path` 时才使用本工具。"
+        "成功和失败都返回 JSON 字符串；成功时包含本地 `path`，可继续传给 "
+        "`vision_analyze` 的 `image_url` 参数。"
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "message_id": {
+                "type": "string",
+                "description": "图片所属 Infoflow 消息的 message_id。",
+            },
+            "image_index": {
+                "type": "integer",
+                "description": "图片在该消息 IMAGE body 中的下标，从 0 开始。",
+                "minimum": 0,
+                "default": 0,
+            },
+            "force": {
+                "type": "boolean",
+                "description": "可选。为 true 时忽略已有下载状态并重新下载。",
+                "default": False,
+            },
+        },
+        "required": ["message_id"],
+    },
+}
+
+
+ANALYZE_IMAGE_TOOL_SCHEMA = {
+    "name": "infoflow_analyze_image",
+    "description": (
+        "按需读取并分析如流 IMAGE 图片。"
+        "当 user message 或历史消息正文出现 `<media:image ...>` 且用户问题"
+        "需要图片内容时使用。传入 marker 中的 `message_id` 和 `index`，"
+        "以及面向视觉模型的 `user_prompt`。成功和失败都返回 JSON 字符串。"
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "message_id": {
+                "type": "string",
+                "description": "图片所属 Infoflow 消息的 message_id。",
+            },
+            "image_index": {
+                "type": "integer",
+                "description": "图片在该消息 IMAGE body 中的下标，从 0 开始。",
+                "minimum": 0,
+                "default": 0,
+            },
+            "user_prompt": {
+                "type": "string",
+                "description": "需要视觉模型围绕图片回答的问题或分析要求。",
+            },
+            "force": {
+                "type": "boolean",
+                "description": "可选。为 true 时忽略已有下载状态并重新下载。",
+                "default": False,
+            },
+        },
+        "required": ["message_id", "user_prompt"],
+    },
+}
+
+
 def _serialize_group_members_payload(
     members: list[Any],
     group_id: str,
@@ -1221,6 +1295,107 @@ def _download_attachment_payload(
     return payload
 
 
+def _image_mime_for_ext(ext: str) -> str:
+    suffix = ext if str(ext or "").startswith(".") else f".{ext}"
+    mime, _ = mimetypes.guess_type(f"image{suffix}")
+    return mime if mime and mime.startswith("image/") else "image/jpeg"
+
+
+def _cache_image_bytes_for_vision(data: bytes, ext: str) -> str:
+    try:
+        from gateway.platforms.base import cache_image_from_bytes
+    except Exception as exc:  # pragma: no cover - depends on hermes runtime
+        raise RuntimeError("Hermes image cache is unavailable") from exc
+    return str(cache_image_from_bytes(data, ext=ext))
+
+
+def _cached_images_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = payload.get("_hermes_infoflow_images")
+    if isinstance(raw, list):
+        return [item if isinstance(item, dict) else {} for item in raw]
+    return []
+
+
+def _download_image_payload(
+    *,
+    success: bool,
+    message_id: str,
+    image_index: int,
+    path: str = "",
+    ext: str = "",
+    size: int = 0,
+    download_source: str = "",
+    error: str = "",
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "success": bool(success),
+        "message_id": message_id,
+        "image_index": int(image_index),
+        "status": "downloaded" if success else "failed",
+    }
+    if success:
+        payload.update({
+            "path": path,
+            "mime_type": _image_mime_for_ext(ext),
+            "size": int(size),
+            "download_source": download_source or "network",
+            "next_step": (
+                "Use vision_analyze with image_url set to this path when image "
+                "details are needed."
+            ),
+        })
+    if error:
+        payload["error"] = error
+    return payload
+
+
+def _analyze_image_payload(
+    *,
+    success: bool,
+    message_id: str,
+    image_index: int,
+    analysis: str = "",
+    mime_type: str = "",
+    size: int = 0,
+    error: str = "",
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "success": bool(success),
+        "message_id": message_id,
+        "image_index": int(image_index),
+        "status": "analyzed" if success else "failed",
+    }
+    if success:
+        payload.update({
+            "analysis": str(analysis or ""),
+            "mime_type": mime_type,
+            "size": int(size),
+        })
+    if error:
+        payload["error"] = error
+    return payload
+
+
+async def _vision_analyze_image_path(path: str, user_prompt: str) -> dict[str, Any]:
+    try:
+        from tools.vision_tools import vision_analyze_tool
+    except Exception as exc:  # pragma: no cover - depends on hermes runtime
+        raise RuntimeError("Hermes vision_analyze tool is unavailable") from exc
+
+    result_json = await vision_analyze_tool(
+        image_url=path,
+        user_prompt=user_prompt,
+    )
+    try:
+        result = json.loads(str(result_json or ""))
+    except json.JSONDecodeError:
+        return {"success": False, "error": "invalid_vision_result"}
+    return result if isinstance(result, dict) else {
+        "success": False,
+        "error": "invalid_vision_result",
+    }
+
+
 def _parse_file_index_arg(value: Any) -> tuple[int | None, str | None]:
     if isinstance(value, bool):
         return None, "file_index must be a non-negative integer"
@@ -1239,6 +1414,13 @@ def _parse_file_index_arg(value: Any) -> tuple[int | None, str | None]:
         return None, "file_index must be a non-negative integer"
     if index < 0:
         return None, "file_index must be a non-negative integer"
+    return index, None
+
+
+def _parse_image_index_arg(value: Any) -> tuple[int | None, str | None]:
+    index, error = _parse_file_index_arg(value)
+    if error:
+        return None, error.replace("file_index", "image_index")
     return index, None
 
 
@@ -2103,6 +2285,273 @@ def make_download_attachment_handler():
             file_index=file_index,
             file=file,
             error="" if success else (getattr(file, "error", "") or "download_failed"),
+        ))
+
+    return _handler
+
+
+async def _download_image_for_tool(
+    *,
+    message_id: str,
+    image_index: int,
+    force: bool = False,
+) -> dict[str, Any]:
+    adapter = _get_live_adapter()
+    if adapter is None:
+        return _download_image_payload(
+            success=False,
+            message_id=message_id,
+            image_index=image_index,
+            error="Infoflow adapter not running — cannot download image.",
+        )
+    store = getattr(adapter, "_message_store", None)
+    if store is None:
+        return _download_image_payload(
+            success=False,
+            message_id=message_id,
+            image_index=image_index,
+            error="Infoflow message store is unavailable.",
+        )
+    serverapi = getattr(adapter, "_serverapi", None)
+    token_provider = getattr(serverapi, "get_access_token", None)
+    if not callable(token_provider):
+        return _download_image_payload(
+            success=False,
+            message_id=message_id,
+            image_index=image_index,
+            error="Infoflow image downloader is unavailable.",
+        )
+
+    from .bot import get_recall_inbound_message_id_hint  # noqa: E402
+
+    current_message_id = get_recall_inbound_message_id_hint() or ""
+    current_record = store.find_any(current_message_id) if current_message_id else None
+    if current_record is None:
+        return _download_image_payload(
+            success=False,
+            message_id=message_id,
+            image_index=image_index,
+            error="Current Infoflow message context is required to download images.",
+        )
+    current_target = _target_from_record(current_record)
+    admin_uid = str(getattr(adapter, "_admin_uid", "") or "")
+    current_is_admin = _record_is_admin(current_record, admin_uid)
+
+    record = store.find_any(message_id)
+    if record is None:
+        return _download_image_payload(
+            success=False,
+            message_id=message_id,
+            image_index=image_index,
+            error="message_id not found",
+        )
+    record_target = _target_from_record(record)
+    if not _same_target(record_target, current_target) and not current_is_admin:
+        return _download_image_payload(
+            success=False,
+            message_id=message_id,
+            image_index=image_index,
+            error="Only admin can download images outside the current conversation.",
+        )
+
+    payload = _record_raw_payload(record)
+    urls = _image_download_urls_from_raw_json(str(getattr(record, "raw_json", "") or ""))
+    if not urls:
+        return _download_image_payload(
+            success=False,
+            message_id=message_id,
+            image_index=image_index,
+            error="message_id has no image attachments",
+        )
+    if image_index >= len(urls):
+        return _download_image_payload(
+            success=False,
+            message_id=message_id,
+            image_index=image_index,
+            error="image_index out of range",
+        )
+
+    cached_images = _cached_images_from_payload(payload)
+    if image_index < len(cached_images):
+        cached = cached_images[image_index]
+        cached_path = str(cached.get("path") or "")
+        if (
+            not force
+            and str(cached.get("status") or "") == "downloaded"
+            and _local_file_readable(cached_path)
+        ):
+            return _download_image_payload(
+                success=True,
+                message_id=message_id,
+                image_index=image_index,
+                path=cached_path,
+                ext=str(cached.get("ext") or ".jpg"),
+                size=int(cached.get("size") or 0),
+                download_source=str(cached.get("download_source") or "cache"),
+            )
+
+    try:
+        downloaded = await _download_inbound_image(
+            urls[image_index],
+            token_provider=token_provider,
+            session=None,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[infoflow:download_image] download failed mid=%s image_index=%s: %s",
+            message_id,
+            image_index,
+            exc,
+        )
+        downloaded = None
+    if downloaded is None:
+        return _download_image_payload(
+            success=False,
+            message_id=message_id,
+            image_index=image_index,
+            error="download_failed",
+        )
+
+    data, ext = downloaded
+    try:
+        local_path = _cache_image_bytes_for_vision(data, ext)
+    except Exception as exc:
+        logger.warning(
+            "[infoflow:download_image] cache failed mid=%s image_index=%s: %s",
+            message_id,
+            image_index,
+            exc,
+        )
+        return _download_image_payload(
+            success=False,
+            message_id=message_id,
+            image_index=image_index,
+            error="cache_failed",
+        )
+
+    image_record = {
+        "status": "downloaded",
+        "path": local_path,
+        "ext": ext,
+        "mime_type": _image_mime_for_ext(ext),
+        "size": len(data),
+        "download_source": "network",
+    }
+    while len(cached_images) <= image_index:
+        cached_images.append({})
+    cached_images[image_index] = image_record
+    payload["_hermes_infoflow_images"] = cached_images
+    _persist_record_raw_json(
+        store,
+        record,
+        json.dumps(payload, ensure_ascii=False),
+    )
+
+    return _download_image_payload(
+        success=True,
+        message_id=message_id,
+        image_index=image_index,
+        path=local_path,
+        ext=ext,
+        size=len(data),
+        download_source="network",
+    )
+
+
+def make_download_image_handler():
+    """Build the ``infoflow_download_image`` tool handler."""
+
+    async def _handler(args: dict, **_kwargs) -> str:
+        message_id = str(args.get("message_id") or "").strip()
+        if not message_id:
+            return _json_error("message_id is required")
+        image_index, image_index_error = _parse_image_index_arg(
+            args.get("image_index", 0)
+        )
+        if image_index_error:
+            return _json_error(image_index_error)
+        assert image_index is not None
+        force = bool(args.get("force", False))
+        return tool_result_json(await _download_image_for_tool(
+            message_id=message_id,
+            image_index=image_index,
+            force=force,
+        ))
+
+    return _handler
+
+
+def make_analyze_image_handler():
+    """Build the ``infoflow_analyze_image`` tool handler."""
+
+    async def _handler(args: dict, **_kwargs) -> str:
+        message_id = str(args.get("message_id") or "").strip()
+        if not message_id:
+            return _json_error("message_id is required")
+        image_index, image_index_error = _parse_image_index_arg(
+            args.get("image_index", 0)
+        )
+        if image_index_error:
+            return _json_error(image_index_error)
+        assert image_index is not None
+        user_prompt = str(args.get("user_prompt") or "").strip()
+        if not user_prompt:
+            return _json_error("user_prompt is required")
+        force = bool(args.get("force", False))
+
+        download_payload = await _download_image_for_tool(
+            message_id=message_id,
+            image_index=image_index,
+            force=force,
+        )
+        if not download_payload.get("success"):
+            return tool_result_json(_analyze_image_payload(
+                success=False,
+                message_id=message_id,
+                image_index=image_index,
+                error=str(download_payload.get("error") or "download_failed"),
+            ))
+
+        path = str(download_payload.get("path") or "")
+        if not path:
+            return tool_result_json(_analyze_image_payload(
+                success=False,
+                message_id=message_id,
+                image_index=image_index,
+                error="downloaded_image_path_missing",
+            ))
+
+        try:
+            vision_payload = await _vision_analyze_image_path(path, user_prompt)
+        except Exception as exc:
+            logger.warning(
+                "[infoflow:analyze_image] vision failed mid=%s image_index=%s: %s",
+                message_id,
+                image_index,
+                exc,
+            )
+            return tool_result_json(_analyze_image_payload(
+                success=False,
+                message_id=message_id,
+                image_index=image_index,
+                error="vision_failed",
+            ))
+
+        if not vision_payload.get("success"):
+            return tool_result_json(_analyze_image_payload(
+                success=False,
+                message_id=message_id,
+                image_index=image_index,
+                error=str(vision_payload.get("error") or "vision_failed"),
+            ))
+
+        return tool_result_json(_analyze_image_payload(
+            success=True,
+            message_id=message_id,
+            image_index=image_index,
+            analysis=str(vision_payload.get("analysis") or ""),
+            mime_type=str(download_payload.get("mime_type") or ""),
+            size=int(download_payload.get("size") or 0),
         ))
 
     return _handler

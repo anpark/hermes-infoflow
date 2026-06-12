@@ -163,11 +163,15 @@ def test_watch_regex_requires_strict_no_reply_output() -> None:
 
 
 def test_mention_path_allows_no_reply_for_clear_stop_or_closer() -> None:
+    assert "直接 @ 必回模式" in _MENTION_PROMPT
     assert "闭嘴" in _MENTION_PROMPT
     assert "stop" in _MENTION_PROMPT
     assert "别发消息了" in _MENTION_PROMPT
-    assert "不期待回复" in _MENTION_PROMPT
+    assert "独立结束语" in _MENTION_PROMPT
     assert "机器人很久没发言" in _MENTION_PROMPT
+    assert "这张图" in _MENTION_PROMPT
+    assert "不得输出 `NO_REPLY`" in _MENTION_PROMPT
+    assert "提出最小补充请求" in _MENTION_PROMPT
     assert "NO_REPLY" in _MENTION_PROMPT
 
 
@@ -194,6 +198,9 @@ def test_infoflow_tool_rules_include_inbound_attachment_contract() -> None:
     assert "files[].path" in _INFOFLOW_TOOL_RULES_DOC
     assert "not_downloaded" in _INFOFLOW_TOOL_RULES_DOC
     assert "infoflow_download_attachment" in _INFOFLOW_TOOL_RULES_DOC
+    assert "infoflow_analyze_image" in _INFOFLOW_TOOL_RULES_DOC
+    assert "infoflow_download_image" in _INFOFLOW_TOOL_RULES_DOC
+    assert "vision_analyze" in _INFOFLOW_TOOL_RULES_DOC
     assert "downloaded" in _INFOFLOW_TOOL_RULES_DOC
     assert "failed" in _INFOFLOW_TOOL_RULES_DOC
     assert "file_delivery(source_path)" in _INFOFLOW_TOOL_RULES_DOC
@@ -221,6 +228,9 @@ def test_common_field_doc_describes_sender_attention_and_attachments() -> None:
     assert "status:\"not_downloaded\"" in _INFOFLOW_FIELD_DOC
     assert "status:\"downloaded\"" in _INFOFLOW_FIELD_DOC
     assert "status:\"failed\"" in _INFOFLOW_FIELD_DOC
+    assert "<media:image" in _INFOFLOW_FIELD_DOC
+    assert "infoflow_analyze_image" in _INFOFLOW_FIELD_DOC
+    assert "infoflow_download_image" in _INFOFLOW_FIELD_DOC
     assert "<Face ...>" in _INFOFLOW_FIELD_DOC
     assert "表情/贴图" in _INFOFLOW_FIELD_DOC
     assert "不是可下载图片" in _INFOFLOW_FIELD_DOC
@@ -244,6 +254,14 @@ def test_group_and_dm_prompt_fragments_keep_only_their_differences() -> None:
     assert "mentions_you" not in _DM_FORMAT_DOC
     assert "`[Sender: ...]` 字段" not in _GROUP_FORMAT_DOC
     assert "`[Sender: ...]` 字段" not in _DM_FORMAT_DOC
+
+
+def test_group_visible_output_no_reply_rule_excludes_direct_mentions() -> None:
+    text = _INFOFLOW_GROUP_VISIBLE_OUTPUT_DOC
+    assert "默认输出单独一行 `NO_REPLY`" in text
+    assert "直接 @ 必回" in text
+    assert "信息不足也必须回复澄清" in text
+    assert "上下文指代" in text
 
 
 def test_permission_doc_mentions_attachment_trust_boundary() -> None:
