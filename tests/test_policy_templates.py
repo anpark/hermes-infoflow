@@ -42,7 +42,7 @@ from hermes_infoflow.prompt_rules import INFOFLOW_DELIVERY_TOOL_RULES
 RENDERED = {
     "mention": _MENTION_PROMPT,
     "watch_mention": _WATCH_MENTION_PROMPT.format(who="张三"),
-    "watch_regex": _WATCH_REGEX_PROMPT.format(pattern="咖啡"),
+    "watch_regex": _WATCH_REGEX_PROMPT.format(pattern="咖啡", skill_hint=""),
     "proactive": _PROACTIVE_PROMPT,
     "engaged": _FOLLOW_UP_ENGAGED_TEMPLATE.format(sender_label="x (uid, human)"),
     "passive": _FOLLOW_UP_PASSIVE_TEMPLATE.format(sender_label="x (uid, human)"),

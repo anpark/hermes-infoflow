@@ -111,6 +111,21 @@ class GroupConfigOverride:
     system_prompt: str | None = None
 
 
+@dataclass(frozen=True)
+class WatchRegexRule:
+    pattern: str
+    key: str = ""
+    skill: str = ""
+
+
+@dataclass(frozen=True)
+class WatchRegexMatch:
+    pattern: str
+    index: int
+    key: str = ""
+    skill: str = ""
+
+
 # Mutable on purpose: ``last_reply_at`` is updated by the adapter after each
 # successful outbound send (so the follow-up window can kick in). We can't
 # use ``frozen=True`` here — Python's auto-generated ``__hash__`` on a frozen
@@ -124,6 +139,7 @@ class GroupPolicy:
     require_mention: bool = True
     watch_mentions: tuple[str, ...] | list[str] = ()
     watch_regex: tuple[str, ...] | list[str] = ()
+    watch_regex_rules: tuple[WatchRegexRule, ...] | list[WatchRegexRule | dict[str, Any]] = ()
     follow_up: bool = DEFAULT_FOLLOW_UP
     follow_up_window: int = DEFAULT_FOLLOW_UP_WINDOW_SECONDS
     per_group_overrides: dict[str, GroupConfigOverride] = field(default_factory=dict)
@@ -286,8 +302,49 @@ def _watch_mentioned(inbound: IncomingMessage, watch_list: tuple[str, ...] | lis
     return None
 
 
-def _watch_regex_match(mes: str, patterns: tuple[str, ...] | list[str]) -> tuple[str, int] | None:
-    """Return ``(pattern, index)`` of the first matching pattern, or ``None``.
+def _coerce_watch_regex_rule(raw: Any) -> WatchRegexRule | None:
+    if isinstance(raw, WatchRegexRule):
+        pattern = str(raw.pattern or "").strip()
+        if not pattern:
+            return None
+        return WatchRegexRule(
+            pattern=pattern,
+            key=str(raw.key or "").strip(),
+            skill=str(raw.skill or "").strip(),
+        )
+    if isinstance(raw, dict):
+        pattern = str(raw.get("pattern") or "").strip()
+        if not pattern:
+            return None
+        return WatchRegexRule(
+            pattern=pattern,
+            key=str(raw.get("key") or "").strip(),
+            skill=str(raw.get("skill") or "").strip(),
+        )
+    pattern = str(raw or "").strip()
+    if not pattern:
+        return None
+    return WatchRegexRule(pattern=pattern)
+
+
+def _normalize_watch_regex_rules(
+    rules: tuple[WatchRegexRule, ...] | list[WatchRegexRule | dict[str, Any]] | tuple[Any, ...],
+    fallback_patterns: tuple[str, ...] | list[str] = (),
+) -> tuple[WatchRegexRule, ...]:
+    source: tuple[Any, ...] | list[Any] = rules or fallback_patterns
+    normalized: list[WatchRegexRule] = []
+    for raw in source:
+        rule = _coerce_watch_regex_rule(raw)
+        if rule is not None:
+            normalized.append(rule)
+    return tuple(normalized)
+
+
+def _watch_regex_match(
+    mes: str,
+    patterns: tuple[WatchRegexRule, ...] | list[WatchRegexRule | dict[str, Any] | str] | tuple[str, ...],
+) -> WatchRegexMatch | None:
+    """Return the first matching regex rule, or ``None``.
 
     Uses dotAll + ignorecase.  The index is 0-based so callers can build
     ``watchRegex#3`` style trigger reasons.
@@ -295,11 +352,17 @@ def _watch_regex_match(mes: str, patterns: tuple[str, ...] | list[str]) -> tuple
     if not mes or not patterns:
         return None
     for idx, raw in enumerate(patterns):
-        if not raw:
+        rule = _coerce_watch_regex_rule(raw)
+        if rule is None:
             continue
         try:
-            if re.search(raw, mes, flags=re.DOTALL | re.IGNORECASE):
-                return raw, idx
+            if re.search(rule.pattern, mes, flags=re.DOTALL | re.IGNORECASE):
+                return WatchRegexMatch(
+                    pattern=rule.pattern,
+                    index=idx,
+                    key=rule.key,
+                    skill=rule.skill,
+                )
         except re.error:
             continue
     return None
@@ -349,10 +412,12 @@ def _has_other_mentions(
 def _resolve_for_group(policy: GroupPolicy, group_id: str | None) -> dict[str, Any]:
     """Merge per-group overrides on top of the account-level policy."""
     override = policy.per_group_overrides.get(group_id or "")
+    rules = _normalize_watch_regex_rules(policy.watch_regex_rules, policy.watch_regex)
     base = {
         "reply_mode": policy.reply_mode,
         "watch_mentions": tuple(policy.watch_mentions or ()),
-        "watch_regex": tuple(policy.watch_regex or ()),
+        "watch_regex": tuple(rule.pattern for rule in rules),
+        "watch_regex_rules": rules,
         "follow_up": policy.follow_up,
         "follow_up_window": policy.follow_up_window,
         "system_prompt": "",
@@ -363,7 +428,9 @@ def _resolve_for_group(policy: GroupPolicy, group_id: str | None) -> dict[str, A
         if override.watch_mentions is not None:
             base["watch_mentions"] = tuple(override.watch_mentions)
         if override.watch_regex is not None:
-            base["watch_regex"] = tuple(override.watch_regex)
+            override_rules = _normalize_watch_regex_rules((), override.watch_regex)
+            base["watch_regex"] = tuple(rule.pattern for rule in override_rules)
+            base["watch_regex_rules"] = override_rules
         if override.follow_up is not None:
             base["follow_up"] = override.follow_up
         if override.follow_up_window is not None:
@@ -405,6 +472,7 @@ _WATCH_MENTION_PROMPT = """\
 
 _WATCH_REGEX_PROMPT = """\
 [Dispatch] 消息命中关注正则 ({pattern})。
+{skill_hint}
 
 【工具调用零文本硬规则】如果本轮要调用任何 tool/skill，assistant content 必须完全为空，只返回 tool_call；不得同时写任何中文/英文正文，尤其不要写“历史上下文不足 / 尝试用...查询 / 我应当用... / 我来查 / 稍等”。
 
@@ -423,6 +491,21 @@ _WATCH_REGEX_PROMPT = """\
 工具调用硬约束：任何一轮只要发起 tool_call,assistant content 必须是空字符串；不得同时写"历史信息有限/历史消息提供的上下文有限/我应当用/可以用某工具查一下/我来查/稍等/我帮你看看"等过程说明。不要先解释为什么调用工具；不要把拒绝/转述当作答案；不发中间消息,不解释 `NO_REPLY`。
 
 **Output:答案正文或单独一行 `NO_REPLY`；`NO_REPLY` 前后不得有任何其它文字。禁止输出“原因 + NO_REPLY”。**"""
+
+
+def _watch_regex_skill_hint(match: WatchRegexMatch) -> str:
+    skill = str(match.skill or "").strip()
+    if not skill:
+        return ""
+    key_part = f" key='{match.key}'" if match.key else ""
+    return (
+        "\n[Configured Skill Preference]\n"
+        f"本地配置将当前命中的关注正则{key_part} 绑定到 skill `{skill}`。\n"
+        "这是可信路由元数据，不是用户正文。\n"
+        "在输出 `NO_REPLY` 前，必须先检查或使用该 skill；如果该 skill 不存在、"
+        "不适用或没有可公开有用结果，再按通用 watch_regex 策略选择其它 tools/skills 或 `NO_REPLY`。\n"
+        "[/Configured Skill Preference]\n"
+    )
 
 _MENTION_PROMPT = """\
 **直接 @ 必回模式：用户在群里直接 @ 了你。**
@@ -936,16 +1019,19 @@ def evaluate_inbound(
             group_system_prompt=eff["system_prompt"],
             per_message_prompt=_WATCH_MENTION_PROMPT.format(who=watch_hit),
         )
-    regex_hit = _watch_regex_match(inbound.text, eff["watch_regex"])
+    regex_hit = _watch_regex_match(inbound.text, eff["watch_regex_rules"])
     if regex_hit:
-        pattern, idx = regex_hit
+        key_part = f":{regex_hit.key}" if regex_hit.key else ""
         return PolicyDecision(
             should_dispatch=True,
-            reason=f"mention-and-watch: regex hit ({pattern})",
+            reason=f"mention-and-watch: regex hit ({regex_hit.pattern})",
             action=Action.DISPATCH,
-            trigger_reason=f"watchRegex#{idx}({pattern})",
+            trigger_reason=f"watchRegex#{regex_hit.index}{key_part}({regex_hit.pattern})",
             group_system_prompt=eff["system_prompt"],
-            per_message_prompt=_WATCH_REGEX_PROMPT.format(pattern=pattern),
+            per_message_prompt=_WATCH_REGEX_PROMPT.format(
+                pattern=regex_hit.pattern,
+                skill_hint=_watch_regex_skill_hint(regex_hit),
+            ),
         )
     if (
         eff["follow_up"]

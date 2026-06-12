@@ -231,7 +231,10 @@ def _handling_strategy(case: dict[str, Any]) -> str:
     elif strategy == "watch_mention":
         prompt = _WATCH_MENTION_PROMPT.format(who=case.get("who") or "chengbo05")
     elif strategy == "watch_regex":
-        prompt = _WATCH_REGEX_PROMPT.format(pattern=case.get("pattern") or "test-pattern")
+        prompt = _WATCH_REGEX_PROMPT.format(
+            pattern=case.get("pattern") or "test-pattern",
+            skill_hint="",
+        )
     else:
         raise ValueError(f"unsupported strategy: {strategy}")
 

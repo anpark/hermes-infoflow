@@ -34,6 +34,8 @@ GROUP_TARGET_RE = re.compile(r"^(?:group:)?(\d+)$", re.IGNORECASE)
 MAX_PREVIEW_LENGTH = 100  # matches openclaw reply-dispatcher truncatePreview()
 WATCH_REGEX_ENV = "INFOFLOW_WATCH_REGEX"
 WATCH_REGEX_ENV_PREFIX = f"{WATCH_REGEX_ENV}_"
+REGEX_WATCH_ENV_PREFIX = "INFOFLOW_REGEX_WATCH_"
+REGEX_SKILL_ENV_PREFIX = "INFOFLOW_REGEX_SKILL_"
 OP_CHANNEL_ENV = "INFOFLOW_OP_CHANNEL"
 LEGACY_HOME_CHANNEL_ENV = "INFOFLOW_HOME_CHANNEL"
 ADMIN_USER_ENV = "INFOFLOW_ADMIN_USER"
@@ -46,33 +48,121 @@ SUPPORTED_CONNECTION_MODES = {"webhook", "websocket"}
 # ---------------------------------------------------------------------------
 
 
+def _env_suffix_sort_key(prefix: str, key: str) -> tuple[tuple[int, int | str], ...]:
+    suffix = key[len(prefix):]
+    parts: list[tuple[int, int | str]] = []
+    for part in re.split(r"(\d+)", suffix):
+        if not part:
+            continue
+        parts.append((0, int(part)) if part.isdigit() else (1, part))
+    return tuple(parts)
+
+
+def _valid_skill_name(value: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", value or ""))
+
+
+def _valid_regex_rule_key(value: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", value or ""))
+
+
 def _watch_regex_env_values() -> list[str]:
-    """Return regex patterns configured via INFOFLOW_WATCH_REGEX env vars."""
+    """Return legacy regex patterns configured via INFOFLOW_WATCH_REGEX vars."""
     patterns: list[str] = []
     direct = os.getenv(WATCH_REGEX_ENV, "").strip()
     if direct:
         patterns.append(direct)
-
-    def sort_key(key: str) -> tuple[tuple[int, int | str], ...]:
-        suffix = key[len(WATCH_REGEX_ENV_PREFIX):]
-        parts: list[tuple[int, int | str]] = []
-        for part in re.split(r"(\d+)", suffix):
-            if not part:
-                continue
-            parts.append((0, int(part)) if part.isdigit() else (1, part))
-        return tuple(parts)
-
     prefixed_keys = (
         key
         for key in os.environ
         if key.startswith(WATCH_REGEX_ENV_PREFIX)
         and len(key) > len(WATCH_REGEX_ENV_PREFIX)
     )
-    for key in sorted(prefixed_keys, key=sort_key):
+    for key in sorted(prefixed_keys, key=lambda k: _env_suffix_sort_key(WATCH_REGEX_ENV_PREFIX, k)):
         value = os.getenv(key, "").strip()
         if value:
             patterns.append(value)
     return patterns
+
+
+def _regex_watch_env_rules() -> list[dict[str, str]]:
+    """Return named regex watch rules from INFOFLOW_REGEX_WATCH_<KEY> env vars."""
+    watch_keys = (
+        key
+        for key in os.environ
+        if key.startswith(REGEX_WATCH_ENV_PREFIX)
+        and len(key) > len(REGEX_WATCH_ENV_PREFIX)
+    )
+    rules: list[dict[str, str]] = []
+    seen_keys: set[str] = set()
+    invalid_keys: set[str] = set()
+    for env_key in sorted(watch_keys, key=lambda k: _env_suffix_sort_key(REGEX_WATCH_ENV_PREFIX, k)):
+        suffix = env_key[len(REGEX_WATCH_ENV_PREFIX):]
+        pattern = os.getenv(env_key, "").strip()
+        if not suffix or not pattern:
+            continue
+        if not _valid_regex_rule_key(suffix):
+            logger.warning("Ignoring invalid %s suffix: %r", REGEX_WATCH_ENV_PREFIX, suffix)
+            invalid_keys.add(suffix)
+            continue
+        seen_keys.add(suffix)
+        skill = os.getenv(f"{REGEX_SKILL_ENV_PREFIX}{suffix}", "").strip()
+        if skill and not _valid_skill_name(skill):
+            logger.warning(
+                "Ignoring invalid %s%s value: %r",
+                REGEX_SKILL_ENV_PREFIX,
+                suffix,
+                skill,
+            )
+            skill = ""
+        rules.append({"key": suffix, "pattern": pattern, "skill": skill})
+
+    for env_key in sorted(os.environ):
+        if not env_key.startswith(REGEX_SKILL_ENV_PREFIX):
+            continue
+        suffix = env_key[len(REGEX_SKILL_ENV_PREFIX):]
+        if suffix in invalid_keys:
+            continue
+        if suffix and suffix not in seen_keys and os.getenv(env_key, "").strip():
+            logger.warning(
+                "Ignoring %s without matching %s%s",
+                env_key,
+                REGEX_WATCH_ENV_PREFIX,
+                suffix,
+            )
+    return rules
+
+
+def _coerce_regex_patterns(raw: Any) -> list[str]:
+    if isinstance(raw, (list, tuple)):
+        return [str(x).strip() for x in raw if str(x).strip()]
+    regex_text = str(raw or "").strip()
+    return [regex_text] if regex_text else []
+
+
+def _merge_regex_watch_rules(
+    named_rules: list[dict[str, str]],
+    legacy_patterns: list[str],
+) -> list[dict[str, str]]:
+    rules: list[dict[str, str]] = []
+    seen_patterns: set[str] = set()
+    for rule in named_rules:
+        pattern = str(rule.get("pattern") or "").strip()
+        if not pattern or pattern in seen_patterns:
+            continue
+        rules.append({
+            "key": str(rule.get("key") or "").strip(),
+            "pattern": pattern,
+            "skill": str(rule.get("skill") or "").strip(),
+        })
+        seen_patterns.add(pattern)
+    for pattern in legacy_patterns:
+        value = str(pattern or "").strip()
+        if not value or value in seen_patterns:
+            continue
+        rules.append({"key": "", "pattern": value, "skill": ""})
+        seen_patterns.add(value)
+    return rules
 
 
 def _normalize_infoflow_target(target_ref: str) -> str:
@@ -189,7 +279,8 @@ def _read_account_settings(config: Any) -> dict[str, Any]:
     extra: dict[str, Any] = {}
     if config is not None:
         extra = dict(getattr(config, "extra", None) or {})
-    watch_regex_env = _watch_regex_env_values()
+    named_regex_env_rules = _regex_watch_env_rules()
+    legacy_regex_env = _watch_regex_env_values()
 
     def pick(env_name: str, key: str, default: Any = None, *aliases: str) -> Any:
         env_val = os.getenv(env_name)
@@ -241,8 +332,11 @@ def _read_account_settings(config: Any) -> dict[str, Any]:
         "require_mention_raw": pick("INFOFLOW_REQUIRE_MENTION", "require_mention", "true"),
         "watch_mentions_raw": pick("INFOFLOW_WATCH_MENTIONS", "watch_mentions", ""),
         "watch_regex_raw": (
-            watch_regex_env if watch_regex_env else pick(WATCH_REGEX_ENV, "watch_regex", "")
+            legacy_regex_env
+            if named_regex_env_rules or legacy_regex_env
+            else pick(WATCH_REGEX_ENV, "watch_regex", "")
         ),
+        "watch_regex_rules_raw": named_regex_env_rules,
         "follow_up_raw": pick("INFOFLOW_FOLLOW_UP", "follow_up", "true"),
         "busy_text_steer_enabled_raw": pick(
             "INFOFLOW_BUSY_TEXT_STEER_ENABLED",
@@ -316,14 +410,17 @@ def _read_account_settings(config: Any) -> dict[str, Any]:
     else:
         settings["watch_mentions"] = [s.strip() for s in str(watch_raw).split(",") if s.strip()]
 
-    # Regex watch patterns: INFOFLOW_WATCH_REGEX is one pattern, and each
-    # INFOFLOW_WATCH_REGEX_* env var contributes one additional pattern.
+    # Regex watch patterns:
+    # - INFOFLOW_REGEX_WATCH_<KEY> optionally pairs with INFOFLOW_REGEX_SKILL_<KEY>
+    # - legacy INFOFLOW_WATCH_REGEX / INFOFLOW_WATCH_REGEX_* still work without skill hints
     regex_raw = settings.pop("watch_regex_raw") or ""
-    if isinstance(regex_raw, (list, tuple)):
-        settings["watch_regex"] = [str(x).strip() for x in regex_raw if str(x).strip()]
-    else:
-        regex_text = str(regex_raw).strip()
-        settings["watch_regex"] = [regex_text] if regex_text else []
+    named_rules = settings.pop("watch_regex_rules_raw") or []
+    regex_rules = _merge_regex_watch_rules(
+        [dict(x) for x in named_rules if isinstance(x, dict)],
+        _coerce_regex_patterns(regex_raw),
+    )
+    settings["watch_regex_rules"] = regex_rules
+    settings["watch_regex"] = [rule["pattern"] for rule in regex_rules]
 
     # Per-group overrides. Accept either an already-decoded dict (config.extra)
     # or a JSON string (env var).
@@ -416,9 +513,13 @@ def _env_enablement() -> dict | None:
         val = os.getenv(env_key, "").strip()
         if val:
             seed[settings_key] = val
-    watch_regex = _watch_regex_env_values()
-    if watch_regex:
-        seed["watch_regex"] = watch_regex
+    watch_regex_rules = _merge_regex_watch_rules(
+        _regex_watch_env_rules(),
+        _watch_regex_env_values(),
+    )
+    if watch_regex_rules:
+        seed["watch_regex_rules"] = watch_regex_rules
+        seed["watch_regex"] = [rule["pattern"] for rule in watch_regex_rules]
     home = infoflow_home_channel_from_env()
     if home:
         seed["home_channel"] = home

@@ -79,7 +79,7 @@ CASES: list[Case] = [
     # ③ _WATCH_REGEX_PROMPT
     Case(
         "watch-regex-knowable",
-        _WATCH_REGEX_PROMPT.format(pattern="咖啡"),
+        _WATCH_REGEX_PROMPT.format(pattern="咖啡", skill_hint=""),
         "咖啡因的英文是什么",
         "reply",
         "公开常识(英文翻译),GLM 应能直接答出 caffeine",

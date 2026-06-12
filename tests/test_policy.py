@@ -205,6 +205,39 @@ def test_mention_and_watch_regex_hit() -> None:
     # NO_REPLY directive now lives in per_message_prompt (injected as user
     # message prefix), not in the channel-level group_system_prompt.
     assert "NO_REPLY" in d.per_message_prompt
+    assert "Configured Skill Preference" not in d.per_message_prompt
+
+
+def test_mention_and_watch_regex_hit_with_skill_hint() -> None:
+    p = policy.GroupPolicy(
+        reply_mode="mention-and-watch",
+        watch_regex_rules=(
+            policy.WatchRegexRule(
+                key="C1",
+                pattern=r"iphone.*crash",
+                skill="map-stability-analysis",
+            ),
+        ),
+    )
+    msg = _group(was_mentioned=False, text="iphone crash 异常")
+    d = policy.evaluate_inbound(msg, p)
+    assert d.should_dispatch is True
+    assert d.trigger_reason == r"watchRegex#0:C1(iphone.*crash)"
+    assert "Configured Skill Preference" in d.per_message_prompt
+    assert "key='C1'" in d.per_message_prompt
+    assert "`map-stability-analysis`" in d.per_message_prompt
+
+
+def test_mention_and_watch_regex_hit_without_skill_hint() -> None:
+    p = policy.GroupPolicy(
+        reply_mode="mention-and-watch",
+        watch_regex_rules=(policy.WatchRegexRule(key="C1", pattern=r"iphone.*crash"),),
+    )
+    msg = _group(was_mentioned=False, text="iphone crash 异常")
+    d = policy.evaluate_inbound(msg, p)
+    assert d.should_dispatch is True
+    assert d.trigger_reason == r"watchRegex#0:C1(iphone.*crash)"
+    assert "Configured Skill Preference" not in d.per_message_prompt
 
 
 def test_mention_and_watch_regex_no_hit_records() -> None:

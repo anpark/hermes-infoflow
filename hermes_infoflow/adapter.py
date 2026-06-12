@@ -646,6 +646,7 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
             require_mention=self._settings["require_mention"],
             watch_mentions=tuple(self._settings["watch_mentions"]),
             watch_regex=tuple(self._settings["watch_regex"]),
+            watch_regex_rules=tuple(self._settings.get("watch_regex_rules") or ()),
             follow_up=self._settings["follow_up"],
             follow_up_window=self._settings["follow_up_window"],
             per_group_overrides=per_group,

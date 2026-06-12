@@ -284,7 +284,12 @@ def _cfg(extra: dict | None = None):
 
 def _clear_watch_regex_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for key in list(os.environ):
-        if key == "INFOFLOW_WATCH_REGEX" or key.startswith("INFOFLOW_WATCH_REGEX_"):
+        if (
+            key == "INFOFLOW_WATCH_REGEX"
+            or key.startswith("INFOFLOW_WATCH_REGEX_")
+            or key.startswith("INFOFLOW_REGEX_WATCH_")
+            or key.startswith("INFOFLOW_REGEX_SKILL_")
+        ):
             monkeypatch.delenv(key, raising=False)
 
 
@@ -420,6 +425,28 @@ def test_env_enablement_includes_prefixed_watch_regex(monkeypatch) -> None:
 
     assert seed is not None
     assert seed["watch_regex"] == ["\\bdeploy\\b", "iphone|ios|crash"]
+
+
+def test_env_enablement_includes_named_watch_regex_skill_rules(monkeypatch) -> None:
+    _clear_watch_regex_env(monkeypatch)
+    monkeypatch.setenv("INFOFLOW_APP_KEY", "k")
+    monkeypatch.setenv("INFOFLOW_APP_SECRET", "s")
+    monkeypatch.setenv("INFOFLOW_CHECK_TOKEN", "tok")
+    monkeypatch.setenv("INFOFLOW_ENCODING_AES_KEY", "aes")
+    monkeypatch.setenv("INFOFLOW_REGEX_WATCH_C1", "iphone.*crash")
+    monkeypatch.setenv("INFOFLOW_REGEX_SKILL_C1", "map-stability-analysis")
+
+    seed = _env_enablement()
+
+    assert seed is not None
+    assert seed["watch_regex"] == ["iphone.*crash"]
+    assert seed["watch_regex_rules"] == [
+        {
+            "key": "C1",
+            "pattern": "iphone.*crash",
+            "skill": "map-stability-analysis",
+        }
+    ]
 
 
 def test_parse_infoflow_op_channel_normalizes_dm_and_group() -> None:
@@ -561,6 +588,80 @@ def test_read_settings_parses_single_watch_regex_from_env(monkeypatch) -> None:
     monkeypatch.setenv("INFOFLOW_WATCH_REGEX", "\\bdeploy\\b")
     s = _read_account_settings(_cfg())
     assert s["watch_regex"] == ["\\bdeploy\\b"]
+    assert s["watch_regex_rules"] == [
+        {"key": "", "pattern": "\\bdeploy\\b", "skill": ""}
+    ]
+
+
+def test_read_settings_parses_named_regex_skill_hint(monkeypatch) -> None:
+    _clear_watch_regex_env(monkeypatch)
+    monkeypatch.setenv("INFOFLOW_REGEX_WATCH_C1", "iphone.*crash")
+    monkeypatch.setenv("INFOFLOW_REGEX_SKILL_C1", "map-stability-analysis")
+
+    s = _read_account_settings(_cfg())
+
+    assert s["watch_regex"] == ["iphone.*crash"]
+    assert s["watch_regex_rules"] == [
+        {
+            "key": "C1",
+            "pattern": "iphone.*crash",
+            "skill": "map-stability-analysis",
+        }
+    ]
+
+
+def test_read_settings_named_regex_dedupes_legacy_pattern(monkeypatch) -> None:
+    _clear_watch_regex_env(monkeypatch)
+    monkeypatch.setenv("INFOFLOW_REGEX_WATCH_C1", "iphone.*crash")
+    monkeypatch.setenv("INFOFLOW_REGEX_SKILL_C1", "map-stability-analysis")
+    monkeypatch.setenv("INFOFLOW_WATCH_REGEX", "iphone.*crash")
+
+    s = _read_account_settings(_cfg())
+
+    assert s["watch_regex"] == ["iphone.*crash"]
+    assert s["watch_regex_rules"] == [
+        {
+            "key": "C1",
+            "pattern": "iphone.*crash",
+            "skill": "map-stability-analysis",
+        }
+    ]
+
+
+def test_read_settings_ignores_invalid_named_regex_skill(monkeypatch, caplog) -> None:
+    _clear_watch_regex_env(monkeypatch)
+    monkeypatch.setenv("INFOFLOW_REGEX_WATCH_C1", "iphone.*crash")
+    monkeypatch.setenv("INFOFLOW_REGEX_SKILL_C1", "bad skill\nname")
+
+    s = _read_account_settings(_cfg())
+
+    assert s["watch_regex_rules"] == [
+        {"key": "C1", "pattern": "iphone.*crash", "skill": ""}
+    ]
+    assert "Ignoring invalid INFOFLOW_REGEX_SKILL_C1" in caplog.text
+
+
+def test_read_settings_ignores_invalid_named_regex_key(monkeypatch, caplog) -> None:
+    _clear_watch_regex_env(monkeypatch)
+    monkeypatch.setenv("INFOFLOW_REGEX_WATCH_BAD KEY", "iphone.*crash")
+    monkeypatch.setenv("INFOFLOW_REGEX_SKILL_BAD KEY", "map-stability-analysis")
+
+    s = _read_account_settings(_cfg())
+
+    assert s["watch_regex"] == []
+    assert s["watch_regex_rules"] == []
+    assert "Ignoring invalid INFOFLOW_REGEX_WATCH_ suffix: 'BAD KEY'" in caplog.text
+    assert "without matching INFOFLOW_REGEX_WATCH_BAD KEY" not in caplog.text
+
+
+def test_read_settings_warns_orphan_named_regex_skill(monkeypatch, caplog) -> None:
+    _clear_watch_regex_env(monkeypatch)
+    monkeypatch.setenv("INFOFLOW_REGEX_SKILL_C1", "map-stability-analysis")
+
+    s = _read_account_settings(_cfg())
+
+    assert s["watch_regex"] == []
+    assert "without matching INFOFLOW_REGEX_WATCH_C1" in caplog.text
 
 
 def test_read_settings_parses_prefixed_watch_regex_env(monkeypatch) -> None:

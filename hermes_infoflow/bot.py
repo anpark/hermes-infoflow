@@ -969,8 +969,8 @@ class Bot:
             return ""
         try:
             eff = _resolve_for_group(self._policy, msg.group_id)
-            hit = _watch_regex_match(msg.text or "", eff.get("watch_regex") or ())
-            return hit[0] if hit else ""
+            hit = _watch_regex_match(msg.text or "", eff.get("watch_regex_rules") or ())
+            return hit.pattern if hit else ""
         except Exception:
             return ""
 

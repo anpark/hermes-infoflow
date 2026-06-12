@@ -124,7 +124,7 @@ optional_env:
     prompt: "Watch mentions (single or comma-separated)"
     password: false
   - name: INFOFLOW_WATCH_REGEX
-    description: "Single regex triggering the bot when matched in message text. Add more patterns with INFOFLOW_WATCH_REGEX_* env vars."
+    description: "Legacy single regex triggering the bot when matched in message text. Add more legacy patterns with INFOFLOW_WATCH_REGEX_* env vars. Prefer named rules with INFOFLOW_REGEX_WATCH_<KEY> and optional INFOFLOW_REGEX_SKILL_<KEY> for skill hints."
     prompt: "Watch regex pattern"
     password: false
   - name: INFOFLOW_FOLLOW_UP
