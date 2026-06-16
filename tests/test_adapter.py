@@ -2704,6 +2704,9 @@ def test_send_records_bot_reply_for_follow_up(configured_env, monkeypatch) -> No
         "��� Non-retryable error (HTTP 405) — trying fallback...",
         "❌ Billing or credits exhausted — quota exceeded",
         "❌ Rate limited after 3 retries — too many requests",
+        "API call failed after 3 retries: Provider returned an empty stream.",
+        "@anjianwei01 API call failed after 3 retries: Provider returned an empty stream.",
+        "❌ API call failed after 3 retries: Provider returned an empty stream.",
         "❌ API failed after 3 retries — upstream unavailable",
         "❌ Max retries (3) exceeded for invalid responses. Giving up.",
         "❌ Non-retryable error (HTTP 401): unauthorized",
@@ -2766,6 +2769,47 @@ def test_group_runtime_status_is_suppressed_and_broadcast_to_ops(
     )
 
 
+def test_group_api_call_failed_reply_is_redirected_to_ops_not_group(
+    configured_env, monkeypatch
+) -> None:
+    monkeypatch.setenv("INFOFLOW_ADMIN_USER", "admin01")
+    monkeypatch.setenv("INFOFLOW_OP_CHANNEL", "ops01")
+    adapter = InfoflowAdapter(_make_config())
+    adapter._bot.send_message = AsyncMock(
+        return_value=SentResult(success=True, message_id="OP-1")
+    )
+    adapter._push_infoflow_event = MagicMock()
+
+    async def _go():
+        return await adapter.send(
+            "group:42",
+            (
+                "API call failed after 3 retries: Provider returned an empty stream "
+                "with no finish_reason."
+            ),
+            reply_to="1868137763810953840",
+        )
+
+    result = asyncio.run(_go())
+
+    assert result.success is True
+    adapter._bot.send_message.assert_awaited_once()
+    op_kwargs = adapter._bot.send_message.await_args.kwargs
+    assert op_kwargs["dm_user_id"] == "ops01"
+    assert op_kwargs["group_id"] is None
+    assert "group:42" in op_kwargs["text"]
+    assert "API call failed after 3 retries" in op_kwargs["text"]
+    assert "reply_to" not in op_kwargs
+
+    pushed = [call.kwargs for call in adapter._push_infoflow_event.call_args_list]
+    assert any(
+        item["chat_id"] == "group:42"
+        and item["extra"]["suppressed_group_status"] is True
+        and item["extra"]["redirected_to_ops"] is True
+        for item in pushed
+    )
+
+
 @pytest.mark.parametrize(
     "content",
     [
@@ -2808,6 +2852,45 @@ def test_group_interim_history_narration_is_suppressed(
     )
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Now let me get the diff files from the iCode review before writing the CR conclusion.",
+        "Now let me analyze bmapad-ios review myself based on the diff files and comments.",
+        "Codex is still running (208s). Let me kill it and perform analysis directly based on diffs.",
+        "Now I have enough context. Let me compose the final CR report.",
+        "Good — now I have the diff summary. Let me write the final review report.",
+    ],
+)
+def test_group_english_process_narration_is_suppressed(
+    configured_env, monkeypatch, content
+) -> None:
+    monkeypatch.setenv("INFOFLOW_OP_CHANNEL", "ops01")
+    adapter = InfoflowAdapter(_make_config())
+    adapter._bot.send_message = AsyncMock()
+    adapter._push_infoflow_event = MagicMock()
+
+    adapter._serverapi.send_group_message_intent = AsyncMock(
+        side_effect=AssertionError("group send must not be called for process narration")
+    )
+
+    async def _go():
+        return await adapter.send("group:42", content)
+
+    result = asyncio.run(_go())
+
+    assert result.success is True
+    adapter._bot.send_message.assert_not_awaited()
+    pushed = [call.kwargs for call in adapter._push_infoflow_event.call_args_list]
+    assert any(
+        item["chat_id"] == "group:42"
+        and item["extra"]["suppressed_group_interim_narration"] is True
+        and item["extra"]["interim_narration_kind"] == "english_process_preface"
+        and item["extra"]["preview"] == content[:200]
+        for item in pushed
+    )
+
+
 def test_group_history_based_final_answer_is_not_suppressed(
     configured_env, monkeypatch
 ) -> None:
@@ -2842,6 +2925,9 @@ def test_group_history_based_final_answer_is_not_suppressed(
         "Auxiliary services can fail independently.",
         "Iteration budget exhausted is a phrase in our incident notes.",
         "@zhujingsi Non-retryable error handling should be documented clearly.",
+        "Working agreements for CR review should be documented.",
+        "Codex quality notes should be documented.",
+        "Now the final conclusion is: no blocking issue.",
     ],
 )
 def test_group_plain_text_status_words_are_not_suppressed(
@@ -2962,6 +3048,46 @@ def test_group_runtime_status_does_not_fallback_to_admin(
         item["chat_id"] == "group:42"
         and item["extra"]["suppressed_group_status"] is True
         and item["extra"]["redirected_to_ops"] is False
+        for item in pushed
+    )
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "⏳ Working — 3 min — iteration 12/90, execute_code",
+        "⏳ Working... (3 min elapsed — iteration 4/90, running: vision_analyze)",
+        "[Background process proc_123 finished with exit code 0]",
+        "[IMPORTANT: Background process proc_123 completed. Review logs before continuing.]",
+    ],
+)
+def test_group_progress_and_background_status_is_tracker_only(
+    configured_env, monkeypatch, content
+) -> None:
+    monkeypatch.setenv("INFOFLOW_ADMIN_USER", "admin01")
+    monkeypatch.setenv("INFOFLOW_OP_CHANNEL", "ops01")
+    adapter = InfoflowAdapter(_make_config())
+    adapter._bot.send_message = AsyncMock()
+    adapter._push_infoflow_event = MagicMock()
+
+    adapter._serverapi.send_group_message_intent = AsyncMock(
+        side_effect=AssertionError("group send must not be called for progress status")
+    )
+
+    async def _go():
+        return await adapter.send("group:4507088", content)
+
+    result = asyncio.run(_go())
+
+    assert result.success is True
+    adapter._bot.send_message.assert_not_awaited()
+    pushed = [call.kwargs for call in adapter._push_infoflow_event.call_args_list]
+    assert any(
+        item["chat_id"] == "group:4507088"
+        and item["extra"]["suppressed_group_status"] is True
+        and item["extra"]["sessiontracker_only_status"] is True
+        and item["extra"]["redirected_to_ops"] is False
+        and item["extra"]["preview"] == content[:200]
         for item in pushed
     )
 

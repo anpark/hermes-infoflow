@@ -80,6 +80,7 @@ _GROUP_STATUS_REDIRECT_PREFIXES = (
     "Gateway restarting",
     "❌ Billing or credits exhausted",
     "❌ Rate limited after",
+    "❌ API call failed",
     "❌ API failed after",
     "❌ Max retries",
     "❌ Non-retryable error",
@@ -121,6 +122,7 @@ _GROUP_STATUS_REDIRECT_TEXT_PREFIXES = (
     "Empty response from model",
     "Model returning empty responses",
     "Auxiliary",
+    "API call failed",
     "API failed after",
     "Ollama runtime context is too small",
     "Primary model failed",
@@ -130,10 +132,16 @@ _GROUP_STATUS_REDIRECT_TEXT_PREFIXES = (
     "Iteration budget exhausted",
     "Response formatting failed",
 )
+_GROUP_STATUS_REDIRECT_ALWAYS_TEXT_PREFIXES = (
+    "API call failed",
+)
 _GROUP_STATUS_REDIRECT_PATTERNS = (
     re.compile(r"^⚠️\s+.+\sstream\s+drop\b", re.IGNORECASE),
 )
 _GROUP_STATUS_TRACKER_ONLY_PREFIXES = (
+    "⏳ Working",
+    "[Background process",
+    "[IMPORTANT: Background process",
     "📦 Preflight compression:",
     "🗜️ Compacting context",
     "⚠ Compression summary failed:",
@@ -149,6 +157,10 @@ _GROUP_STATUS_TRACKER_ONLY_PREFIXES = (
     "🗜️ Compressed",
 )
 _GROUP_STATUS_TRACKER_ONLY_TEXT_PREFIXES = (
+    "Working —",
+    "Working...",
+    "Background process",
+    "IMPORTANT: Background process",
     "Preflight compression:",
     "Compacting context",
     "Compression summary failed:",
@@ -162,8 +174,8 @@ _GROUP_STATUS_TRACKER_ONLY_TEXT_PREFIXES = (
     "Context too large",
     "Compressed",
 )
-_GROUP_INTERIM_NARRATION_MAX_CHARS = 180
-_GROUP_INTERIM_NARRATION_PATTERNS = (
+_GROUP_INTERIM_NARRATION_MAX_CHARS = 1200
+_GROUP_INTERIM_HISTORY_PATTERNS = (
     re.compile(
         r"^(?:我先|我先去|我来先|让我先|先)"
         r"(?:读|看|查|查询|拉取|获取|翻看|翻一下)"
@@ -174,6 +186,29 @@ _GROUP_INTERIM_NARRATION_PATTERNS = (
         r"^(?:历史信息有限|当前(?:消息|上下文)|从(?:群历史|历史消息|上下文)看)"
         r".{0,120}(?:可以用|需要用|调用|用).{0,40}(?:查一下|查询|看看|查)"
         r".{0,40}$"
+    ),
+)
+_GROUP_INTERIM_ENGLISH_PROCESS_PATTERNS = (
+    re.compile(
+        r"^(?:nowletme|letmenow|letme|i(?:'|’)?ll|iwill)"
+        r"(?:get|fetch|check|inspect|read|look|analy[sz]e|verify|run|launch|wait|proceed|compose|write|prepare)"
+        r".{0,1000}$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^nowihave.{0,300}(?:letme|iwill|i(?:'|’)?ll)"
+        r"(?:compose|write|send|prepare|run|launch).{0,500}$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^(?:good|great|ok|okay|done).{0,300}(?:nowihave|letme|iwill|i(?:'|’)?ll)"
+        r".{0,300}(?:compose|write|send|prepare|run|launch).{0,300}$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^codex(?:isstillrunning|isrunning|stillrunning|produced|returned|started|finished|completed|failed|timedout)"
+        r".{0,1000}$",
+        re.IGNORECASE,
     ),
 )
 _MEDIA_IMAGE_MARKER_RE = re.compile(r"<media:image(?:\s|>)")
@@ -221,6 +256,9 @@ def _group_status_redirect_kind(text: str) -> str:
     for prefix in _GROUP_STATUS_REDIRECT_PREFIXES:
         if t.startswith(prefix):
             return prefix
+    for prefix in _GROUP_STATUS_REDIRECT_ALWAYS_TEXT_PREFIXES:
+        if t.startswith(prefix):
+            return prefix
     normalized = _drop_leading_status_glyphs(t)
     if normalized != t:
         for prefix in _GROUP_STATUS_REDIRECT_TEXT_PREFIXES:
@@ -229,6 +267,9 @@ def _group_status_redirect_kind(text: str) -> str:
     mentionless = _drop_leading_at_mentions(t)
     if mentionless != t:
         for prefix in _GROUP_STATUS_REDIRECT_PREFIXES:
+            if mentionless.startswith(prefix):
+                return prefix
+        for prefix in _GROUP_STATUS_REDIRECT_ALWAYS_TEXT_PREFIXES:
             if mentionless.startswith(prefix):
                 return prefix
         normalized_mentionless = _drop_leading_status_glyphs(mentionless)
@@ -275,9 +316,12 @@ def _group_interim_narration_kind(text: str) -> str:
     if not t or len(t) > _GROUP_INTERIM_NARRATION_MAX_CHARS or "\n" in t:
         return ""
     compact = re.sub(r"\s+", "", t)
-    for pattern in _GROUP_INTERIM_NARRATION_PATTERNS:
+    for pattern in _GROUP_INTERIM_HISTORY_PATTERNS:
         if pattern.search(compact):
             return "history_context_preface"
+    for pattern in _GROUP_INTERIM_ENGLISH_PROCESS_PATTERNS:
+        if pattern.search(compact):
+            return "english_process_preface"
     return ""
 
 
@@ -577,6 +621,8 @@ class InfoflowAdapter(BasePlatformAdapter):  # type: ignore[misc]
       into ``bot.send_message()``/``bot.send_image()``/``bot.recall_message()``
     * Run the configured inbound receive transport
     """
+
+    SUPPORTS_MESSAGE_EDITING = False
 
     def __init__(self, config: Any, **kwargs):
         if not HERMES_AVAILABLE:
