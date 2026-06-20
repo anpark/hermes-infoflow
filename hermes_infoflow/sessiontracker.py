@@ -70,8 +70,8 @@ SUPPORTED_CHAT_TYPES = GROUP_CHAT_TYPES | DM_CHAT_TYPES
 _PROGRESS_LINE_RE = re.compile(r"^[┊\s]*[🔍⚙️💻🌐📁📝🧠✨]")
 
 # OAuth code is one-time; cache successful code -> user_id for resolve polling / SSE.
-_CODE_USER_CACHE_TTL_SECONDS = int(os.getenv("HERMES_INFOFLOW_CODE_CACHE_TTL", "86400"))
-_CODE_USER_CACHE_MAX = int(os.getenv("HERMES_INFOFLOW_CODE_CACHE_MAX", "1024"))
+_CODE_USER_CACHE_TTL_SECONDS = int(os.getenv("HERMES_INFOFLOW_CODE_CACHE_TTL", "86400")) if os.getenv("HERMES_INFOFLOW_CODE_CACHE_TTL", "").isdigit() else 86400
+_CODE_USER_CACHE_MAX = int(os.getenv("HERMES_INFOFLOW_CODE_CACHE_MAX", "1024")) if os.getenv("HERMES_INFOFLOW_CODE_CACHE_MAX", "").isdigit() else 1024
 _code_user_cache: dict[str, tuple[str, float]] = {}
 _code_user_cache_lock = asyncio.Lock()
 
@@ -297,8 +297,10 @@ async def resolve_target(
         else:
             meta = tracker.get_meta(tracker_session_id)
             hermes_meta = tracker.get_meta(hermes_session_id) if hermes_session_id else None
-            if hermes_meta is not None and hermes_meta.status == "active":
-                status = "active"
+            if hermes_meta is not None:
+                # Pass through hermes_meta.status (active | idle | ended) so the
+                # frontend 'ended' branch (e.g. empty-hint for ended sessions) works.
+                status = hermes_meta.status or "idle"
             elif not hermes_session_id:
                 status = "waiting"
             elif meta is not None:
@@ -595,11 +597,15 @@ async def _require_terminal_admin_user_id(
 
 
 _SESSIONTRACKER_CSS = """
+@font-face { font-family: 'MesloLGM NF'; src: url('/webhook/infoflow/sessiontracker/static/fonts/meslo/meslolgm-nf-regular.woff2') format('woff2'); font-weight: 400; font-style: normal; font-display: swap; }
+@font-face { font-family: 'MesloLGM NF'; src: url('/webhook/infoflow/sessiontracker/static/fonts/meslo/meslolgm-nf-bold.woff2') format('woff2'); font-weight: 700; font-style: normal; font-display: swap; }
+@font-face { font-family: 'MesloLGM NF'; src: url('/webhook/infoflow/sessiontracker/static/fonts/meslo/meslolgm-nf-italic.woff2') format('woff2'); font-weight: 400; font-style: italic; font-display: swap; }
+@font-face { font-family: 'MesloLGM NF'; src: url('/webhook/infoflow/sessiontracker/static/fonts/meslo/meslolgm-nf-bold-italic.woff2') format('woff2'); font-weight: 700; font-style: italic; font-display: swap; }
 :root { --bg: #0c0c0c; --text: #d4d4d4; --muted: #6a737d; --accent: #58a6ff;
   --user: #f0b67f; --hermes-border: #3d5a80; --ok: #3dd68c; --interim: #b48ead; }
 * { box-sizing: border-box; }
 html, body { height: 100%; margin: 0; }
-body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--bg);
+body { font-family: 'Microsoft YaHei', '微软雅黑', sans-serif; background: var(--bg);
   color: var(--text); font-size: 13px; line-height: 1.55; }
 header { padding: 10px 14px; border-bottom: 1px solid #222; background: #111; flex-shrink: 0; }
 h1 { margin: 0; font-size: 14px; font-weight: 600; }
@@ -655,11 +661,127 @@ body.layout-col { display: flex; flex-direction: column; height: 100vh; }
   color: #d4d4d4; padding: 0 9px; font: inherit; cursor: pointer; }
 .terminal-button.icon { width: 28px; padding: 0; font-size: 14px; line-height: 1; }
 .terminal-button:disabled { opacity: 0.45; cursor: default; }
-#xterm-host { flex: 1; min-height: 0; padding: 8px; }
+#xterm-host { flex: 1; min-height: 0; padding: 8px; position: relative; }
 #terminal-fallback { flex: 1; min-height: 0; margin: 0; padding: 10px 12px; overflow: auto;
   background: #050505; color: #d4d4d4; white-space: pre-wrap; outline: none; }
 #terminal-fallback.hidden, #xterm-host.hidden { display: none; }
+#terminal-vkeys { display: flex; align-items: center; gap: 4px; min-height: 36px; padding: 5px 8px;
+  border-top: 1px solid #222; background: #101010; flex-shrink: 0; flex-wrap: wrap; }
+.vkey { height: 30px; min-width: 36px; border: 1px solid #30363d; border-radius: 4px;
+  background: #161b22; color: #d4d4d4; padding: 0 6px; font-size: 12px; cursor: pointer;
+  -webkit-user-select: none; user-select: none; touch-action: manipulation; }
+.vkey:active { background: #264f78; }
+.vkey.modifier { border-color: #58a6ff; color: #58a6ff; }
+.vkey.modifier.active { background: #1f3a5f; border-color: #79c0ff; color: #79c0ff; }
+.vkey.wide { min-width: 48px; }
 .xterm { height: 100%; }
+/* xterm viewport: smooth touch scrolling on mobile */
+#xterm-host .xterm-viewport {
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  touch-action: pan-y;
+  /* Hide the native scrollbar — we draw a custom one below */
+  scrollbar-width: none; /* Firefox */
+  -ms-overflow-style: none; /* IE10+ */
+}
+/* Hide native xterm scrollbar (we use overlay) */
+#xterm-host .xterm-viewport::-webkit-scrollbar { width: 0; height: 0; display: none; }
+#xterm-host .xterm-viewport { scrollbar-width: none; -ms-overflow-style: none; }
+/* Overlay scrollbar — works in both viewport-overflow and tmux modes */
+#term-scrollbar {
+  position: absolute; top: 0; right: 0; bottom: 0;
+  width: 16px; z-index: 20; pointer-events: none;
+}
+#term-scrollbar-thumb {
+  position: absolute; right: 2px; width: 6px;
+  border-radius: 3px; min-height: 30px;
+  background: rgba(160,170,190,0.45);
+  pointer-events: auto; cursor: pointer; touch-action: none;
+}
+#term-scrollbar-thumb:hover, #term-scrollbar-thumb.active {
+  background: rgba(140,155,190,0.8);
+}
+#terminal-ctx-menu {
+  position: fixed; z-index: 10000;
+  background: #1e2030; border: 1px solid #444c6a; border-radius: 8px;
+  padding: 4px; min-width: 200px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.7);
+  -webkit-backdrop-filter: none; backdrop-filter: none;
+  opacity: 1;
+}
+#terminal-ctx-menu button {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  background: none; border: none; cursor: pointer; color: #e0e0e0;
+  font-family: 'Microsoft YaHei', '微软雅黑', sans-serif; font-size: 13px;
+  padding: 9px 12px; border-radius: 4px; text-align: left;
+}
+#terminal-ctx-menu button:hover, #terminal-ctx-menu button:active { background: #2a3558; }
+#terminal-ctx-menu .ctx-kbd { margin-left: auto; color: #888; font-size: 10px; }
+#terminal-ctx-menu .ctx-divider { height: 1px; background: #3a3a4a; margin: 3px 6px; }
+/* Paste-trap: hidden off-screen */
+#terminal-paste-trap {
+  position: fixed; top: -9999px; left: -9999px;
+  width: 1px; height: 1px; opacity: 0; pointer-events: none;
+}
+/* Mobile input trap: overlays xterm for keyboard capture on mobile */
+.mobile-input-trap {
+  display: none; position: absolute; left: 8px; bottom: 48px;
+  width: 2px; height: 24px; opacity: 0.01; font-size: 16px;
+  resize: none; border: none; outline: none; padding: 0;
+  background: transparent; color: transparent; caret-color: transparent;
+  z-index: 6; overflow: hidden; -webkit-user-select: text;
+}
+.mobile-terminal .mobile-input-trap { display: block; }
+/* Paste-awaiting mode: enlarge + make visible so user can long-press → system Paste */
+.mobile-input-trap.paste-ready {
+  width: 80% !important; height: 48px !important;
+  left: 10% !important; bottom: 56px !important;
+  opacity: 1 !important; color: #d4d4d4 !important;
+  caret-color: #58a6ff !important; background: #161b22 !important;
+  border: 1px solid #444c6a !important; border-radius: 6px;
+  padding: 8px 10px !important; font-size: 15px;
+  z-index: 1002 !important;
+}
+.mobile-input-trap.paste-ready::placeholder { color: #6a7080; }
+/* When keyboard is open on mobile, float vkeys above keyboard using visualViewport */
+.mobile-terminal.kbd-open #terminal-vkeys {
+  position: fixed; left: 0; right: 0;
+  z-index: 1001; border-top: 2px solid #333;
+  padding-bottom: max(5px, env(safe-area-inset-bottom));
+}
+/* JS will set bottom/top dynamically based on visualViewport */
+/* Mobile copy FAB */
+#terminal-mobile-copy-fab {
+  position: absolute; right: 10px; top: 48px; z-index: 7;
+  height: 32px; padding: 0 10px;
+  border: 1px solid #30363d; border-radius: 4px;
+  background: #161b22; color: #d4d4d4; font-size: 12px;
+  cursor: pointer; box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+}
+/* Mobile copy mode overlay */
+#terminal-mobile-copy-layer {
+  display: none; position: absolute; inset: 0; z-index: 8;
+  flex-direction: column; background: #050505; color: #d4d4d4;
+  border: 1px solid #30363d;
+}
+.tmc-toolbar {
+  flex: 0 0 auto; display: flex; justify-content: flex-end; gap: 8px;
+  padding: 8px; border-bottom: 1px solid #222; background: #101010;
+}
+.tmc-action {
+  height: 32px; padding: 0 10px; border: 1px solid #30363d; border-radius: 4px;
+  background: #161b22; color: #d4d4d4; font-size: 12px; cursor: pointer;
+}
+.tmc-action:active { background: #264f78; }
+#terminal-mobile-copy-layer pre {
+  flex: 1 1 auto; min-height: 0; margin: 0; padding: 10px;
+  font-family: "'MesloLGM NF', Menlo, Consolas, 'Courier New', monospace";
+  font-size: 12px; line-height: 1.5; white-space: pre-wrap;
+  overflow-wrap: anywhere; overflow: auto;
+  user-select: text; -webkit-user-select: text;
+  -webkit-touch-callout: default;
+  touch-action: auto; cursor: text;
+}
 """
 
 _SESSIONTRACKER_HTML = """<!DOCTYPE html>
@@ -693,10 +815,58 @@ _SESSIONTRACKER_HTML = """<!DOCTYPE html>
     <button type="button" id="terminal-new" class="terminal-button">New</button>
     <button type="button" id="terminal-disconnect" class="terminal-button icon" title="Close terminal" aria-label="Close terminal" disabled>⏻</button>
   </div>
-  <div id="xterm-host"></div>
+  <div id="xterm-host" style="position:relative">
+    <div id="term-scrollbar"><div id="term-scrollbar-thumb"></div></div>
+    </div>
+  </div>
   <pre id="terminal-fallback" class="hidden" tabindex="0"></pre>
+
+  <!-- Mobile input trap: independent textarea for mobile keyboard capture -->
+  <textarea id="mobile-input-trap" class="mobile-input-trap"
+    autocomplete="off" autocapitalize="none" autocorrect="off"
+    spellcheck="false" inputmode="text" enterkeyhint="enter"></textarea>
+
+  <!-- Mobile copy button (FAB, shown when text selected in xterm) -->
+  <button type="button" id="terminal-mobile-copy-fab" title="Copy selected text" style="display:none;">📋 Copy</button>
+
+  <!-- Mobile copy mode overlay -->
+  <div id="terminal-mobile-copy-layer">
+    <div class="tmc-toolbar">
+      <span style="font-size:11px;color:#888;flex:1;">长按选择文本</span>
+      <button type="button" class="tmc-action" onclick="copyMobileSelection()">📋 Copy</button>
+      <button type="button" class="tmc-action" onclick="selectAllMobileCopy()">selectAll</button>
+      <button type="button" class="tmc-action" onclick="closeMobileCopyMode()">✕ Close</button>
+    </div>
+    <pre tabindex="0"></pre>
+  </div>
+
+  <div id="terminal-vkeys">
+    <button type="button" class="vkey modifier" id="vkey-ctrl" title="Ctrl (toggle)">Ctrl</button>
+    <button type="button" class="vkey" id="vkey-tab" title="Tab">Tab</button>
+    <button type="button" class="vkey" id="vkey-esc" title="Escape">Esc</button>
+    <button type="button" class="vkey" id="vkey-up" title="Arrow Up">↑</button>
+    <button type="button" class="vkey" id="vkey-down" title="Arrow Down">↓</button>
+    <button type="button" class="vkey" id="vkey-cc" title="Ctrl+C (interrupt)">C-c</button>
+    <button type="button" class="vkey" id="vkey-cb" title="Ctrl+B (tmux prefix)">C-b</button>
+    <button type="button" class="vkey" id="vkey-pgup" title="Page Up (scroll up)">PgUp</button>
+    <button type="button" class="vkey" id="vkey-pgdn" title="Page Down (scroll down)">PgDn</button>
+  </div>
 </div>
 <button type="button" id="scroll-bottom" title="Scroll to bottom">↓</button>
+
+<!-- Terminal context menu (right-click / long-press) -->
+<div id="terminal-ctx-menu" style="display:none;">
+  <button data-action="copy" onclick="terminalCtxCopy()">📋 Copy <span class="ctx-kbd">Ctrl+Shift+C</span></button>
+  <button data-action="paste" onclick="terminalCtxPaste()">📋 Paste <span class="ctx-kbd">Ctrl+Shift+V</span></button>
+  <div class="ctx-divider"></div>
+  <button onclick="terminalCtxTextSelect()">📋 Text Select (mobile)</button>
+  <button onclick="terminalCtxSelectAll()">📋 Select All</button>
+  <button onclick="terminalCtxClear()">🧹 Clear</button>
+</div>
+
+<!-- Hidden paste-trap input for HTTP fallback -->
+<input id="terminal-paste-trap" type="text" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false">
+
 <script>
 const params = new URLSearchParams(location.search);
 const apiBase = location.pathname.replace(/\\/?$/, '') + '/api';
@@ -783,6 +953,8 @@ let terminalConnectTimer = null;
 let terminalTransport = '';
 let terminalHttpPollToken = 0;
 let terminalHttpPolling = false;
+let _httpInputBuffer = '';
+let _httpInputTimer = null;
 let terminalOutputCursor = 0;
 
 function setTerminalStatus(text) {
@@ -799,6 +971,33 @@ function clearTerminalConnectTimer() {
 function isMobileTerminalClient() {
   const ua = navigator.userAgent || '';
   return /iPhone|iPad|iPod|Android|Mobile|baiduhi_ios/i.test(ua);
+}
+
+if (isMobileTerminalClient()) {
+  document.body.classList.add('mobile-terminal');
+  // Track keyboard open/close via visualViewport and position vkey bar correctly
+  const vkeyBar = document.getElementById('terminal-vkeys');
+  if (window.visualViewport) {
+    const updateKbdState = () => {
+      const vk = window.visualViewport;
+      const kbdOpen = vk.height < window.innerHeight - 80;
+      document.body.classList.toggle('kbd-open', kbdOpen);
+      // Position vkey bar at the bottom of the visible viewport (above keyboard).
+      // visualViewport.height shrinks when keyboard appears; offsetTop accounts
+      // for any scroll offset. Using vk.height + vk.offsetTop gives the visible
+      // viewport bottom in CSS pixels relative to the layout viewport.
+      if (kbdOpen && vkeyBar) {
+        const bottom = Math.max(0, window.innerHeight - (vk.height + vk.offsetTop));
+        vkeyBar.style.bottom = bottom + 'px';
+      } else if (vkeyBar) {
+        vkeyBar.style.bottom = '';
+      }
+    };
+    window.visualViewport.addEventListener('resize', updateKbdState);
+    window.visualViewport.addEventListener('scroll', updateKbdState);
+    // Initial call
+    setTimeout(updateKbdState, 100);
+  }
 }
 
 function terminalApiUrl(path, extra = {}) {
@@ -853,10 +1052,336 @@ function ensureXtermAssets() {
   if (!xtermAssetsPromise) {
     xtermAssetsPromise = loadStyle(staticBase + '/xterm/xterm.css')
       .then(() => loadScript(staticBase + '/xterm/xterm.js'))
-      .then(() => loadScript(staticBase + '/xterm/addon-fit.js'));
+      .then(() => loadScript(staticBase + '/xterm/addon-fit.js'))
+      .then(() => loadScript(staticBase + '/xterm/addon-web-links.js'));
   }
   return xtermAssetsPromise;
 }
+
+// ── Terminal copy/paste helpers ─────────────────────────────────────────────
+function terminalCopyText(text) {
+  if (!text) return;
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).catch(() => terminalFallbackCopy(text));
+  } else {
+    terminalFallbackCopy(text);
+  }
+}
+
+function terminalFallbackCopy(text) {
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.cssText = 'position:fixed;left:-9999px;top:-9999px;opacity:0';
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand('copy'); } catch (_) {}
+  document.body.removeChild(ta);
+}
+
+function terminalDoPaste() {
+  if (!isMobileTerminalClient() && navigator.clipboard && navigator.clipboard.readText) {
+    navigator.clipboard.readText()
+      .then(text => { if (text) sendTerminalInput(text); })
+      .catch(() => {
+        awaitingTermPaste = true;
+        const trap = document.getElementById('terminal-paste-trap');
+        if (trap) { trap.value = ''; trap.focus(); }
+      });
+    return;
+  }
+  // Mobile: create a visible paste dialog so the user can use the system
+  // keyboard's paste button or long-press paste. The dialog is a semi-transparent
+  // overlay with a large textarea that auto-focuses.
+  let dialog = document.getElementById('paste-dialog');
+  if (dialog) dialog.remove();
+  dialog = document.createElement('div');
+  dialog.id = 'paste-dialog';
+  dialog.style.cssText = 'position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;padding:16px;';
+  const box = document.createElement('div');
+  box.style.cssText = 'background:#161b22;border:1px solid #444c6a;border-radius:10px;padding:16px;width:100%;max-width:400px;';
+  const label = document.createElement('div');
+  label.textContent = 'Paste content below (long-press or use keyboard paste):';
+  label.style.cssText = 'color:#8b949e;font-size:13px;margin-bottom:10px;';
+  const ta = document.createElement('textarea');
+  ta.style.cssText = 'width:100%;height:100px;background:#0d1117;color:#d4d4d4;border:1px solid #30363d;border-radius:6px;padding:8px;font-size:16px;resize:none;-webkit-user-select:text;';
+  ta.placeholder = 'Long-press here → Paste';
+  ta.autocomplete = 'off';
+  ta.autocorrect = 'off';
+  ta.autocapitalize = 'none';
+  ta.spellcheck = false;
+  const btnRow = document.createElement('div');
+  btnRow.style.cssText = 'display:flex;gap:8px;margin-top:12px;justify-content:flex-end;';
+  const cancelBtn = document.createElement('button');
+  cancelBtn.textContent = 'Cancel';
+  cancelBtn.style.cssText = 'padding:6px 16px;border:1px solid #30363d;border-radius:6px;background:#161b22;color:#8b949e;cursor:pointer;font-size:14px;';
+  const sendBtn = document.createElement('button');
+  sendBtn.textContent = 'Send';
+  sendBtn.style.cssText = 'padding:6px 16px;border:1px solid #1f6feb;border-radius:6px;background:#1f6feb;color:#fff;cursor:pointer;font-size:14px;';
+  btnRow.appendChild(cancelBtn);
+  btnRow.appendChild(sendBtn);
+  box.appendChild(label);
+  box.appendChild(ta);
+  box.appendChild(btnRow);
+  dialog.appendChild(box);
+  document.body.appendChild(dialog);
+  // Auto-focus the textarea after render
+  setTimeout(() => ta.focus(), 50);
+  // Send button: send whatever is in the textarea
+  sendBtn.addEventListener('click', () => {
+    const text = ta.value;
+    if (text) sendTerminalInput(text);
+    dialog.remove();
+    if (xterm) xterm.focus();
+  });
+  // Cancel button
+  cancelBtn.addEventListener('click', () => {
+    dialog.remove();
+    if (xterm) xterm.focus();
+  });
+  // Also close on backdrop click
+  dialog.addEventListener('click', (e) => {
+    if (e.target === dialog) {
+      dialog.remove();
+      if (xterm) xterm.focus();
+    }
+  });
+  // Catch paste event directly on the textarea (user uses keyboard paste button)
+  ta.addEventListener('paste', (e) => {
+    const text = e.clipboardData && e.clipboardData.getData('text');
+    if (text) {
+      // Don't put it in the textarea — send directly and close
+      e.preventDefault();
+      sendTerminalInput(text);
+      dialog.remove();
+      if (xterm) xterm.focus();
+    }
+  });
+  // If user types text instead of pasting, allow them to send it
+  ta.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      const text = ta.value;
+      if (text) sendTerminalInput(text);
+      dialog.remove();
+      if (xterm) xterm.focus();
+    } else if (e.key === 'Escape') {
+      dialog.remove();
+      if (xterm) xterm.focus();
+    }
+  });
+}
+
+let awaitingTermPaste = false;
+
+// ── Terminal context menu ───────────────────────────────────────────────────
+function openTerminalContextMenu(x, y) {
+  let menu = document.getElementById('terminal-ctx-menu');
+  if (!menu) return;
+  const sel = xterm ? xterm.getSelection() : '';
+  const copyBtn = menu.querySelector('[data-action="copy"]');
+  if (copyBtn) copyBtn.style.display = sel ? '' : 'none';
+  // Show menu near the long-press point, offset down so finger doesn't cover it.
+  // When soft keyboard is open, adjust for visualViewport offset so the menu
+  // appears in the visible area, not under the keyboard.
+  const vk = window.visualViewport;
+  const vkOffset = vk ? vk.offsetTop : 0;
+  const viewH = vk ? vk.height : window.innerHeight;
+  // First render to measure actual size
+  menu.style.display = 'block';
+  menu.style.left = '-9999px';
+  menu.style.top = '-9999px';
+  const menuW = menu.offsetWidth || 210;
+  const menuH = menu.offsetHeight || 200;
+  // x is relative to layout viewport; adjust by visualViewport.offsetTop
+  const adjY = y - vkOffset;
+  const left = Math.max(8, Math.min(x - menuW / 2, window.innerWidth - menuW - 8));
+  const top = Math.min(adjY + 8, viewH - menuH - 8) + vkOffset;
+  menu.style.left = left + 'px';
+  menu.style.top = top + 'px';
+}
+
+function hideTerminalContextMenu() {
+  const menu = document.getElementById('terminal-ctx-menu');
+  if (menu) menu.style.display = 'none';
+}
+
+function terminalCtxCopy() {
+  hideTerminalContextMenu();
+  const sel = xterm ? xterm.getSelection() : '';
+  if (sel) terminalCopyText(sel);
+}
+
+function terminalCtxPaste() {
+  hideTerminalContextMenu();
+  terminalDoPaste();
+}
+
+function terminalCtxSelectAll() {
+  hideTerminalContextMenu();
+  if (xterm) xterm.selectAll();
+}
+
+function terminalCtxClear() {
+  hideTerminalContextMenu();
+  if (xterm) xterm.clear();
+}
+
+function terminalCtxTextSelect() {
+  hideTerminalContextMenu();
+  // Open mobile copy mode: dump buffer into a selectable <pre>
+  openMobileCopyMode();
+}
+
+// ── Mobile copy mode (selectable text overlay) ──────────────────────────────
+let mobileCopyModeOpen = false;
+let mobileCopyWasNearBottom = true;
+
+function openMobileCopyMode() {
+  let layer = document.getElementById('terminal-mobile-copy-layer');
+  if (!layer || !xterm) return;
+  const buffer = xterm.buffer && xterm.buffer.active;
+  let text = '';
+  if (buffer) {
+    const rows = [];
+    for (let i = 0; i < buffer.length; i++) {
+      const line = buffer.getLine(i);
+      if (!line) continue;
+      const t = line.translateToString(true);
+      if (line.isWrapped && rows.length > 0) { rows[rows.length - 1] += t; }
+      else { rows.push(t); }
+    }
+    text = rows.join('\\n').replace(/\\n+$/, '');
+  }
+  const pre = layer.querySelector('pre');
+  if (pre) pre.textContent = text;
+  const vp = xtermHost.querySelector('.xterm-viewport');
+  mobileCopyWasNearBottom = !vp || (vp.scrollHeight - vp.scrollTop - vp.clientHeight < 20);
+  layer.style.display = 'flex';
+  mobileCopyModeOpen = true;
+  if (pre) {
+    pre.scrollTop = Math.max(0, pre.scrollHeight - pre.clientHeight);
+  }
+}
+
+function closeMobileCopyMode() {
+  let layer = document.getElementById('terminal-mobile-copy-layer');
+  if (layer) layer.style.display = 'none';
+  mobileCopyModeOpen = false;
+  if (mobileCopyWasNearBottom && xterm) {
+    termUserScrolled = false;
+    xterm.scrollToBottom();
+    flushPendingWrites();
+  }
+  if (isMobileTerminalClient() && mobileInputTrap) {
+    mobileInputTrap.focus({ preventScroll: true });
+  } else if (xterm) {
+    xterm.focus();
+  }
+}
+
+function copyMobileSelection() {
+  let layer = document.getElementById('terminal-mobile-copy-layer');
+  const pre = layer ? layer.querySelector('pre') : null;
+  let text = '';
+  const sel = window.getSelection && window.getSelection();
+  if (sel && sel.toString() && pre && pre.contains(sel.anchorNode)) {
+    text = sel.toString();
+  } else if (pre) {
+    text = pre.textContent || '';
+  }
+  if (text) terminalCopyText(text);
+}
+
+function selectAllMobileCopy() {
+  let layer = document.getElementById('terminal-mobile-copy-layer');
+  const pre = layer ? layer.querySelector('pre') : null;
+  if (!pre) return;
+  const range = document.createRange();
+  range.selectNodeContents(pre);
+  const sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(range);
+}
+
+// ── Smart auto-follow for xterm viewport ────────────────────────────────────
+let termUserScrolled = false;
+let termScrollResumeTimer = null;
+let termUserScrollIntentUntil = 0;
+let boundXtermVp = null;
+const pendingWrites = []; // buffer output while user scrolled up
+
+function isTermNearBottom() {
+  if (!xterm) return true;
+  const vp = boundXtermVp || xtermHost.querySelector('.xterm-viewport');
+  if (!vp) return true;
+  return vp.scrollHeight - vp.scrollTop - vp.clientHeight < 20;
+}
+
+function onTermViewportScroll() {
+  if (isTermNearBottom() && !mobileCopyModeOpen) {
+    termUserScrolled = false;
+    clearTimeout(termScrollResumeTimer);
+    flushPendingWrites();
+  } else {
+    termUserScrolled = true;
+  }
+  updateScrollbarThumb();
+}
+
+function markTermUserScrollIntent() {
+  termUserScrollIntentUntil = Date.now() + (isMobileTerminalClient() ? 4000 : 900);
+}
+
+function bindXtermViewport(vp) {
+  if (!vp || boundXtermVp === vp) return;
+  unbindXtermViewport();
+  boundXtermVp = vp;
+  vp.addEventListener('scroll', onTermViewportScroll, { passive: true });
+  vp.addEventListener('wheel', markTermUserScrollIntent, { passive: true });
+  // Touch swipe → PgUp/PgDn when tmux mouse tracking is active
+  // (touch scroll is ignored by tmux; only wheel events trigger copy-mode)
+  vp.addEventListener('touchstart', (e) => {
+    markTermUserScrollIntent();
+    if (!xterm || !xterm._core || !xterm._core.coreMouseService) return;
+    if (!xterm._core.coreMouseService.areMouseEventsActive) return;
+    // Mouse tracking ON (tmux/vim) — track swipe for PgUp/PgDn conversion
+    const t = e.touches[0];
+    if (t) { _swipeStartY = t.clientY; _swipeStartTime = Date.now(); _swipeFired = false; }
+  }, { passive: true });
+  vp.addEventListener('touchmove', (e) => {
+    markTermUserScrollIntent();
+    if (_swipeStartY === null || _swipeFired) return;
+    if (!xterm || !xterm._core || !xterm._core.coreMouseService) return;
+    if (!xterm._core.coreMouseService.areMouseEventsActive) return;
+    const t = e.touches[0];
+    if (!t) return;
+    const dy = t.clientY - _swipeStartY;
+    const elapsed = Date.now() - _swipeStartTime;
+    // Threshold: moved >60px within 400ms = swipe
+    if (Math.abs(dy) > 60 && elapsed < 400) {
+      _swipeFired = true;
+      const dir = dy < 0 ? -1 : 1; // swipe up = scroll up, swipe down = scroll down
+      tmuxAwarePageKey(dir < 0 ? '\x1b[5~' : '\x1b[6~');
+    }
+  }, { passive: true });
+  vp.addEventListener('touchend', () => { _swipeStartY = null; _swipeFired = false; }, { passive: true });
+}
+
+// Swipe state for tmux touch→PgUp/PgDn conversion
+let _swipeStartY = null, _swipeStartTime = 0, _swipeFired = false;
+
+function unbindXtermViewport() {
+  if (!boundXtermVp) return;
+  boundXtermVp.removeEventListener('scroll', onTermViewportScroll);
+  boundXtermVp.removeEventListener('wheel', markTermUserScrollIntent);
+  // Note: touch listeners on boundXtermVp will be GC'd when vp is replaced
+  boundXtermVp = null;
+}
+
+// ── Custom scrollbar overlay for xterm viewport ─────────────────────────────
+// The native xterm scrollbar is invisible on mobile WebViews. This overlay
+// draws a draggable thumb that syncs with the xterm viewport scrollTop, so
+// scrolling is discoverable + usable by touch on phones.
 
 async function initAdminTerminal() {
   if (terminalSurfaceReady) return;
@@ -867,9 +1392,11 @@ async function initAdminTerminal() {
     xterm = new window.Terminal({
       cursorBlink: true,
       convertEol: true,
-      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+      fontFamily: "'MesloLGM NF', 'RemoteCC MesloLGM NF', Menlo, Consolas, 'Courier New', monospace",
       fontSize: 13,
-      scrollback: 8000,
+      scrollback: 50000,
+      smoothScrollDuration: isMobileTerminalClient() ? 0 : 80,
+      allowProposedApi: true,
       theme: {
         background: '#050505',
         foreground: '#d4d4d4',
@@ -881,8 +1408,113 @@ async function initAdminTerminal() {
       fitAddon = new window.FitAddon.FitAddon();
       xterm.loadAddon(fitAddon);
     }
+    if (window.WebLinksAddon && window.WebLinksAddon.WebLinksAddon) {
+      xterm.loadAddon(new window.WebLinksAddon.WebLinksAddon());
+    }
     xterm.open(xtermHost);
-    xterm.onData(data => sendTerminalInput(data));
+    // IME composition tracking — guard against mobile IME swallowing characters
+    let composing = false;
+    const xtermTextarea = xtermHost.querySelector('textarea');
+    if (xtermTextarea) {
+      xtermTextarea.addEventListener('compositionstart', () => { composing = true; });
+      xtermTextarea.addEventListener('compositionend', () => {
+        composing = false;
+        // Some IMEs (e.g. Sogou on mobile) emit the final text via the
+        // textarea value rather than through keydown. Give the browser a
+        // tick to update the value, then send whatever is there.
+        setTimeout(() => {
+          const val = xtermTextarea.value;
+          if (val) {
+            sendTerminalInput(val.replace(/\\x0d?\\x0a/g, '\\x0d'));
+            xtermTextarea.value = '';
+          }
+        }, 0);
+      });
+    }
+    xterm.onData(data => {
+      if (composing) return; // will be handled by compositionend
+      sendTerminalInput(data);
+    });
+    xterm.attachCustomKeyEventHandler(ev => {
+      if (ev.type === 'keydown' && ev.key === 'Tab') { ev.preventDefault(); }
+      // Ctrl+Shift+C: copy selection
+      if (ev.type === 'keydown' && ev.key === 'c' && ev.ctrlKey && ev.shiftKey) {
+        ev.preventDefault();
+        const sel = xterm.getSelection();
+        if (sel) terminalCopyText(sel);
+        return false;
+      }
+      // Ctrl+Shift+V: paste from clipboard
+      if (ev.type === 'keydown' && ev.key === 'v' && ev.ctrlKey && ev.shiftKey) {
+        ev.preventDefault();
+        terminalDoPaste();
+        return false;
+      }
+      // During IME composition, let the browser handle the event natively
+      if (ev.type === 'keydown' && composing) { return false; }
+      return true;
+    });
+    // Native paste event (Ctrl+V / mobile long-press paste)
+    xtermHost.addEventListener('paste', (e) => {
+      e.preventDefault();
+      const text = e.clipboardData && e.clipboardData.getData('text');
+      if (text) sendTerminalInput(text);
+    });
+    // Right-click context menu
+    xtermHost.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      openTerminalContextMenu(e.clientX, e.clientY);
+    });
+    // Long-press on mobile → context menu
+    let termTouchStart = null;
+    let termTouchMoved = false;
+    let longPressTimer = null;
+    function clearTermLongPress() {
+      clearTimeout(longPressTimer); longPressTimer = null; termTouchStart = null; termTouchMoved = false;
+    }
+    xtermHost.addEventListener('touchstart', (e) => {
+      if (!isMobileTerminalClient()) return;
+      const t = e.touches && e.touches[0];
+      if (!t) return;
+      termTouchStart = { x: t.clientX, y: t.clientY };
+      termTouchMoved = false;
+      clearTimeout(longPressTimer);
+      longPressTimer = setTimeout(() => {
+        if (!termTouchMoved && termTouchStart) {
+          openTerminalContextMenu(termTouchStart.x, termTouchStart.y);
+        }
+      }, 1000);
+    }, { passive: true });
+    xtermHost.addEventListener('touchmove', (e) => {
+      if (!isMobileTerminalClient()) return;
+      const t = e.touches && e.touches[0];
+      if (t && termTouchStart) {
+        const dx = Math.abs(t.clientX - termTouchStart.x);
+        const dy = t.clientY - termTouchStart.y;
+        if (Math.abs(dy) > 5 || dx > 5) { termTouchMoved = true; clearTermLongPress(); }
+        // Only mark userScrolled when swiping UP (finger moves up = reading history)
+        if (dy < -8) { termUserScrolled = true; }
+      }
+    }, { passive: true });
+    xtermHost.addEventListener('touchend', clearTermLongPress, { passive: true });
+    xtermHost.addEventListener('touchcancel', clearTermLongPress, { passive: true });
+    // xterm selection change → show copy button on mobile
+    xterm.onSelectionChange(() => {
+      const sel = xterm.getSelection();
+      if (isMobileTerminalClient()) {
+        const copyFab = document.getElementById('terminal-mobile-copy-fab');
+        if (copyFab) { copyFab.style.display = sel ? '' : 'none'; }
+      }
+    });
+    // User scroll detection on xterm viewport for smart auto-follow
+    const vpObserver = new MutationObserver(() => {
+      const vp = xtermHost.querySelector && xtermHost.querySelector('.xterm-viewport');
+    });
+    vpObserver.observe(xtermHost, { childList: true, subtree: true });
+    const vp0 = xtermHost.querySelector && xtermHost.querySelector('.xterm-viewport');
+    if (vp0) { bindXtermViewport(vp0); vpObserver.disconnect(); }
+    initTermScrollbar();
+    updateScrollbarThumb();
     xterm.writeln('Session Tracker admin terminal');
     terminalFallback.classList.add('hidden');
     xtermHost.classList.remove('hidden');
@@ -931,27 +1563,71 @@ function resizeAdminTerminal() {
   }
 }
 
+let _scrollToBottomRaf = 0;
+function requestScrollToBottom() {
+  if (mobileCopyModeOpen || (isMobileTerminalClient() && termUserScrolled)) return;
+  if (_scrollToBottomRaf) return;
+  _scrollToBottomRaf = requestAnimationFrame(() => {
+    _scrollToBottomRaf = 0;
+    if (xterm) xterm.scrollToBottom();
+  });
+}
+
 function writeTerminal(data) {
+  data = data || '';
   if (xterm) {
-    xterm.write(data || '');
+    // Buffer output while user is scrolled up (avoid burning scrollback)
+    if (termUserScrolled || mobileCopyModeOpen) {
+      pendingWrites.push(data);
+      const max = 20000;
+      if (pendingWrites.length > max) pendingWrites.splice(0, pendingWrites.length - max);
+      // Still update scrollbar in case scrollArea grew (new history)
+      return;
+    }
+    xterm.write(data);
+    requestScrollToBottom();
+    // Update scrollbar after xterm renders (scrollArea height may change)
+    requestAnimationFrame(() => requestAnimationFrame(updateScrollbarThumb));
   } else {
-    terminalFallback.textContent += data || '';
+    terminalFallback.textContent += data;
     terminalFallback.scrollTop = terminalFallback.scrollHeight;
   }
 }
 
+function flushPendingWrites() {
+  if (pendingWrites.length === 0) return;
+  const batch = pendingWrites.splice(0);
+  xterm.write(batch.join(''));
+  xterm.scrollToBottom();
+}
+
 function sendTerminalInput(data) {
+  // User typed something → resume auto-follow so they see the output
+  if (data) {
+    termUserScrolled = false;
+    flushPendingWrites();
+  }
   if (terminalWs && terminalWs.readyState === WebSocket.OPEN) {
     terminalWs.send(JSON.stringify({ type: 'input', data }));
     return;
   }
   if (terminalTransport !== 'http' || !activeTerminalId) return;
-  terminalApi(
-    '/sessions/' + encodeURIComponent(activeTerminalId) + '/input',
-    { method: 'POST', body: { data } }
-  ).catch(err => {
-    setTerminalStatus('Input error: ' + (err && err.message ? err.message : err));
-  });
+  // Buffer rapid input to reduce HTTP request overhead
+  _httpInputBuffer += data;
+  if (!_httpInputTimer) {
+    _httpInputTimer = setTimeout(() => {
+      const batch = _httpInputBuffer;
+      _httpInputBuffer = '';
+      _httpInputTimer = null;
+      if (!batch || !activeTerminalId) return;
+      terminalApi(
+        '/sessions/' + encodeURIComponent(activeTerminalId) + '/input',
+        { method: 'POST', body: { data: batch } }
+      ).catch(err => {
+        setTerminalStatus('Input error: ' + (err && err.message ? err.message : err));
+      });
+    }, 16); // ~1 frame
+  }
 }
 
 function handleFallbackKey(ev) {
@@ -1017,7 +1693,7 @@ async function startTerminalHttpFallback(terminalId) {
     try {
       const data = await terminalApi(
         '/sessions/' + encodeURIComponent(terminalId) + '/output',
-        { extra: { cursor: terminalOutputCursor, wait: 20 } }
+        { extra: { cursor: terminalOutputCursor, wait: 5 } }
       );
       if (
         !terminalHttpPolling ||
@@ -1172,7 +1848,11 @@ async function createTerminalSession({ connect = true } = {}) {
 async function openTerminalPanel() {
   await refreshTerminalSessions({ createIfEmpty: true, connect: true });
   resizeAdminTerminal();
-  if (xterm) xterm.focus();
+  if (isMobileTerminalClient() && mobileInputTrap) {
+    mobileInputTrap.focus();
+  } else if (xterm) {
+    xterm.focus();
+  }
   if (usingFallback) terminalFallback.focus();
 }
 
@@ -1222,7 +1902,7 @@ function connectTerminalWs(terminalId, { background = false } = {}) {
     if (terminalWs !== ws || ws.readyState !== WebSocket.CONNECTING) return;
     if (background) abandonTerminalWs(ws);
     else fallbackTerminalFromWs(ws, terminalId, 'Connecting via HTTP...');
-  }, 5000);
+  }, 10000);
   ws.onopen = () => {
     if (terminalWs !== ws) return;
     clearTerminalConnectTimer();
@@ -1313,6 +1993,324 @@ terminalSessionSelect.addEventListener('change', () => {
   connectAdminTerminal(terminalId);
 });
 terminalDisconnect.addEventListener('click', disconnectAdminTerminal);
+
+// Mobile copy FAB handler
+const mobileCopyFab = document.getElementById('terminal-mobile-copy-fab');
+if (mobileCopyFab) {
+  mobileCopyFab.addEventListener('click', () => {
+    const sel = xterm ? xterm.getSelection() : '';
+    if (sel) {
+      terminalCopyText(sel);
+      setTerminalStatus('Copied ' + sel.length + ' chars');
+    }
+    mobileCopyFab.style.display = 'none';
+    if (xterm) xterm.focus();
+  });
+}
+
+
+// Paste-trap input handlers (for HTTP fallback paste)
+const pasteTrap = document.getElementById('terminal-paste-trap');
+if (pasteTrap) {
+  pasteTrap.addEventListener('paste', (e) => {
+    if (!awaitingTermPaste) return;
+    awaitingTermPaste = false;
+    const text = e.clipboardData && e.clipboardData.getData('text');
+    if (text) sendTerminalInput(text);
+    e.preventDefault();
+    if (xterm) xterm.focus();
+  });
+  pasteTrap.addEventListener('blur', () => {
+    awaitingTermPaste = false;
+    if (xterm) xterm.focus();
+  });
+  pasteTrap.addEventListener('keydown', (e) => {
+    if (e.key === 'v' && (e.ctrlKey || e.metaKey)) return; // allow Ctrl+V
+    awaitingTermPaste = false;
+    pasteTrap.value = '';
+    e.preventDefault();
+    if (e.key.length === 1) sendTerminalInput(e.key);
+    if (xterm) xterm.focus();
+  });
+}
+
+// Click outside context menu to close
+document.addEventListener('click', (e) => {
+  const menu = document.getElementById('terminal-ctx-menu');
+  if (menu && menu.style.display !== 'none') {
+    if (!menu.contains(e.target)) hideTerminalContextMenu();
+  }
+});
+document.addEventListener('contextmenu', (e) => {
+  const menu = document.getElementById('terminal-ctx-menu');
+  if (menu && menu.style.display !== 'none') {
+    if (!menu.contains(e.target)) hideTerminalContextMenu();
+  }
+});
+
+
+// --- Mobile input trap (independent textarea for mobile keyboard capture) ---
+const mobileInputTrap = document.getElementById('mobile-input-trap');
+let mobileTrapComposing = false;
+
+if (mobileInputTrap && isMobileTerminalClient()) {
+  // On mobile, clicking the xterm area should focus the input trap instead
+  // of xterm's internal textarea for better keyboard/IME control.
+  xtermHost.addEventListener('click', () => {
+    if (mobileCopyModeOpen) return;
+    focusMobileTrap();
+  });
+
+  function focusMobileTrap() {
+    if (!mobileInputTrap) return;
+    mobileInputTrap.focus({ preventScroll: true });
+  }
+
+  mobileInputTrap.addEventListener('compositionstart', () => {
+    mobileTrapComposing = true;
+  });
+
+  mobileInputTrap.addEventListener('compositionend', () => {
+    mobileTrapComposing = false;
+    const value = mobileInputTrap.value;
+    if (value) {
+      sendTerminalInput(value);
+      mobileInputTrap.value = '';
+    }
+  });
+
+  mobileInputTrap.addEventListener('input', () => {
+    if (mobileTrapComposing) return;
+    const value = mobileInputTrap.value;
+    if (value) {
+      sendTerminalInput(value);
+      mobileInputTrap.value = '';
+    }
+  });
+
+  mobileInputTrap.addEventListener('keydown', (e) => {
+    if (mobileTrapComposing) return;
+    const mapped = {
+      Enter: '\\r',
+      Backspace: '\\x7f',
+      Tab: '\\t',
+      Escape: '\\x1b',
+      ArrowUp: '\\x1b[A',
+      ArrowDown: '\\x1b[B',
+      ArrowRight: '\\x1b[C',
+      ArrowLeft: '\\x1b[D',
+      Home: '\\x1b[H',
+      End: '\\x1b[F',
+      Delete: '\\x1b[3~',
+    }[e.key];
+    if (!mapped) return;
+    e.preventDefault();
+    mobileInputTrap.value = '';
+    sendTerminalInput(mapped);
+  });
+
+  mobileInputTrap.addEventListener('paste', (e) => {
+    const text = e.clipboardData && e.clipboardData.getData('text');
+    if (!text) return;
+    e.preventDefault();
+    mobileInputTrap.value = '';
+    // Exit paste-ready visual state
+    mobileInputTrap.classList.remove('paste-ready');
+    mobileInputTrap.placeholder = '';
+    awaitingTermPaste = false;
+    sendTerminalInput(text);
+    // Return focus to xterm after paste
+    if (xterm) setTimeout(() => xterm.focus(), 0);
+  });
+  mobileInputTrap.addEventListener('blur', () => {
+    // Clean up paste-ready state when trap loses focus
+    if (mobileInputTrap.classList.contains('paste-ready')) {
+      mobileInputTrap.classList.remove('paste-ready');
+      mobileInputTrap.placeholder = '';
+      awaitingTermPaste = false;
+    }
+  });
+
+  // When xterm's own textarea gets focus on mobile, redirect to input trap
+  const xtermTextarea = xtermHost.querySelector('textarea');
+  if (xtermTextarea) {
+    xtermTextarea.addEventListener('focus', () => {
+      if (isMobileTerminalClient() && !mobileCopyModeOpen) {
+        xtermTextarea.blur();
+        focusMobileTrap();
+      }
+    });
+  }
+}
+
+// --- Virtual key bar for mobile / webview ---
+let vkeyCtrlActive = false;
+const vkeyCtrlBtn = document.getElementById('vkey-ctrl');
+
+function setVkeyCtrl(active) {
+  vkeyCtrlActive = active;
+  if (vkeyCtrlBtn) vkeyCtrlBtn.classList.toggle('active', active);
+}
+
+// Intercept xterm input: when Ctrl is toggled, convert a-z to Ctrl+A-Z
+const _origSendTerminalInput = sendTerminalInput;
+sendTerminalInput = function(data) {
+  if (vkeyCtrlActive && data.length === 1) {
+    const code = data.charCodeAt(0);
+    if (code >= 97 && code <= 122) {
+      setVkeyCtrl(false);
+      _origSendTerminalInput(String.fromCharCode(code - 96));
+      return;
+    }
+    if (code >= 65 && code <= 90) {
+      setVkeyCtrl(false);
+      _origSendTerminalInput(String.fromCharCode(code - 64));
+      return;
+    }
+  }
+  if (vkeyCtrlActive) setVkeyCtrl(false);
+  _origSendTerminalInput(data);
+};
+
+function vkeySend(seq) {
+  sendTerminalInput(seq);
+  if (isMobileTerminalClient() && mobileInputTrap) {
+    mobileInputTrap.focus({ preventScroll: true });
+  } else if (xterm) {
+    xterm.focus();
+  }
+}
+
+if (vkeyCtrlBtn) vkeyCtrlBtn.addEventListener('click', () => {
+  setVkeyCtrl(!vkeyCtrlActive);
+  if (xterm) xterm.focus();
+});
+document.getElementById('vkey-tab')?.addEventListener('click', () => vkeySend('\t'));
+document.getElementById('vkey-esc')?.addEventListener('click', () => vkeySend('\x1b'));
+document.getElementById('vkey-up')?.addEventListener('click', () => vkeySend('\x1b[A'));
+document.getElementById('vkey-down')?.addEventListener('click', () => vkeySend('\x1b[B'));
+document.getElementById('vkey-cc')?.addEventListener('click', () => vkeySend('\x03'));
+document.getElementById('vkey-cb')?.addEventListener('click', () => vkeySend('\x02'));
+// ── Overlay scrollbar ──────────────────────────────────────────────────────
+let _sbThumb = null, _sbDragging = false, _sbRaf = 0;
+let _sbStartY = 0, _sbThumbTop0 = 0, _sbLastPageDir = 0, _sbPageTimer = null;
+
+function initTermScrollbar() {
+  _sbThumb = document.getElementById('term-scrollbar-thumb');
+  if (!_sbThumb) return;
+
+  function thumbPos() { return parseFloat(_sbThumb.style.top) || 0; }
+  function thumbH() { return _sbThumb.clientHeight || 30; }
+  function trackH() { return _sbThumb.parentElement.clientHeight || 200; }
+
+  function down(clientY) {
+    _sbDragging = true;
+    _sbStartY = clientY;
+    _sbThumbTop0 = thumbPos();
+    _sbLastPageDir = 0;
+    _sbThumb.classList.add('active');
+  }
+  function move(clientY) {
+    if (!_sbDragging) return;
+    const dy = clientY - _sbStartY;
+    const tH = trackH(), hH = thumbH();
+    const maxTop = tH - hH;
+    let newTop = _sbThumbTop0 + dy;
+    newTop = Math.max(0, Math.min(maxTop, newTop));
+    _sbThumb.style.top = Math.round(newTop) + 'px';
+
+    if (boundXtermVp && boundXtermVp.scrollHeight > boundXtermVp.clientHeight + 2) {
+      // Viewport overflow — scroll directly
+      const maxScroll = boundXtermVp.scrollHeight - boundXtermVp.clientHeight;
+      const scrollTarget = maxTop > 0 ? (newTop / maxTop) * maxScroll : 0;
+      boundXtermVp.scrollTop = scrollTarget;
+    } else {
+      // No overflow (tmux) — drag past center sends repeated PgUp/PgDn
+      const mid = tH / 2;
+      const dir = newTop + hH/2 < mid ? -1 : 1;
+      if (dir !== _sbLastPageDir) {
+        _sbLastPageDir = dir;
+        tmuxAwarePageKey(dir < 0 ? '\x1b[5~' : '\x1b[6~');
+        clearInterval(_sbPageTimer);
+        _sbPageTimer = setInterval(() => {
+          if (!_sbDragging) { clearInterval(_sbPageTimer); return; }
+          tmuxAwarePageKey(dir < 0 ? '\x1b[5~' : '\x1b[6~');
+        }, 400);
+      }
+    }
+  }
+  function up() {
+    if (!_sbDragging) return;
+    _sbDragging = false;
+    _sbThumb.classList.remove('active');
+    clearInterval(_sbPageTimer);
+    // If tmux: snap thumb back to top after drag
+    if (!boundXtermVp || boundXtermVp.scrollHeight <= boundXtermVp.clientHeight + 2) {
+      _sbThumb.style.top = '0px';
+    }
+  }
+
+  _sbThumb.addEventListener('mousedown', e => { e.preventDefault(); down(e.clientY); });
+  document.addEventListener('mousemove', e => { if (_sbDragging) move(e.clientY); });
+  document.addEventListener('mouseup', up);
+  _sbThumb.addEventListener('touchstart', e => { e.preventDefault(); const t=e.touches[0]; if(t) down(t.clientY); }, {passive:false});
+  _sbThumb.addEventListener('touchmove', e => { if(!_sbDragging) return; e.preventDefault(); const t=e.touches[0]; if(t) move(t.clientY); }, {passive:false});
+  _sbThumb.addEventListener('touchend', up);
+  _sbThumb.addEventListener('touchcancel', up);
+}
+
+function updateScrollbarThumb() {
+  if (_sbRaf) return;
+  _sbRaf = requestAnimationFrame(() => {
+    _sbRaf = 0;
+    if (!_sbThumb) return;
+    const tH = _sbThumb.parentElement ? _sbThumb.parentElement.clientHeight : 0;
+    if (tH === 0) return;
+    if (boundXtermVp && boundXtermVp.scrollHeight > boundXtermVp.clientHeight + 2) {
+      const cH = boundXtermVp.clientHeight, sH = boundXtermVp.scrollHeight;
+      const sT = boundXtermVp.scrollTop;
+      const hH = Math.max(30, Math.floor(tH * cH / sH));
+      const maxTop = tH - hH;
+      const maxScroll = sH - cH;
+      const top = maxScroll > 0 ? (sT / maxScroll) * maxTop : 0;
+      _sbThumb.style.height = hH + 'px';
+      _sbThumb.style.top = Math.round(top) + 'px';
+    } else {
+      // No overflow (tmux) — small fixed thumb at top
+      _sbThumb.style.height = Math.max(30, Math.floor(tH * 0.3)) + 'px';
+      _sbThumb.style.top = '0px';
+    }
+  });
+}
+
+// PgUp/PgDn — tmux needs copy-mode first; other apps handle PgUp/PgDn directly.
+// When mouse tracking is active (tmux/vim), we send C-b [ to enter copy-mode
+// then the page key. Without mouse tracking, just send the page key.
+function tmuxAwarePageKey(pageSeq) {
+  // pageSeq: '\x1b[5~' for PgUp or '\x1b[6~' for PgDn
+  const inTmux = xterm && xterm._core && xterm._core.coreMouseService &&
+                 xterm._core.coreMouseService.areMouseEventsActive;
+  if (inTmux) {
+    // Send C-b [ (tmux prefix + copy-mode), wait briefly, then send page key
+    vkeySend('\x02');       // C-b = tmux prefix
+    setTimeout(() => {
+      vkeySend('[');          // enter copy-mode
+      setTimeout(() => {
+        vkeySend(pageSeq);    // PgUp/PgDn works in copy-mode
+      }, 50);
+    }, 50);
+  } else {
+    vkeySend(pageSeq);
+  }
+}
+
+document.getElementById('vkey-pgup')?.addEventListener('click', () => {
+  tmuxAwarePageKey('\x1b[5~');
+});
+document.getElementById('vkey-pgdn')?.addEventListener('click', () => {
+  tmuxAwarePageKey('\x1b[6~');
+});
+
 window.addEventListener('resize', resizeAdminTerminal);
 
 const streamBoxes = new Map();
